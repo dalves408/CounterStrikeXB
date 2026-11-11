@@ -40,16 +40,32 @@ Map loading / gameplay: out of scope for now.
   56,682,396 B).
 
 ## Where boot gets to (runs/v17_fresh2, 2026-11-11 ~04:53 PT)
-- Kernel init OK, AvSetDisplayMode 640x480 fmt 0x12 fb 0xD44000.
-- `d:\Media\Videos\MGS_Logo.xmv` opens (status 0) but nothing visible: FB stays
-  black (`[GPU] brightest pixel written 0x00000000`, `[PB] 0 pushbuffer calls followed`,
-  427 batches drawn with all vertex x/y = 0).
-- Game proceeds to load valve/cstrike data, `launcher/` files etc.
-- OPEN: why no visible output (intros/menus). Next investigation target.
+- Kernel init OK, AvSetDisplayMode 640x480 fmt 0x12.
+- NOTE: run.ps1 defaults alone (runs/b1_long) hang earlier in an IRQL spin; the
+  working set is `-ExtraEnv 'RECOMP_PB_EXEC=1;RECOMP_CONTIG_AVOID_IMAGE=1;RECOMP_AC97_READY=1;RECOMP_VBLANK=paced'`
+  (to be baked into run.ps1 once confirmed).
 
+## Current blocker: intro movies use the NV2A video overlay (PVIDEO) - not modelled
+Evidence (runs/b2_full, b3_wd, b5_ftrace, b6_peek; 2026-11-11 05:00-05:25 PT):
+- Boot flow sub at 0x000AD8A0: 0x000ADB46 plays d:\Media\Videos\MGS_Logo.xmv, then
+  Valve_Logo.xmv (0x000ADB53) via movie player 0x000C6F70, then waits for cache
+  flag [0x552D68] (loop 0x000ADB78), optional ESRB.xmv, then `open SuperLauncher_Root`
+  (0x000ADBE5) = the real menus.
+- Movie loop 0x000C7183..0x000C72D2: XMVDecoder_GetNextFrame (0x0029030E) via 0x000C6D40;
+  status 2 sets end flag [0x552308]=1 (a pad button >0x1E at 0x384F7A table skips).
+- Frames are shown with D3D UpdateOverlay (YUY2 overlay plane), not drawn: the PB
+  frame trace shows only a full-screen copy of the black back buffer.
+- b6_peek: [0x552308] becomes 1 (~15 s) -> movie DID finish. Then cleanup 0x000C6BC0
+  calls D3D EnableOverlay(FALSE) at 0x0030A8D0: writes NV_PVIDEO_STOP
+  (regs+0x8704 = 1) and spins until NV_PVIDEO_BUFFER (regs+0x8700) == 0. Nothing models
+  PVIDEO, so BUFFER never clears -> permanent hang, black screen (b2_full: triangle count
+  frozen for >100 s; watchdog stacks in v17_wd/b3_wd agree).
+- Fix plan: hand-written CS PVIDEO model (STOP clears BUFFER, like xemu's pvideo_write),
+  then composite the YUY2 overlay into the presented frame so intros are visible.
 ## Borrowings from other projects
 - NV2A fence-mirror pattern: concept from old CS project / toolkit (Wreckless);
   addresses re-derived for this XBE.
 
 ## Rules in force
 Small local commits, never push. Bounded test runs, kill only own PIDs.
+
