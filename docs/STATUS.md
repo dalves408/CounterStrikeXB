@@ -179,3 +179,27 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
 - FIX = local toolkit patch 0003-usb-ohci-keep-waiting-for-the-driver-to-start-the-co.patch
   (keep polling, log once at 1500). Pin -> a31cc9e (343b6d8 + 0001..0003), reproduced
   bit-exact in a scratch clone.
+## MENUS VERIFIED: keyboard + pad injection (runs/i4_menu, 2026-11-11 ~06:55-07:05 PT)
+Interactive bounded run (run.ps1 -PadLive -FbDumpEvery 30, own PID stopped at the end),
+build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
+- Pad injection (RECOMP_PAD_LIVE -> same USB XID report path as an XInput pad):
+  start on title -> Main Menu (pad_start_main_menu_i4.png); a on Training -> Training submenu
+  (pad_a_training_i4.png); b -> back to Main Menu (pad_b_back_i4.png); y on Profile Selection
+  -> Create a Profile keyboard; right/down/down moves the highlight Done -> 1 -> a -> k
+  (profile_keyboard_pad_nav_i4.png); b (150 ms) -> Profile Selection, b:400 -> Main Menu
+  (pad_b_cancel_main_i4.png).
+- Keyboard (send_key.ps1 -> window -> toolkit key map): Z (A) -> Training (kbd_z_training_i4),
+  X (B) -> back (kbd_x_back_i4), Down x5 -> Change Profile with its description
+  (kbd_down5_change_profile_i4), Z -> Profile Selection: profile list, settings column,
+  RENAME / Y NEW / X REMOVE / A SELECT / B CANCEL hints (profile_selection_i4), V (Y) -> Create
+  a Profile: all keyboard rows render (Done/1-0, Shift/a-j, Caps Lock/k-t, Symbols/u-z/
+  Backspace, Accents/Space/<-/->) + A SELECT / B BACK (profile_keyboard_i4).
+- Visuals: no garbage; text/layout correct on every screen. One dump (snap_f_kbd_x) caught the
+  description line mid-redraw after a screen change (next frames clean) - a transition frame.
+- Minor/unexplained: the first pad b on the keyboard screen (highlight on "k") did nothing;
+  later b presses there worked. Possibly game behaviour on a letter key; left for David.
+- Keyboard map (toolkit): arrows = D-pad, Enter = START, Backspace = BACK, Z/X/C/V = A/B/X/Y,
+  WASD = left stick, IJKL = right stick, Q/E = White/Black, 1/3 = L/R trigger.
+- Not tested here: a physical XInput controller (left for David).
+- How David launches: from C:\Recomp\CounterStrikeXB2,
+  `powershell -ExecutionPolicy Bypass -File scripts\run.ps1` (normal play; he closes it).
