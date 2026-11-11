@@ -257,3 +257,21 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
   black for ~1-2 min while the map loads (no intro, no loading picture yet), which reads as a crash.
 - Next: UX of the hand-over (keep the old window up until the new one exists / show it in the
   same place), load time (~2 min), in-game FPS (window title showed 0-2 FPS during load; measure in game).
+## Airstrip in-game visuals, David's PID 7596 (11:56-11:57 PT, read-only window captures)
+- By the time we looked, the team was already chosen; the Select Weapon (buy) wheel was open, so no
+  key was sent. Captures: C:\Users\dynam\cs2_snaps\ingame_pre_select.png, ingame_glitch_01..08.png
+  (copy: docs/evidence/airstrip_ingame_buymenu_david.png).
+- FPS (window title): 0-3 FPS throughout (draws/frame ~720-760). Round timer went 4:14 -> 4:00 ->
+  3:52 -> 3:47 across ~30 s real time, so the game clock runs roughly half speed.
+- World: almost the whole scene is flat grey. Only alpha-tested foliage (palm, pine, ferns), one
+  striped pole and a concrete post are visible. No ground, walls, hangars or sky texture can be made
+  out, so BSP world surfaces/sky are missing or drawn as flat grey (fog/clear colour). Needs a frame
+  without the buy menu to confirm.
+- No first-person weapon viewmodel visible.
+- HUD: numerals (health 100, armor 0, timer, ammo 20/40, $9250) look smeared/ghosted with a dark
+  offset copy, and the timer colon is missing. A light-blue translucent ellipse sits top-left
+  (probably the radar background with no radar contents). Small stray glyphs ("q" marks) below the
+  wheel. Chat/event text ("Quade picked up the bomb", player names Mike/Zane) renders.
+- Buy wheel itself renders legibly (dark segments, labels).
+- Suspects for later (unverified): world brushes use a lightmap/multitexture or a combiner path
+  the toolkit pb_exec does not handle; HUD ghosting from AA/supersample scaling of 2D quads.
