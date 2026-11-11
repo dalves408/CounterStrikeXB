@@ -275,3 +275,23 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 - Buy wheel itself renders legibly (dark segments, labels).
 - Suspects for later (unverified): world brushes use a lightmap/multitexture or a combiner path
   the toolkit pb_exec does not handle; HUD ghosting from AA/supersample scaling of 2D quads.
+## Airstrip in-game, buy menu closed (David's PID 7596, 12:00 PT, read-only captures)
+- C:\Users\dynam\cs2_snaps\ingame_clean_01..04.png (copy docs/evidence/airstrip_ingame_clean_david.png).
+  FPS (title) 2-4, draws/frame 675-766.
+- World geometry: MISSING. Left ~84% of the view is a flat mottled grey; the right ~16% is flat white
+  with a cyan patch top-right. No ground, runway, walls, hangars or skybox. Only studio models and
+  alpha-tested foliage render (palms, pine, ferns, striped pole, concrete post), correctly textured
+  and depth-sorted among themselves, standing on nothing. So BSP world brushes + sky are not drawn
+  (or drawn flat); entities/models are fine.
+- Viewmodel: no first-person weapon visible (ammo HUD shows 20/40, so a weapon is equipped).
+- HUD POSITION (David: "drawn in the middle of the screen, should be at the top/edges"): the whole
+  status row (health cross 100, armor 0, round timer 4:42/4:33 with no colon, ammo 20 | 40, $12500)
+  sits at ~45% of screen height instead of the screen edge; the radar oval (light-blue, empty) and
+  buy-zone cart icon are inset from the top-left; crosshair-like glyphs at ~88% height, x centre,
+  instead of screen centre; chat ("Quade / Fire in the hole!") lower-left. Positions are not a
+  uniform shift, consistent with HUD 2D quads being placed in one coordinate space (640x480) while
+  the frame is the 640x960 supersampled back buffer, or with a viewport/scissor scale on the 2D pass.
+  Suspect: same family as the earlier 640x960 vs 640x480 issue (toolkit pb_exec AA/supersample
+  scale for screen-space/transformed vertices). Unverified.
+- HUD text: earlier ghosting looks milder without the buy overlay; digits readable, colon missing.
+- Light-grey bar across the top-left edge (x 0-370, first ~20 px) of unknown origin.
