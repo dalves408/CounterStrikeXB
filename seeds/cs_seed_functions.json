@@ -1,0 +1,6 @@
+[
+  {
+    "start": "0x000C6310",
+    "note": "Thread start routine (SEH prolog: push -1; push 0x23B750; mov eax,fs:[0]). Address is pushed as a CreateThread start at 0x000C64BA. Measured: old project run boot5 logged '[ICALL] Failed to resolve VA 0x000C6310' because the detector missed it."
+  }
+]
