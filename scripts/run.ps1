@@ -12,7 +12,7 @@ param(
     [string]$Label = ('run_' + (Get-Date -Format 'yyyyMMdd_HHmmss')),
     [int]$FbDumpEvery = 0,           # >0: dump the guest framebuffer every N frames to runs\<label>\fb.bmp
     [switch]$PadLive,                # diagnostics: also feed pad 0 from runs\<label>\pad_live.txt (toolkit RECOMP_PAD_LIVE, same XID report path)
-    [string[]]$ExtraEnv = @(),       # NAME=VALUE pairs for experiments
+    [string[]]$ExtraEnv = @(),       # NAME=VALUE pairs for experiments (';'-separated ok)
     [switch]$PassThru
 )
 $ErrorActionPreference = 'Stop'
@@ -23,12 +23,18 @@ if ($Label -notmatch '^[A-Za-z0-9_\-]+$') { throw 'label: letters, digits, - and
 $dir = Join-Path $root "runs\$Label"
 New-Item -ItemType Directory -Force $dir | Out-Null
 
+# Start from a clean slate: inherited RECOMP_*/CS_* knobs from another
+# project's shell silently change behaviour (and RECOMP_SAVE_DIR moves saves).
+Get-ChildItem env: | Where-Object { $_.Name -match '^(RECOMP_|CS_)' } |
+    ForEach-Object { Remove-Item "env:$($_.Name)" }
+
 $envs = [ordered]@{
     RECOMP_USB         = '1'   # OHCI + USB gamepad model (XAPI's real input path)
     RECOMP_KEYBOARD    = '1'   # keyboard -> pad 0 (toolkit map: arrows=D-pad, Enter=START, Backspace=BACK, Z/X/C/V=A/B/X/Y, WASD=left stick)
     RECOMP_FB_WINDOW   = '1'
     RECOMP_D3D_PRESENT = '1'
-    CS_SAVE_ROOT       = (Join-Path $root 'SaveData')
+    CS_SAVE_ROOT       = (Join-Path $root 'SaveData')   # partition images / cache (src/main.c)
+    RECOMP_SAVE_DIR    = (Join-Path $root 'SaveData')   # TDATA/UDATA (profiles, saves)
 }
 if ($FbDumpEvery -gt 0) {
     $envs['RECOMP_FB_DUMP'] = (Join-Path $dir 'fb.bmp')
@@ -39,7 +45,8 @@ if ($PadLive) {
     $envs['RECOMP_PAD_LIVE'] = $live
     $envs['RECOMP_INPUT_DIAG'] = '1'
 }
-foreach ($kv in $ExtraEnv) { $k, $v = $kv -split '=', 2; $envs[$k] = $v }
+# ';'-separated too, because powershell -File passes a comma list as one string.
+foreach ($kv in (($ExtraEnv -join ';') -split ';' | Where-Object { $_ })) { $k, $v = $kv -split '=', 2; $envs[$k] = $v }
 foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k, $envs[$k], 'Process') }
 ($envs.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) | Set-Content (Join-Path $dir 'env.txt')
 
