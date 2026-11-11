@@ -19,7 +19,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $p = & (Join-Path $PSScriptRoot 'run.ps1') -Label $Label -FbDumpEvery 30 -ExtraEnv ($ExtraEnv -join ';') -PassThru
 $dir = Join-Path $root "runs\$Label"
 $fb = Join-Path $dir 'fb.bmp'
-$sched = foreach ($k in (($Keys -join ';') -split ';' | Where-Object { $_ })) { $t, $n = $k -split ':', 2; [pscustomobject]@{ T = [double]$t; Key = $n; Done = $false } }
+$sched = foreach ($k in (($Keys -join ';') -split '[;,]' | Where-Object { $_ })) { $t, $n = $k -split ':', 2; [pscustomobject]@{ T = [double]$t; Key = $n; Done = $false } }
 $sw = [Diagnostics.Stopwatch]::StartNew(); $nextSnap = $SnapEvery; $lastHash = ''
 "t,event" | Set-Content (Join-Path $dir 'probe.csv')
 while ($sw.Elapsed.TotalSeconds -lt $Seconds -and -not $p.HasExited) {
