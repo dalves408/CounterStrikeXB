@@ -32,6 +32,9 @@
  * old file's other CS hooks (pad mirroring, button pulses, guest pokes) are
  * deliberately not carried over.
  */
+#include <windows.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -44,9 +47,72 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va, uint32_t put_off, uint32_t get_
 #define CS_D3D_FENCE_PUT_OFF   0x2Cu   /* last submitted time            */
 #define CS_D3D_FENCE_GET_PTR   0x30u   /* -> GPU-written completion word */
 
+/*
+ * 2. The NV2A video overlay (PVIDEO): CS's intro movies.
+ *
+ * CS plays its XMV intros (MGS_Logo, Valve_Logo, ESRB; boot flow 0x000ADB46)
+ * through D3D's overlay, not as geometry: each decoded YUY2 frame goes to
+ * D3DDevice_UpdateOverlay, which programs PVIDEO's bank registers and sets the
+ * bank's bit in NV_PVIDEO_BUFFER. When the movie ends, the player's cleanup
+ * (0x000C6BC0) calls D3DDevice_EnableOverlay(FALSE) at 0x0030A8D0:
+ *
+ *     mov  eax, [0x316fe8]       ; device
+ *     mov  eax, [eax+0x934]      ; NV2A register base (0xFD000000)
+ *     ...  mov [eax+0x8704], 1   ; NV_PVIDEO_STOP
+ *   L: cmp  [eax+0x8700], 0      ; NV_PVIDEO_BUFFER
+ *     jne  L
+ *
+ * Against the plain memory behind the aperture BUFFER never clears, so the
+ * main thread spun there forever on a black screen (measured: runs/b6_peek,
+ * end-of-movie flag [0x552308] = 1, then no further GPU work; watchdog stack
+ * through 0x000C6BC7 in runs/v17_wd).
+ *
+ * The pinned toolkit already models PVIDEO (nv2a_core.c pvideo_write: STOP
+ * clears the pending banks, as xemu does) and scans the overlay out over the
+ * framebuffer (fb_present.c fb_overlay / pvideo_scanout.h, toolkit #220). Both
+ * are reached only by a title that calls nv2a_hook_init -- which makes the
+ * PVIDEO register page fault -- and routes those faults to
+ * nv2a_hook_handle_mmio from its VEH. This file does exactly that and nothing
+ * more: only the 4 KB PVIDEO page is trapped; every other NV2A register stays
+ * the plain memory the rest of the toolkit expects. No game state is written.
+ */
+extern void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
+extern bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                  uint32_t fault_xbox_va, int is_write);
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+#define CS_NV2A_PVIDEO_VA   0xFD008000u
+#define CS_NV2A_PVIDEO_SIZE 0x1000u
+
+static int s_pvideo_hooked;
+
 void cs_gpu_init(void)
 {
     if (xbox_Nv2aMirrorFence(CS_D3D_DEVICE_PTR_VA, CS_D3D_FENCE_PUT_OFF,
                              CS_D3D_FENCE_GET_PTR) != 0)
         fprintf(stderr, "[CS2] NV2A fence mirror: table full\n");
+
+    /* The VEH (main.c) is installed before this runs, so the trapped page's
+     * first fault already has somewhere to go. */
+    nv2a_hook_init(xbox_GetMemoryOffset());
+    s_pvideo_hooked = 1;
+}
+
+int cs_gpu_mmio_fault(void *exception_pointers)
+{
+    PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)exception_pointers;
+    uintptr_t fault, base;
+    uint64_t rel;
+
+    if (!s_pvideo_hooked || !ep ||
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return 0;
+    fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    base = (uintptr_t)xbox_GetMemoryOffset();
+    rel = (uint64_t)fault - (uint64_t)base;
+    if (fault < base || rel < CS_NV2A_PVIDEO_VA ||
+        rel >= (uint64_t)CS_NV2A_PVIDEO_VA + CS_NV2A_PVIDEO_SIZE)
+        return 0;
+    return nv2a_hook_handle_mmio(ep->ContextRecord, fault, (uint32_t)rel,
+               ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0) ? 1 : 0;
 }

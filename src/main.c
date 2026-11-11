@@ -237,6 +237,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          * TODO: Implement mini x86-64 decoder for instruction skipping,
          * or connect to the xbox_nv2a library for proper handling.
          */
+        /* CS2: the NV2A PVIDEO register page is trapped (src/cs_gpu.c). */
+        if (cs_gpu_mmio_fault(ep))
+            return EXCEPTION_CONTINUE_EXECUTION;
+
         if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
