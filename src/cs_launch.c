@@ -56,6 +56,7 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 #define CS_SELF_PATH_TAIL ";default.xbe"
 
 static uint32_t s_hal_va;
+static int s_from_parent;
 
 static int cs_is_self_launch(uint32_t page)
 {
@@ -111,6 +112,12 @@ static int cs_relaunch_self(uint32_t page)
     ok = fwrite(buf, 1, sizeof(buf), f) == sizeof(buf);
     fclose(f);
     if (!ok) return 0;
+    {   /* Diagnostics: CS_LAUNCH_SAVE=<file> keeps a copy, so a later run can
+         * start straight into the game with -ExtraEnv CS_LAUNCH_PAGE=<copy>. */
+        const char *keep = getenv("CS_LAUNCH_SAVE");
+        if (keep && *keep)
+            CopyFileA(file, keep, FALSE);
+    }
 
     if (!GetModuleFileNameA(NULL, exe, sizeof(exe))) return 0;
     _snprintf(pid, sizeof(pid), "%lu", (unsigned long)GetCurrentProcessId());
@@ -188,6 +195,7 @@ void cs_launch_restore(void)
     if (!GetEnvironmentVariableA("CS_LAUNCH_PAGE", file, sizeof(file)))
         return;
     pp = getenv("CS_LAUNCH_PARENT");
+    s_from_parent = pp && *pp;   /* only a hand-over file is consumed */
     if (pp && *pp) {
         HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, strtoul(pp, NULL, 10));
         if (h) {
@@ -209,7 +217,8 @@ void cs_launch_restore(void)
     }
     got = fread(buf, 1, sizeof(buf), f);
     fclose(f);
-    DeleteFileA(file);
+    if (s_from_parent)
+        DeleteFileA(file);
     if (got != sizeof(buf)) {
         fprintf(stderr, "[CS2-LAUNCH] short launch page %s (%zu)\n", file, got);
         return;

@@ -228,3 +228,6 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 - NEXT BLOCKER (map load, was out of scope): loading bar stays empty to 200 s; the engine
   loops FileSystem lookups for "*1".."*76" across t:\ z:\ d:\media d:\shared d:\cstrike
   d:\valve (inline brush-model names being opened as files).
+## Open issues logged from David (2026-11-11 ~11:30 PT)
+- Intro movies (MGS/Valve XMV) do not play smoothly on David's runs. Not investigated yet
+  (after the Training-launch work). Tip from David: START or A skips the intros in test runs.
