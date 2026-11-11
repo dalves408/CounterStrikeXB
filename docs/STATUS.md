@@ -231,3 +231,16 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 ## Open issues logged from David (2026-11-11 ~11:30 PT)
 - Intro movies (MGS/Valve XMV) do not play smoothly on David's runs. Not investigated yet
   (after the Training-launch work). Tip from David: START or A skips the intros in test runs.
+## VERIFIED: Training map loads and plays after the relaunch (runs/l4_training, 11:32-11:37 PT)
+- Keys: Return every 5 s from 25 to 100 s (title -> Main Menu -> Training -> Hostage-Rescue).
+  Relaunch PID 20312 -> 25260; CS_LAUNCH_SAVE kept the hand-over page at
+  runs\launch_page_training_hostage.bin (type 0, title 0x4D530036, launch data byte 0 = 0x02).
+- By snap_225 the training level is running: in-game HUD ($16000) behind the tutorial prompt
+  "Buying Weapons and Equipment ... Press A to continue" (docs/evidence/training_ingame_prompt_l4.png).
+  No exception, no bugcheck, no exit up to the 320 s stop. So in Training there is NO map-load
+  crash; runs/l1_training only looked stuck because it was stopped at 200 s mid-load (the "*1".."*76"
+  loose-file probes are inline brush-model names checked across the search path; slow but finite).
+- Load time after relaunch is long (~2 min incl. briefing); file-probe logging is a suspect for later.
+- Direct-to-game test: `run.ps1 -ExtraEnv 'CS_LAUNCH_PAGE=<copy of a saved page>'` (the file is only
+  deleted when handed over by a parent instance).
+- Next (David 11:37): Training has too many prompts -> test Single Player / System Link match start.
