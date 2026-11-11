@@ -1,6 +1,6 @@
-﻿# HANDOFF - Counter-Strike (Xbox) recomp, CounterStrikeXB2
+﻿# HANDOFF - Counter-Strike (Xbox) recomp, CounterStrikeXB (formerly CounterStrikeXB2)
 Stopped 2026-11-11 12:02 PT at David's request. Full detail and evidence: docs/STATUS.md.
-All commits local only, nothing pushed. Old C:\Recomp\CounterStrikeXB and shared C:\Recomp\tools\xboxrecomp untouched.
+2026-11-11: at David's request the old C:\Recomp\CounterStrikeXB was deleted, this project renamed from CounterStrikeXB2 to C:\Recomp\CounterStrikeXB, and published to github.com/dalves408/CounterStrikeXB (replacing the old repo). Shared C:\Recomp\tools\xboxrecomp untouched.
 
 ## Working (verified)
 - Clean project: own toolkit clone pinned (v0.17.0 + local patches 0001-0003, applied by setup.ps1), pure generated code, clean disc extraction, project-local SaveData.

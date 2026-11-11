@@ -1,4 +1,4 @@
-# CounterStrikeXB2 - status (verified facts only)
+# CounterStrikeXB (formerly CounterStrikeXB2) - status (verified facts only)
 
 Fresh rebuild of the Counter-Strike (Xbox, 0x4D530036) -> Windows static recomp.
 Old project `C:\Recomp\CounterStrikeXB` and the shared `C:\Recomp\tools\xboxrecomp`
@@ -201,7 +201,7 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 - Keyboard map (toolkit): arrows = D-pad, Enter = START, Backspace = BACK, Z/X/C/V = A/B/X/Y,
   WASD = left stick, IJKL = right stick, Q/E = White/Black, 1/3 = L/R trigger.
 - Not tested here: a physical XInput controller (left for David).
-- How David launches: from C:\Recomp\CounterStrikeXB2,
+- How David launches: from C:\Recomp\CounterStrikeXB,
   `powershell -ExecutionPolicy Bypass -File scripts\run.ps1` (normal play; he closes it).
 
 ## "CRASH AFTER THE MENUS" = XLaunchNewImage into itself (2026-11-11 ~11:20 PT)
