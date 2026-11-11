@@ -1,0 +1,44 @@
+From a31cc9e16579b890440cad35d1fec724a49092dc Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 07:10:00 -0800
+Subject: [PATCH] usb/ohci: keep waiting for the driver to start the controller
+ (CounterStrikeXB2 local patch)
+
+The controller thread gave up after 1500 ticks if HcControl never reached
+Operational. Counter-Strike's XAPI starts the host controller only after its
+intro movies: 22-29 s of ticks on a normal boot, and a slower boot crossed
+the limit, after which no device was ever plugged in and the title had no
+pad and no keyboard for the whole session (2 of the last ~15 runs). Keep
+polling instead and log once at the old limit.
+---
+ src/usb/ohci.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/usb/ohci.c b/src/usb/ohci.c
+index 5462e9a..2130d41 100644
+--- a/src/usb/ohci.c
++++ b/src/usb/ohci.c
+@@ -1095,9 +1095,18 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
+ 
+         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+          * the driver has not started yet is not a test of anything. */
++        /* No deadline: giving up after 1500 ticks ("30 s and it never
++         * started") left Counter-Strike with no pad at all whenever its boot
++         * ran slow -- XAPI starts the controller after the intro movies, at
++         * 22-29 s of ticks on a normal boot, and a slower one crossed 1500
++         * and never got a device (CounterStrikeXB2 runs f2_tc, i3_menu). A
++         * title that never starts USB costs one sleeping thread. */
+         if ((control & 0xC0u) != 0x80u) {
+-            if (++waited > 1500)              /* 30 s and it never started */
+-                break;
++            if (++waited == 1500) {
++                fprintf(stderr, "  [OHCI0] controller not started after 1500"
++                                " ticks; still waiting%c", 10);
++                fflush(stderr);
++            }
+             continue;
+         }
+         if (!(enable & INTR_MIE))
+-- 
+2.51.0.windows.2
+

@@ -147,7 +147,7 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
 - Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
   off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
 
-## FRAMING FIXED: presenter picked the 640x960 back buffer (2026-11-11 ~07:00 PT)
+## FRAMING FIXED: presenter picked the 640x960 back buffer (2026-11-11 ~06:35 PT)
 - Not a rasteriser/sampling bug. runs/f2_tc (FTRACE now prints texcoord 0): resolve triangle
   texcoords 0,0 / 2560,0 / 0,3840 against positions 0,0 / 2560,0 / 0,1920 = correct 1:2
   vertical downsample into the front buffer 0x00D44000. (The FTRACE "px" figure is not a
@@ -169,3 +169,13 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
   So A (confirm) via keyboard Return is verified. Evidence: docs/evidence/title_full_fx1.png,
   main_menu_full_fx1.png, training_menu_full_fx1.png (copies in C:\Users\dynam\cs2_snaps\fx1_*).
 - Next: B (back) key, profile keyboard rows (Change Profile -> create), pad injection (-PadLive).
+
+## USB never started on slow boots: toolkit OHCI 30 s deadline (2026-11-11 ~06:50 PT)
+- runs/f2_tc and i3_menu reached the title but never got input: no "[OHCI0] operational"
+  line at all. ohci.c's controller thread gave up after 1500 ticks ("30 s and it never
+  started"); CS's XAPI starts the HC only after the intro movies, logged 22-29 s on normal
+  boots (n5/n6/v17_vbl ~29 s), so a slower boot crossed it and the session had no pad or
+  keyboard at all.
+- FIX = local toolkit patch 0003-usb-ohci-keep-waiting-for-the-driver-to-start-the-co.patch
+  (keep polling, log once at 1500). Pin -> a31cc9e (343b6d8 + 0001..0003), reproduced
+  bit-exact in a scratch clone.

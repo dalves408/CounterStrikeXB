@@ -1,12 +1,13 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "616b31f6d83235eaacbc5bafa3cd2dada3b70ff6",
+                       "commit":  "a31cc9e16579b890440cad35d1fec724a49092dc",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
                                              "patches/xboxrecomp/0001-disasm-drop-phase-shifted-call-targets-CounterStrike.patch",
-                                             "patches/xboxrecomp/0002-pb_exec-present-the-display-sized-surface-over-a-tal.patch"
+                                             "patches/xboxrecomp/0002-pb_exec-present-the-display-sized-surface-over-a-tal.patch",
+                                             "patches/xboxrecomp/0003-usb-ohci-keep-waiting-for-the-driver-to-start-the-co.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",
