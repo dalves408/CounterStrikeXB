@@ -5,7 +5,8 @@ $root = Split-Path $PSScriptRoot -Parent
 $dep = Get-Content (Join-Path $root 'dependencies.json') -Raw | ConvertFrom-Json
 $tk = Join-Path $root $dep.xboxrecomp.path
 if (-not (Test-Path -LiteralPath (Join-Path $tk '.git'))) {
-    & git clone $dep.xboxrecomp.url $tk
+    # autocrlf off: git am of the local patches fails on a CRLF-converted checkout.
+    & git clone -c core.autocrlf=false $dep.xboxrecomp.url $tk
     if ($LASTEXITCODE -ne 0) { throw 'git clone xboxrecomp failed' }
 }
 $item = Get-Item -LiteralPath $tk -Force

@@ -1,0 +1,99 @@
+From 616b31f6d83235eaacbc5bafa3cd2dada3b70ff6 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 07:00:00 -0800
+Subject: [PATCH] pb_exec: present the display-sized surface over a taller
+ supersampled one (CounterStrikeXB2 local patch)
+
+The flip presented the biggest surface drawn since the last flip. D3D's
+supersampled back buffers are taller than the display: Counter-Strike draws
+its 640x480 UI into a 640x960 surface (SURFACE_FORMAT 0x128, no NV2A AA bits)
+and D3D's Swap filters it into the 640x480 front buffer with one textured
+triangle (positions 0,0 / 2560,0 / 0,1920; texcoords 0,0 / 2560,0 / 0,3840,
+i.e. a correct 1:2 vertical downsample). Biggest-wins handed the window the
+640x960 back buffer read as 640x480: its top half 1:1, the bottom of every
+screen cut off.
+
+note_drawn now prefers a display-sized surface (640x480 logical, at the
+surface's own AA scale, so 2x1/2x2 NV2A AA surfaces still count) over one
+that is not; between two of the same kind the biggest still wins, so
+Burnout 3's small shadow maps and X-Men Legends' AA menu are unchanged.
+The frame trace also prints the program batch's texcoord 0 per vertex.
+---
+ src/kernel/nv2a_pb_exec.c | 45 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a5ea9cc..722fb5f 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -310,6 +310,7 @@ static struct {
+      * biggest surface drawn since the last flip is the one being presented. */
+     uint32_t drawn_pitch, drawn_x, drawn_y, drawn_w, drawn_h, drawn_bpp;
+     int drawn_stale;      /* set at a flip: the next draw starts a new frame */
++    int drawn_disp;       /* drawn_offset is display-sized (note_drawn) */
+     uint64_t pixels;
+     uint32_t pixel_max;   /* brightest value any pixel write carried */
+     uint32_t clip_x, clip_w, clip_y, clip_h;       /* real (anti-aliased) pixels */
+@@ -621,11 +622,42 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+ 
+ static uint32_t surface_bpp(void);
+ 
++/* The size of the picture the display scans out, in logical pixels. The
++ * window (fb_present) is 640x480 and so is every SD mode a title sets.
++ * ponytail: HD modes (720p/1080i) are not modelled here; nothing matches and
++ * the biggest-surface rule below decides, as before. */
++#define NV_DISPLAY_W 640u
++#define NV_DISPLAY_H 480u
++
++/* Is a surface of real size w x h, at the current AA scale, display-sized? */
++static int surface_is_display_sized(uint32_t w, uint32_t h, float sx, float sy)
++{
++    uint32_t ax = sx > 1.5f ? 2u : 1u, ay = sy > 1.5f ? 2u : 1u;
++    return w == NV_DISPLAY_W * ax && h == NV_DISPLAY_H * ay;
++}
++
++/* Which surface the flip presents: the biggest one drawn since the last flip
++ * (Burnout 3's small shadow maps, drawn after the scene, must not win) --
++ * unless a display-sized surface was drawn and the biggest is not one.
++ * D3D's supersampled back buffers are taller than the display: Counter-Strike
++ * renders its 640x480 UI into a 640x960 surface (SURFACE_FORMAT 0x128, no
++ * NV2A AA bits) and D3D's Swap then filters it into the 640x480 front buffer
++ * with one textured triangle. Biggest-wins presented the 640x960 back buffer
++ * read as 640x480 -- its top half 1:1, the bottom of every screen cut off --
++ * instead of the front buffer the CRTC scans. */
+ static void note_drawn(void)
+ {
+-    if (!s_gpu.drawn_stale && s_gpu.drawn_offset
+-        && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
+-        return;
++    if (!s_gpu.drawn_stale && s_gpu.drawn_offset) {
++        int cur_disp = surface_is_display_sized(s_gpu.clip_w, s_gpu.clip_h,
++                                                s_gpu.aa_sx, s_gpu.aa_sy);
++        if (s_gpu.drawn_disp && !cur_disp)
++            return;
++        if (cur_disp == s_gpu.drawn_disp
++            && s_gpu.clip_w * s_gpu.clip_h < s_gpu.drawn_w * s_gpu.drawn_h)
++            return;
++    }
++    s_gpu.drawn_disp = surface_is_display_sized(s_gpu.clip_w, s_gpu.clip_h,
++                                                s_gpu.aa_sx, s_gpu.aa_sy);
+     s_gpu.drawn_stale = 0;
+     s_gpu.drawn_offset = s_gpu.color_offset;
+     s_gpu.drawn_pitch = s_gpu.pitch;
+@@ -3658,6 +3690,13 @@ static void draw_primitive(void)
+                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
+                         s_xf[2].pos[0], s_xf[2].pos[1], 10);
++            if ((s_gpu.xf_mode & 3) == 2 && s_xf) {
++                uint32_t k2;
++                for (k2 = 0; k2 < 3 && k2 < s_gpu.idx_count; k2++)
++                    fprintf(stderr, "[FTRACE]     t0[%u] %g %g %g %g  in0 idx %u\n", k2,
++                            s_xf[k2].tex[0][0], s_xf[k2].tex[0][1],
++                            s_xf[k2].tex[0][2], s_xf[k2].tex[0][3], s_gpu.idx[k2]);
++            }
+             if (s_gpu.rc_seen) {
+                 int st;
+                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
+-- 
+2.51.0.windows.2
+

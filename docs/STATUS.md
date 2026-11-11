@@ -146,3 +146,26 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
   NOT yet tested: a real XInput controller, A/B on menu items.
 - Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
   off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
+
+## FRAMING FIXED: presenter picked the 640x960 back buffer (2026-11-11 ~07:00 PT)
+- Not a rasteriser/sampling bug. runs/f2_tc (FTRACE now prints texcoord 0): resolve triangle
+  texcoords 0,0 / 2560,0 / 0,3840 against positions 0,0 / 2560,0 / 0,1920 = correct 1:2
+  vertical downsample into the front buffer 0x00D44000. (The FTRACE "px" figure is not a
+  coverage count for queued program triangles; ignore it.)
+- Real cause: pb_exec note_drawn() presents "the biggest surface drawn since the last flip"
+  (toolkit fcea264, for Burnout 3 shadow maps). The 640x960 back buffer beats the 640x480
+  front, so the window got the back buffer read as 640x480 = top half 1:1. PCRTC_START is
+  never written by the title (runs/f3_crtc, RECOMP_NV2A_TRACE), so no scanout address exists.
+- FIX = local toolkit patch patches/xboxrecomp/0002-pb_exec-present-the-display-sized-surface-
+  over-a-tal.patch: prefer a display-sized surface (640x480 logical at its AA scale) over a
+  non-display-sized one; same-kind ties keep biggest-wins (Burnout/X-Men unchanged).
+  dependencies.json commit -> 616b31f (343b6d8 + 0001 + 0002), reproduced bit-exact in a
+  scratch clone. setup.ps1 now clones with core.autocrlf=false (git am failed on a
+  CRLF-converted checkout: "does not match index").
+- VERIFIED runs/fx1_present (85 s, Return 48/56/64, Down 72): full screens. Title with
+  "Please press START" + copyright lines (snap_050), Main Menu all 6 items Training..Change
+  Profile + A SELECT hint (snap_058), Return on Training -> Training submenu Hostage-Rescue /
+  Demolition with description and A SELECT / B BACK (snap_066), Down -> Demolition (snap_074).
+  So A (confirm) via keyboard Return is verified. Evidence: docs/evidence/title_full_fx1.png,
+  main_menu_full_fx1.png, training_menu_full_fx1.png (copies in C:\Users\dynam\cs2_snaps\fx1_*).
+- Next: B (back) key, profile keyboard rows (Change Profile -> create), pad injection (-PadLive).
