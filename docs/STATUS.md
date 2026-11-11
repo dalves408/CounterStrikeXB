@@ -129,6 +129,14 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
   front buffer 0x00D44000 (draw surface alternates in [GPU] stats), and the front buffer
   ends up holding the TOP HALF 1:1 -> the cut-off. Suspects: AA/supersample scale state
   (pb_exec surface_apply_clip maps AA=1 to 2x horizontal, sy only for AA=2) or resolve
-  texture coordinates. Next: trace SET_SURFACE_FORMAT/CLIP + resolve draw texcoords.
+  texture coordinates.
+- Frame trace runs/f1_trace (RECOMP_FRAME_TRACE=<flag file> + RECOMP_FRAME_TRACE_METHODS=1,
+  flag created at 44 s on the title): back buffer SURFACE_FORMAT 0x128 (AA bits 0, so the
+  2x is D3D supersampling, not NV2A AA), clip 640x960; front clip 640x480. Resolve = ONE
+  triangle on surf 00D44000 640x480, texture 0 = 80AEC000 640x960 fmt 0x12 (linear
+  A8R8G8B8 rect, 0x1B04=00011229, rect 0x1B1C=028003C0, filter 0x1B14=02022000 linear),
+  positions v0 (0,0) v1 (2560,0) v2 (0,1920) (oversized, should cover all 640x480) but
+  the rasteriser reports px 171601 (< 307200). Next: dump that triangle's texcoords in
+  pb_exec and check rect-texture uv (texel units) and the px coverage.
 - Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
   off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
