@@ -203,3 +203,28 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 - Not tested here: a physical XInput controller (left for David).
 - How David launches: from C:\Recomp\CounterStrikeXB2,
   `powershell -ExecutionPolicy Bypass -File scripts\run.ps1` (normal play; he closes it).
+
+## "CRASH AFTER THE MENUS" = XLaunchNewImage into itself (2026-11-11 ~11:20 PT)
+- David's runs runs/run_20261111_110459 and _110721 (Main Menu -> Training -> Hostage-Rescue):
+  no exception, no dump. Log tail: `[PATH] \Device\CdRom0\-xbox_cs-f.xbe`, launch data page
+  type=0 titleid=0x4D530036 path='\Device\CdRom0;default.xbe', launch data 00000002, then
+  `HalReturnToFirmware: routine=2` -> toolkit bridge ExitProcess. The window simply closed.
+- Cause: CS's front end does not load a map in-process. It probes d:\-xbox_cs-f.xbe (dev name),
+  then XLaunchNewImage("d:\default.xbe") with launch data (strings at 0x00329A88) = quick
+  reboot into ITSELF. The toolkit treats every HalReturnToFirmware as quit.
+- FIX (hand-written, src/cs_launch.c; no toolkit change, generated code untouched): override of
+  the HalReturnToFirmware thunk (slot 0x003211BC, ordinal 49). Routine 2 + launch page naming
+  \Device\CdRom0;default.xbe + title 0x4D530036 -> save the 4 KB page to %TEMP%, CreateProcess
+  the same exe (same cmdline/cwd/std handles, env CS_LAUNCH_PAGE/CS_LAUNCH_PARENT), then the
+  toolkit bridge exits as before. The child waits for the parent, main.c calls
+  cs_launch_restore() after xbox_kernel_bridge_init(): page copied into a guest heap page and
+  KDATA LaunchDataPage pointed at it (what the kernel export reads). Other targets still exit.
+  run.ps1 sets CS_RUN_DIR; relaunched PIDs are appended to runs\<label>\pid.txt; bounded
+  run.ps1/probe.ps1 follow and stop the whole chain (own PIDs only).
+- VERIFIED runs/l1_training (keys Return 48/56, Z 64): Training submenu (snap_065) -> relaunch
+  PID 18088 -> 19116 at ~66 s, child skips intros (launch data honoured), reads
+  maps\cs_training.txt/.res, shows "Counter-Terrorist Briefing / Hostage-Rescue Training /
+  Loading..." (docs/evidence/training_briefing_relaunch_l1.png).
+- NEXT BLOCKER (map load, was out of scope): loading bar stays empty to 200 s; the engine
+  loops FileSystem lookups for "*1".."*76" across t:\ z:\ d:\media d:\shared d:\cstrike
+  d:\valve (inline brush-model names being opened as files).

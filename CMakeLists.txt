@@ -29,6 +29,7 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/cs_gpu.c
     src/cs_kernel.c
+    src/cs_launch.c
 )
 
 add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})

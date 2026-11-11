@@ -35,6 +35,7 @@ $envs = [ordered]@{
     RECOMP_D3D_PRESENT = '1'
     CS_SAVE_ROOT       = (Join-Path $root 'SaveData')   # partition images / cache (src/main.c)
     RECOMP_SAVE_DIR    = (Join-Path $root 'SaveData')   # TDATA/UDATA (profiles, saves)
+    CS_RUN_DIR         = $dir   # src/cs_launch.c appends relaunched PIDs (XLaunchNewImage -> default.xbe) to pid.txt
     # Required for boot (runs/b1_long hangs without them; verified p1_pvideo):
     RECOMP_PB_EXEC            = '1'       # toolkit NV2A pushbuffer executor (draws the D3D frames)
     RECOMP_CONTIG_AVOID_IMAGE = '1'       # contiguous allocations placed above the XBE image
@@ -61,11 +62,19 @@ $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru `
 Write-Host "PID $($p.Id); logs in $dir"
 if ($PassThru) { return $p }
 if ($Seconds -gt 0) {
-    if (-not $p.WaitForExit($Seconds * 1000)) {
-        Stop-Process -Id $p.Id -Force
-        $p.WaitForExit(5000) | Out-Null
-        Write-Host "stopped PID $($p.Id) after $Seconds s"
-    } else { Write-Host "exited with $($p.ExitCode)" }
+    # The title relaunches itself (menu -> game) as a new PID listed in pid.txt;
+    # wait on the whole chain and stop only PIDs this run started.
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $live = @(Get-Content (Join-Path $dir 'pid.txt') | ForEach-Object { Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue } | Where-Object { $_.ProcessName -eq 'cs2_xbox_recomp' })
+        if (-not $live) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    foreach ($id in (Get-Content (Join-Path $dir 'pid.txt'))) {
+        $q = Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue
+        if ($q -and $q.ProcessName -eq 'cs2_xbox_recomp') { Stop-Process -Id $q.Id -Force; Write-Host "stopped PID $id after $Seconds s" }
+    }
+    if ((Get-Date) -lt $deadline) { Write-Host "exited (chain: $((Get-Content (Join-Path $dir 'pid.txt')) -join ', '))" }
     $klog = Join-Path $root 'xbox_kernel.log'
     if (Test-Path $klog) { Copy-Item $klog (Join-Path $dir 'xbox_kernel.log') -Force }
 }

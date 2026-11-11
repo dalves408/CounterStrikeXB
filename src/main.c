@@ -42,6 +42,7 @@
 #include <xbox/xboxrecomp.h>
 #include <ohci.h>
 #include "cs_gpu.h"
+#include "cs_launch.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -380,6 +381,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+
+    /* CS2: XLaunchNewImage back into this XBE (src/cs_launch.c): restore the
+     * launch data page the previous instance handed over, if any. */
+    cs_launch_restore();
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

@@ -22,13 +22,16 @@ $fb = Join-Path $dir 'fb.bmp'
 $sched = foreach ($k in (($Keys -join ';') -split '[;,]' | Where-Object { $_ })) { $t, $n = $k -split ':', 2; [pscustomobject]@{ T = [double]$t; Key = $n; Done = $false } }
 $sw = [Diagnostics.Stopwatch]::StartNew(); $nextSnap = $SnapEvery; $lastHash = ''
 "t,event" | Set-Content (Join-Path $dir 'probe.csv')
-while ($sw.Elapsed.TotalSeconds -lt $Seconds -and -not $p.HasExited) {
+$pidFile = Join-Path $dir 'pid.txt'
+function Get-Live { @(Get-Content $pidFile | ForEach-Object { Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue } | Where-Object { $_.ProcessName -eq 'cs2_xbox_recomp' }) }
+while ($sw.Elapsed.TotalSeconds -lt $Seconds -and (Get-Live).Count -gt 0) {
+    $cur = (Get-Live)[-1]
     Start-Sleep -Milliseconds 250
     $t = $sw.Elapsed.TotalSeconds
     foreach ($s in $sched) {
         if (-not $s.Done -and $t -ge $s.T) {
             $s.Done = $true
-            try { & (Join-Path $PSScriptRoot 'send_key.ps1') -ProcessId $p.Id -Key $s.Key | Out-Null; "$([int]$t),key $($s.Key)" | Add-Content (Join-Path $dir 'probe.csv') }
+            try { & (Join-Path $PSScriptRoot 'send_key.ps1') -ProcessId $cur.Id -Key $s.Key | Out-Null; "$([int]$t),key $($s.Key)" | Add-Content (Join-Path $dir 'probe.csv') }
             catch { "$([int]$t),key $($s.Key) FAILED $_" | Add-Content (Join-Path $dir 'probe.csv') }
         }
     }
@@ -48,8 +51,10 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds -and -not $p.HasExited) {
         }
     }
 }
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(5000) | Out-Null; "stopped PID $($p.Id) at $Seconds s" }
-else { "exited early code $($p.ExitCode) at $([int]$sw.Elapsed.TotalSeconds) s" }
+$left = Get-Live
+if ($left) { foreach ($q in $left) { Stop-Process -Id $q.Id -Force; "stopped PID $($q.Id) at $Seconds s" } }
+else { "chain exited at $([int]$sw.Elapsed.TotalSeconds) s" }
+"pids: $((Get-Content $pidFile) -join ', ')"
 $klog = Join-Path $root 'xbox_kernel.log'
 if (Test-Path $klog) { Copy-Item $klog (Join-Path $dir 'xbox_kernel.log') -Force }
 Get-ChildItem $dir | Select-Object Name, Length | Format-Table -AutoSize | Out-String

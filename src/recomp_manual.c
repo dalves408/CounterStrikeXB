@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include "cs_kernel.h"
+#include "cs_launch.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -98,8 +99,10 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 
     /* CS: kernel-thunk semantics fixes (src/cs_kernel.c). Synthetic kernel
      * VAs only, so ordinary indirect calls pay one compare. */
-    if (xbox_va >= 0xFE000000u)
-        return (recomp_func_t)cs_kernel_override(xbox_va);
+    if (xbox_va >= 0xFE000000u) {
+        recomp_func_t f = (recomp_func_t)cs_launch_override(xbox_va);
+        return f ? f : (recomp_func_t)cs_kernel_override(xbox_va);
+    }
     return (recomp_func_t)0;
 }
 
