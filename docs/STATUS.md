@@ -138,5 +138,11 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
   positions v0 (0,0) v1 (2560,0) v2 (0,1920) (oversized, should cover all 640x480) but
   the rasteriser reports px 171601 (< 307200). Next: dump that triangle's texcoords in
   pb_exec and check rect-texture uv (texel units) and the px coverage.
+- VERIFIED runs/n1_nav (06:42 PT): saved profile reused (SaveData/TDATA/4d530036/
+  CurrentProfile.dat); START x3 -> Main Menu; keyboard Down, Down moves highlight Training
+  -> Xbox Live (snap_074), Up -> Single Player (snap_082). Evidence:
+  docs/evidence/main_menu_nav_down2_n1.png, main_menu_nav_up_n1.png. Keyboard reaches the
+  title through the same USB XID report path a pad uses (RECOMP_KEYBOARD -> pad 0).
+  NOT yet tested: a real XInput controller, A/B on menu items.
 - Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
   off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
