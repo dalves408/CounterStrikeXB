@@ -117,4 +117,11 @@ Map loading / gameplay: out of scope for now.
 Small local commits, never push. Bounded test runs, kill only own PIDs.
 
 
-- Runtime verification of the patched build: PENDING (see next entry).
+- VERIFIED runs/i1_split (06:15 PT, 80 s, keyboard Enter at 48/56/64 s via send_key.ps1):
+  irql-depth=0, OHCI 8 setups / 6 OUT0, interrupt-IN reports flowing (14149 by 80 s).
+  Title reacted to START: CurrentProfile.dat missing -> "You need a profile" prompt
+  (snap_050), then a default profile NewPlayer000 was created and the real Main Menu
+  rendered: Training / Single Player / Xbox Live / System Link ... (snap_065).
+  Evidence: docs/evidence/profile_prompt_i1.png, docs/evidence/main_menu_i1.png.
+- Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
+  off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
