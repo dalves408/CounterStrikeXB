@@ -1,0 +1,15 @@
+{
+  "xboxrecomp": {
+    "url": "https://github.com/sp00nznet/xboxrecomp.git",
+    "commit": "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b",
+    "tag": "v0.16.0",
+    "path": "tools/xboxrecomp",
+    "note": "Private clone owned by this project. Never a junction to C:\\Recomp\\tools\\xboxrecomp."
+  },
+  "capstone": "5.0.9",
+  "disc": {
+    "image": "Counter-Strike (USA) (En,Fr,Es,It,Ko).xiso.iso",
+    "image_sha256": "435d65bd29e04cb8dd0d80f18ce9632ada7b62b6abc3d7935b24b866281e418b",
+    "default_xbe_sha256": "8f0c12e345ed7b900f5732602e16ad7d17e3239b13f9baaf50541104169cb105"
+  }
+}

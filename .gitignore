@@ -1,0 +1,27 @@
+# Build output
+build/
+out/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+# Python
+.deps/
+.venv/
+__pycache__/
+*.pyc
+# Pinned toolkit clone (recreate with scripts/setup.ps1)
+tools/xboxrecomp/
+# Generated C: pure pipeline output (recreate with scripts/pipeline.py)
+src/recomp/gen/
+# Disc contents and images (bring your own dump)
+game_files/
+*.iso
+*.xbe
+# Local runtime state and logs
+SaveData/
+runs/
+analysis/
+*.log
