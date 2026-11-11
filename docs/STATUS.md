@@ -244,3 +244,4 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
 - Direct-to-game test: `run.ps1 -ExtraEnv 'CS_LAUNCH_PAGE=<copy of a saved page>'` (the file is only
   deleted when handed over by a parent instance).
 - Next (David 11:37): Training has too many prompts -> test Single Player / System Link match start.
+- 11:38 PT: test launches paused at David's request (he is picking a mode himself). runs/s1_single was my own aborted start (PID 28432, stopped after ~5 s; no data).
