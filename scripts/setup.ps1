@@ -10,8 +10,19 @@ if (-not (Test-Path -LiteralPath (Join-Path $tk '.git'))) {
 }
 $item = Get-Item -LiteralPath $tk -Force
 if ($item.LinkType) { throw "$tk is a $($item.LinkType); CS2 needs its own clone, not a link." }
-& git -C $tk checkout --quiet --detach $dep.xboxrecomp.commit
-if ($LASTEXITCODE -ne 0) { throw 'checkout of pinned xboxrecomp commit failed' }
+# commit = base_commit + local_patches (git am with a fixed identity, so the
+# resulting sha is reproducible). Reuse it if this clone already has it.
+& git -C $tk checkout --quiet --detach $dep.xboxrecomp.commit 2>$null
+if ($LASTEXITCODE -ne 0) {
+    & git -C $tk checkout --quiet --detach $dep.xboxrecomp.base_commit
+    if ($LASTEXITCODE -ne 0) { throw 'checkout of base xboxrecomp commit failed' }
+    $env:GIT_COMMITTER_NAME = 'CounterStrikeXB2'; $env:GIT_COMMITTER_EMAIL = 'cs2@local'
+    $env:GIT_COMMITTER_DATE = '2026-11-11T06:00:00-08:00'
+    foreach ($p in $dep.xboxrecomp.local_patches) {
+        & git -C $tk -c core.autocrlf=false am --quiet --committer-date-is-author-date (Join-Path $root $p)
+        if ($LASTEXITCODE -ne 0) { & git -C $tk am --abort; throw "local patch failed: $p" }
+    }
+}
 $head = (& git -C $tk rev-parse HEAD).Trim()
 if ($head -ne $dep.xboxrecomp.commit) { throw "toolkit HEAD $head != pin $($dep.xboxrecomp.commit)" }
 $dirty = & git -C $tk status --porcelain --untracked-files=no

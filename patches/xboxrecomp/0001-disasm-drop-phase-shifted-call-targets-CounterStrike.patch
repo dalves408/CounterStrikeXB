@@ -1,0 +1,112 @@
+From 65510706b843b10d6f70cdc86eeeb99c574601a6 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] disasm: drop phase-shifted call targets (CounterStrikeXB2
+ local patch)
+
+A direct-call target that lies strictly inside an instruction of a prologue function's body, and is called only from bytes outside every detected function, is a decode of data, not a function start. It clamped CS's XAPI device open 0x0031B21C at 0x0031B3AA (call decoded from data at 0x00318220), leaving IRQL raised and the pad URB unarmed. Also XNET 0x002695D1 (bogus 0x0026962A).
+---
+ tools/disasm/functions.py | 66 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/tools/disasm/functions.py b/tools/disasm/functions.py
+index e0bda93..0c73610 100644
+--- a/tools/disasm/functions.py
++++ b/tools/disasm/functions.py
+@@ -88,6 +88,10 @@ class FunctionDetector:
+         # the function they land in.
+         self._alias_entries: Dict[int, int] = {}
+         self._callback_code: Set[int] = set()
++        # Direct-call targets proven to sit inside an instruction of a
++        # prologue function's body and called only from outside every
++        # function. See _drop_phase_shifted_call_targets.
++        self._phase_shifted_targets: Set[int] = set()
+ 
+     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
+         """
+@@ -122,6 +126,11 @@ class FunctionDetector:
+         # Pass 5: Build functions from candidates
+         self._build_functions(sections)
+ 
++        # Pass 5b: call targets that land mid-instruction in a real body.
++        if self._drop_phase_shifted_call_targets():
++            self.functions.clear()
++            self._build_functions(sections)
++
+         # Pass 6: Tail-jump targets. A function reached only by "jmp" and never
+         # by "call" is invisible to every pass above, so it is emitted as a stub
+         # that returns without unwinding the frame its jumping caller built --
+@@ -744,6 +753,8 @@ class FunctionDetector:
+         swept = {sec.name for sec in sections}
+         unswept: Dict[str, List[int]] = {}
+         for target in call_targets:
++            if target in self._phase_shifted_targets:
++                continue
+             section = self.image.get_section_at_va(target)
+             if not (section and section.executable):
+                 continue
+@@ -801,6 +812,61 @@ class FunctionDetector:
+                   f" section {name} (e.g. 0x{min(targets):08X}); their callees"
+                   f" will be stubs. Add it with --extra-sections {name}.")
+ 
++    def _drop_phase_shifted_call_targets(self) -> int:
++        """
++        Pass 5b: drop a call_target start that lies strictly inside an
++        instruction of a prologue function's body when every direct call to it
++        comes from bytes outside all detected functions.
++
++        Pass 4 trusts any direct call, realigning the stream at its target.
++        When the "call" is itself a decode of data (the sweep running through
++        a table out of phase), its operand can name a byte in the middle of a
++        real function's instruction. That bogus start then clamps the owner:
++        Counter-Strike's XAPI device open (0x0031B21C) was cut at 0x0031B3AA,
++        inside `mov byte [ebp-0x26],4`, by a "call" decoded from data at
++        0x00318220; the generated body fell off its end with IRQL raised and
++        the pad's interrupt URB never armed. An MSVC body never overlaps
++        another entry, and a call from inside no function is no corroboration,
++        so both conditions together are safe to reject. (CounterStrikeXB2
++        local patch on v0.17.0.)
++        """
++        starts = sorted(self.functions)
++        callers: Dict[int, List[int]] = {}
++        candidates = {
++            addr for addr, (_, method) in self._candidates.items()
++            if method == "call_target"}
++        for insn in self.engine.instructions.values():
++            if insn.call_target in candidates:
++                callers.setdefault(insn.call_target, []).append(insn.address)
++
++        def inside_a_function(addr: int) -> bool:
++            index = bisect.bisect_right(starts, addr) - 1
++            if index < 0:
++                return False
++            func = self.functions[starts[index]]
++            return func.start <= addr < func.end
++
++        dropped = 0
++        for target in sorted(candidates):
++            index = bisect.bisect_left(starts, target) - 1
++            if index < 0:
++                continue
++            owner = self.functions[starts[index]]
++            if not owner.has_prologue or owner.end <= target:
++                continue
++            if not any(insn.address < target < insn.end_address
++                       for insn in self.engine.get_instructions_in_range(
++                           max(owner.start, target - MAX_INSN_LEN), target)):
++                continue
++            if any(inside_a_function(c) for c in callers.get(target, ())):
++                continue
++            del self._candidates[target]
++            self._phase_shifted_targets.add(target)
++            dropped += 1
++            print(f"  Dropped phase-shifted call target 0x{target:08X} "
++                  f"inside 0x{owner.start:08X}")
++        return dropped
++
+     def _pass_indirect_call_slots(self) -> None:
+         """
+         Pass 4b: An immediate written into a memory slot that is elsewhere the
+-- 
+2.51.0.windows.2
+

@@ -35,6 +35,11 @@ $envs = [ordered]@{
     RECOMP_D3D_PRESENT = '1'
     CS_SAVE_ROOT       = (Join-Path $root 'SaveData')   # partition images / cache (src/main.c)
     RECOMP_SAVE_DIR    = (Join-Path $root 'SaveData')   # TDATA/UDATA (profiles, saves)
+    # Required for boot (runs/b1_long hangs without them; verified p1_pvideo):
+    RECOMP_PB_EXEC            = '1'       # toolkit NV2A pushbuffer executor (draws the D3D frames)
+    RECOMP_CONTIG_AVOID_IMAGE = '1'       # contiguous allocations placed above the XBE image
+    RECOMP_AC97_READY         = '1'       # AC97 codec reports ready (DSOUND init)
+    RECOMP_VBLANK             = 'paced'   # paced 60 Hz vblank interrupts
 }
 if ($FbDumpEvery -gt 0) {
     $envs['RECOMP_FB_DUMP'] = (Join-Path $dir 'fb.bmp')

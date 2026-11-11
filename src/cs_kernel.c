@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <windows.h>
 #include "recomp_types.h"
 #include "cs_kernel.h"
 
@@ -81,11 +82,73 @@ static void cs_NtReadFile(void)
     }
 }
 
+/*
+ * 2. Diagnostic only (CS_IRQL_DIAG=1): who raises to DISPATCH_LEVEL and never
+ *    lowers. The toolkit's [IRQLHOLD] report names the bridge
+ *    (bridge_KeRaiseIrqlToDpcLevel) and one stack word, which is not enough to
+ *    find the guest caller. This logs the guest stack for the first raises at
+ *    each distinct esp. Behaviour is unchanged: the bridge does the raise.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#define CS_THUNK_KERAISEIRQLTODPC 0x003211A8u   /* ordinal 129 */
+static uint32_t s_keraise_va;
+
+int xbox_IrqlRaisedCount(void);                  /* kernel_hal.c */
+#define CS_THUNK_KFLOWERIRQL 0x003211A4u        /* ordinal 161, fastcall cl */
+static uint32_t s_kflower_va;
+static volatile long s_irql_logged;
+
+/* One line per raise/lower made from guest esp in [lo, hi) (CS_IRQL_DIAG_LO /
+ * _HI, hex; default the main thread's 0x0108ED00..0x0108EE00), with the
+ * toolkit's raised-thread count before and after and the guest stack. */
+static void cs_irql_log(const char *what, recomp_func_t bridge)
+{
+    static uint32_t lo = 1, hi;
+    uint32_t esp = g_esp, ecx = g_ecx;
+    int before, i;
+    if (lo == 1) {
+        const char *l = getenv("CS_IRQL_DIAG_LO"), *h = getenv("CS_IRQL_DIAG_HI");
+        lo = l ? strtoul(l, NULL, 16) : 0x0108ED00u;
+        hi = h ? strtoul(h, NULL, 16) : 0x0108EE00u;
+    }
+    before = xbox_IrqlRaisedCount();
+    if (bridge)
+        bridge();
+    if (esp >= lo && esp < hi && s_irql_logged < 3000) {
+        s_irql_logged++;
+        fprintf(stderr, "[CS2-IRQL] %s tid %lu esp %08X ecx %08X eax %08X depth %d->%d |",
+                what, (unsigned long)GetCurrentThreadId(), esp, ecx, g_eax,
+                before, xbox_IrqlRaisedCount());
+        for (i = 0; i < 12; i++)
+            fprintf(stderr, " %08X", MEM32(esp + 4 * i));
+        fprintf(stderr, "\n");
+    }
+}
+
+static void cs_KeRaiseIrqlToDpcLevel(void)
+{
+    cs_irql_log("raise", recomp_lookup_kernel(s_keraise_va));
+}
+
+static void cs_KfLowerIrql(void)
+{
+    cs_irql_log("lower", recomp_lookup_kernel(s_kflower_va));
+}
+
 recomp_func_t cs_kernel_override(uint32_t xbox_va)
 {
     if (!s_ntreadfile_va)
         s_ntreadfile_va = MEM32(CS_THUNK_NTREADFILE);
+    if (!s_keraise_va)
+        s_keraise_va = MEM32(CS_THUNK_KERAISEIRQLTODPC);
     if (xbox_va == s_ntreadfile_va)
         return cs_NtReadFile;
+    if (!s_kflower_va)
+        s_kflower_va = MEM32(CS_THUNK_KFLOWERIRQL);
+    if (xbox_va == s_keraise_va && getenv("CS_IRQL_DIAG"))
+        return cs_KeRaiseIrqlToDpcLevel;
+    if (xbox_va == s_kflower_va && getenv("CS_IRQL_DIAG"))
+        return cs_KfLowerIrql;
     return (recomp_func_t)0;
 }

@@ -79,6 +79,35 @@ Map loading / gameplay: out of scope for now.
    OHCI interrupts/DPCs are never delivered. Old project papered over this with
    RECOMP_IRQL_UNSTICK (not carried over). Next: RECOMP_IRQL_TRACE to find the raise.
 
+## Input root cause found: lifter mis-split of XAPI device open (2026-11-11 ~06:10 PT)
+- Not a missing KfLowerIrql in the guest and not cli/sti. CS_IRQL_DIAG (src/cs_kernel.c,
+  env-gated logging of KeRaiseIrqlToDpcLevel/KfLowerIrql with guest stack) showed the
+  unmatched raise is in XPP sub_0031B21C (XAPI internal device open): raise at 0x0031B239,
+  then the generated body simply ended at 0x0031B3AA ("Original: 0x0031B21C - 0x0031B3AA").
+- Cause: toolkit disasm accepted a bogus function start 0x0031B3A7 (detection call_target),
+  which is the MIDDLE of `mov byte [ebp-0x26],4` at 0x0031B3A6. The "call" is data decoded
+  as code at 0x00318220 (no function there). The bogus start clamped the real function, so
+  the open never sent its class request, never lowered IRQL, never armed the pad interrupt
+  URB -> IRQL depth 1 forever, OHCI irq held off, interrupt ED never gets a TD, 0 reports.
+- scripts/split_scan.py scans all starts for mid-instruction landings: 31 hits, almost all
+  linear-decode drift through padding/data; the two real ones are 0x0031B3A7 (XPP) and
+  0x0026962A (XNET, inside 0x002695D1 at `mov edi,[ecx+8]`).
+- Toolkit `--coalesce-functions` cannot fix it (it refuses call_target/tail_jump_alias
+  interior starts as "independent evidence").
+- An earlier WIP hand-wrote the missing 0x0031B3AA..0x0031B3EE instructions (src/cs_xpp.c);
+  discarded in favour of fixing the detector (backup: %TEMP%\cs2_wip_xpp on Champ).
+- FIX = LOCAL TOOLKIT PATCH (for later upstreaming):
+  patches/xboxrecomp/0001-disasm-drop-phase-shifted-call-targets-CounterStrike.patch, new
+  Pass 5b in tools/disasm/functions.py: drop a call_target start that lies strictly inside
+  an instruction of a prologue function AND whose every direct caller is outside all
+  detected functions. On CS it drops exactly 0x0031B3A7 and 0x0026962A (disasm.log);
+  0x0031B21C now spans 0x0031B21C-0x0031B46C (592 B), 0x002695D1 spans to 0x00269B64.
+  dependencies.json: base_commit 343b6d8 (v0.17.0) + local_patches -> commit 6551070;
+  scripts/setup.ps1 applies them with git am and a fixed identity (sha verified reproducible
+  in a scratch clone). Generated code is still pure pipeline output (14319 functions).
+- run.ps1 now sets RECOMP_PB_EXEC=1, RECOMP_CONTIG_AVOID_IMAGE=1, RECOMP_AC97_READY=1,
+  RECOMP_VBLANK=paced by default.
+
 ## Borrowings from other projects
 - PVIDEO: none from other projects; uses the pinned toolkit own model (#220, written for Bink/Midtown Madness 3).
 - NV2A fence-mirror pattern: concept from old CS project / toolkit (Wreckless);
@@ -87,3 +116,5 @@ Map loading / gameplay: out of scope for now.
 ## Rules in force
 Small local commits, never push. Bounded test runs, kill only own PIDs.
 
+
+- Runtime verification of the patched build: PENDING (see next entry).
