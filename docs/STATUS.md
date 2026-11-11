@@ -71,6 +71,13 @@ Map loading / gameplay: out of scope for now.
    found the window, so earlier key schedules never reached the game). Next: START on
    title screen -> profile flow (Initial_CreateProfile / SelectProfile) -> main menu.
 3. Bake required env into run.ps1 once confirmed stable.
+4. INPUT BLOCKER (runs/n2_start, n3_usb, 05:40 PT): keys reach the window ([KEY] down
+   vk=0x0D...) but the title never reacts. RECOMP_USB_STATS: USB enumeration stalls after
+   5 control setups / 3 OUT0, interrupt ED 00A3A090 never gets a TD, 0 reports served
+   (usb_gamepad_report never called). OHCI log: "irq held off by guest IRQL (depth 1)";
+   stats show irql-depth=1 permanently -> a guest raise without matching lower, so
+   OHCI interrupts/DPCs are never delivered. Old project papered over this with
+   RECOMP_IRQL_UNSTICK (not carried over). Next: RECOMP_IRQL_TRACE to find the raise.
 
 ## Borrowings from other projects
 - PVIDEO: none from other projects; uses the pinned toolkit own model (#220, written for Bink/Midtown Madness 3).
