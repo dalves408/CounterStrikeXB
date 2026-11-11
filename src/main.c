@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Counter-Strike (Xbox) - Recompiled Game Entry Point
  *
  * This is the Windows executable that hosts the recompiled game code.
@@ -41,6 +41,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include <ohci.h>
+#include "cs_gpu.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -345,6 +346,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * so host XInput / keyboard state arrives as real 20-byte XID reports on
      * the interrupt endpoint -- no guest-memory writes. */
     xbox_OhciInit();
+
+    /* CS2: D3D8LTCG completion fence (src/cs_gpu.c). */
+    cs_gpu_init();
 
     /* Bring up the emulated APU.
      *
