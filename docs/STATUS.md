@@ -245,3 +245,15 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
   deleted when handed over by a parent instance).
 - Next (David 11:37): Training has too many prompts -> test Single Player / System Link match start.
 - 11:38 PT: test launches paused at David's request (he is picking a mode himself). runs/s1_single was my own aborted start (PID 28432, stopped after ~5 s; no data).
+
+## David's Single Player -> Beginner -> Airstrip run (runs/run_20261111_113815, 11:38 PT)
+- Path: Main Menu, Down (Single Player), A on every screen (Beginner, Airstrip defaults).
+- PID 7216 handed over at ~11:39:02 (launch data byte 0 = 0x03, page type 0, title 0x4D530036)
+  to PID 7596. No exception, no bugcheck. The child loaded Airstrip and at 11:42 was in game at
+  the team-select menu (Auto-Select / Counter-Terrorist / Terrorist, $16000 HUD behind;
+  desktop capture docs/evidence/airstrip_team_select_david_run.png). Window title FPS 0-2 during
+  load; draws climbing.
+- So the "crash" David saw is the menu window closing on the self-relaunch: the new window is
+  black for ~1-2 min while the map loads (no intro, no loading picture yet), which reads as a crash.
+- Next: UX of the hand-over (keep the old window up until the new one exists / show it in the
+  same place), load time (~2 min), in-game FPS (window title showed 0-2 FPS during load; measure in game).
