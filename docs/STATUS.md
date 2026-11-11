@@ -123,5 +123,12 @@ Small local commits, never push. Bounded test runs, kill only own PIDs.
   (snap_050), then a default profile NewPlayer000 was created and the real Main Menu
   rendered: Training / Single Player / Xbox Live / System Link ... (snap_065).
   Evidence: docs/evidence/profile_prompt_i1.png, docs/evidence/main_menu_i1.png.
+- Framing analysis (06:30 PT): full UI is drawn into the 640x960 back buffer 0x00AEC000
+  (pitch 2560; fb.bmp00013 in runs/i1_split shows the complete Create-a-Profile screen
+  incl. A SELECT / B BACK at the bottom). D3D then draws a resolve pass into the 640x480
+  front buffer 0x00D44000 (draw surface alternates in [GPU] stats), and the front buffer
+  ends up holding the TOP HALF 1:1 -> the cut-off. Suspects: AA/supersample scale state
+  (pb_exec surface_apply_clip maps AA=1 to 2x horizontal, sy only for AA=2) or resolve
+  texture coordinates. Next: trace SET_SURFACE_FORMAT/CLIP + resolve draw texcoords.
 - Still open: framing (bottom of screen cut: profile prompt text and lower menu items cut
   off; fb dumps alternate 640x480 and 640x960), D-pad/A/B navigation, real XInput pad test.
