@@ -1,4 +1,4 @@
-﻿# CounterStrikeXB2 - status (verified facts only)
+# CounterStrikeXB2 - status (verified facts only)
 
 Fresh rebuild of the Counter-Strike (Xbox, 0x4D530036) -> Windows static recomp.
 Old project `C:\Recomp\CounterStrikeXB` and the shared `C:\Recomp\tools\xboxrecomp`
@@ -45,24 +45,35 @@ Map loading / gameplay: out of scope for now.
   working set is `-ExtraEnv 'RECOMP_PB_EXEC=1;RECOMP_CONTIG_AVOID_IMAGE=1;RECOMP_AC97_READY=1;RECOMP_VBLANK=paced'`
   (to be baked into run.ps1 once confirmed).
 
-## Current blocker: intro movies use the NV2A video overlay (PVIDEO) - not modelled
-Evidence (runs/b2_full, b3_wd, b5_ftrace, b6_peek; 2026-11-11 05:00-05:25 PT):
-- Boot flow sub at 0x000AD8A0: 0x000ADB46 plays d:\Media\Videos\MGS_Logo.xmv, then
-  Valve_Logo.xmv (0x000ADB53) via movie player 0x000C6F70, then waits for cache
-  flag [0x552D68] (loop 0x000ADB78), optional ESRB.xmv, then `open SuperLauncher_Root`
-  (0x000ADBE5) = the real menus.
-- Movie loop 0x000C7183..0x000C72D2: XMVDecoder_GetNextFrame (0x0029030E) via 0x000C6D40;
-  status 2 sets end flag [0x552308]=1 (a pad button >0x1E at 0x384F7A table skips).
-- Frames are shown with D3D UpdateOverlay (YUY2 overlay plane), not drawn: the PB
-  frame trace shows only a full-screen copy of the black back buffer.
-- b6_peek: [0x552308] becomes 1 (~15 s) -> movie DID finish. Then cleanup 0x000C6BC0
-  calls D3D EnableOverlay(FALSE) at 0x0030A8D0: writes NV_PVIDEO_STOP
-  (regs+0x8704 = 1) and spins until NV_PVIDEO_BUFFER (regs+0x8700) == 0. Nothing models
-  PVIDEO, so BUFFER never clears -> permanent hang, black screen (b2_full: triangle count
-  frozen for >100 s; watchdog stacks in v17_wd/b3_wd agree).
-- Fix plan: hand-written CS PVIDEO model (STOP clears BUFFER, like xemu's pvideo_write),
-  then composite the YUY2 overlay into the presented frame so intros are visible.
+## Milestone: intros play, boot reaches the title screen (2026-11-11 ~05:20 PT)
+- Commit 81dbd71: `src/cs_gpu.c` calls the toolkit's `nv2a_hook_init` and the VEH routes
+  the 4 KB NV2A PVIDEO page (0xFD008000) to `nv2a_hook_handle_mmio`. This reaches the
+  toolkit's existing PVIDEO model (STOP clears pending banks, like xemu) and overlay
+  scanout (toolkit #220). No game state written; generated code untouched.
+- Root cause it fixes: intros are XMV movies shown through D3D UpdateOverlay (PVIDEO);
+  at movie end D3D EnableOverlay(FALSE) (0x0030A8D0) writes NV_PVIDEO_STOP and spins
+  until NV_PVIDEO_BUFFER == 0; plain aperture memory never cleared it -> black hang.
+  (Boot flow 0x000AD8A0: MGS_Logo.xmv, Valve_Logo.xmv, wait cache [0x552D68], optional
+  ESRB, then `open SuperLauncher_Root` at 0x000ADBE5. Movie loop 0x000C7183, end flag
+  [0x552308].)
+- Verified runs/p1_pvideo (120 s, no input): MGS logo movie visible (snap_015), Valve logo,
+  sound banks, `SuperLauncher_Root.xpr` opened, title screen rendered at ~36-39 s
+  (snap_039), idle -> AttractMovie.xmv plays (snap_087..120). Evidence copies:
+  docs/evidence/intro_mgs_logo_p1.png, attract_movie_p1.png.
+- Required env (not yet defaults in run.ps1): RECOMP_PB_EXEC=1, RECOMP_CONTIG_AVOID_IMAGE=1,
+  RECOMP_AC97_READY=1, RECOMP_VBLANK=paced. Without them (runs/b1_long) boot hangs early.
+
+## Open issues / next
+1. Title screen framing: CS logo cut at the bottom edge (snap_039); back buffer is
+   640x960 (2x vertical AA) downsampled by D3D into the 640x480 front buffer - check
+   whether the layout/scale is right vs hardware.
+2. Input: send_key.ps1 rewritten (C# EnumWindows; the PowerShell-callback version never
+   found the window, so earlier key schedules never reached the game). Next: START on
+   title screen -> profile flow (Initial_CreateProfile / SelectProfile) -> main menu.
+3. Bake required env into run.ps1 once confirmed stable.
+
 ## Borrowings from other projects
+- PVIDEO: none from other projects; uses the pinned toolkit own model (#220, written for Bink/Midtown Madness 3).
 - NV2A fence-mirror pattern: concept from old CS project / toolkit (Wreckless);
   addresses re-derived for this XBE.
 
