@@ -249,6 +249,21 @@ static TexEnt s_tx[MAX_TEX];
 static StateEnt s_bs[96], s_dss[96], s_ss[48];
 static int s_nbs, s_ndss, s_nss;
 
+static uint32_t s_fr_draws, s_fr_tris;   /* this frame, for RECOMP_CS_FRAME_CSV */
+/* RECOMP_CS_FLASH=<dir>: every draw of the current and previous frame, kept so
+ * that a frame which comes out (almost) all black after a normal one can be
+ * explained: both draw lists go to stderr and the frame's targets to <dir>. */
+typedef struct {
+    uint32_t rt, rw, rh, n, kept, tex, fmt, tw, th, comb, bl, bsrc, bdst, at, afunc, aref, dt, cm, c0;
+    float x0, y0, z0, rhw0, u0, v0;
+    float vx[3][4], vt[3][4];      /* first triangle: position + rhw, texcoord 0 (combiner path) */
+    uint32_t rc_ctl, rc_sp, rc_f0, rc_f1, rc_cicw, rc_aicw, rc_cocw, rc_aocw, rc_k0, st_valid, st0_fmt, st0_off, st0_w, st0_h;
+    int srv_kind;                  /* 0 white, 1 render target, 2 decoded texture */
+} DrawRec;
+#define DL_MAX 256
+static DrawRec s_dl[2][DL_MAX];
+static unsigned s_dln[2], s_dlc;
+static const char *s_flash_dir;
 static int s_inited, s_failed;
 static uint32_t s_frame, s_tick;
 static int s_cull_on = 1, s_log, s_world_trace, s_no_alpha, s_force_a1;
@@ -979,6 +994,71 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
     rt->dirty = 1;
     st_draws++; st_tris += kept / 3;
+    s_fr_draws++; s_fr_tris += kept / 3;
+    if (s_flash_dir && s_dln[s_dlc] < DL_MAX) {
+        DrawRec *d = &s_dl[s_dlc][s_dln[s_dlc]++];
+        const Nv2aVertex *v = &b->vertices[0];
+        memset(d, 0, sizeof *d);
+        d->rt = s->color_va; d->rw = s->width; d->rh = s->height; d->n = b->count; d->kept = kept;
+        if (b->texture) { d->tex = b->texture->offset; d->fmt = b->texture->color; d->tw = b->texture->width; d->th = b->texture->height; }
+        d->comb = b->combiner ? 1u : 0u;
+        d->bl = r->blend_enable; d->bsrc = r->blend_src; d->bdst = r->blend_dst;
+        d->at = r->alpha_test_enable; d->afunc = r->alpha_func; d->aref = r->alpha_ref;
+        d->dt = r->depth_test_enable; d->cm = r->color_mask; d->c0 = v->diffuse;
+        d->x0 = v->x; d->y0 = v->y; d->z0 = v->z; d->rhw0 = v->rhw; d->u0 = v->u; d->v0 = v->v;
+        { int q; for (q = 0; q < 3 && q < (int)b->count; q++) {
+            d->vx[q][0] = b->vertices[q].x; d->vx[q][1] = b->vertices[q].y; d->vx[q][2] = b->vertices[q].z; d->vx[q][3] = b->vertices[q].rhw;
+            memcpy(d->vt[q], b->vertices[q].tex[0], sizeof d->vt[q]); } }
+        if (b->combiner) {
+            const Nv2aCombiner *c = b->combiner;
+            d->rc_ctl = c->control; d->rc_sp = c->stage_program; d->rc_f0 = c->final0; d->rc_f1 = c->final1;
+            d->rc_cicw = c->color_icw[0]; d->rc_aicw = c->alpha_icw[0]; d->rc_cocw = c->color_ocw[0]; d->rc_aocw = c->alpha_ocw[0];
+            d->rc_k0 = c->factor0[0]; d->st_valid = b->stage_valid;
+            if (b->stages) { d->st0_fmt = b->stages[0].color; d->st0_off = b->stages[0].offset; d->st0_w = b->stages[0].width; d->st0_h = b->stages[0].height; }
+            d->srv_kind = use_rc ? (srvs[0] == s_white_srv ? 0 : 2) : -1;
+            { int q; for (q = 0; q < MAX_RT; q++) if (use_rc && s_rt[q].srv && srvs[0] == s_rt[q].srv) d->srv_kind = 1; }
+        }
+    }
+}
+
+/* ---- frame timing log (RECOMP_CS_FRAME_CSV=<file>) ------------------------------
+ * One line per guest flip: time since process start, interval to the previous
+ * flip, draws and triangles of the frame, readback time, and a signature of the
+ * display-sized (640x480) target: mean luma, share of near-black pixels, and a
+ * hash of a sub-sampled grid. A flash shows up as a frame whose luma or black
+ * share jumps against both neighbours; a stall as a long interval. */
+static FILE *s_csv;
+static double s_sig_luma, s_sig_black;
+static uint64_t s_sig_hash;
+static int s_sig_valid;
+
+double cs_now_ms(void)
+{
+    static LARGE_INTEGER f, t0;
+    LARGE_INTEGER t;
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    QueryPerformanceCounter(&t);
+    return (double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+
+static void frame_signature(const D3D11_MAPPED_SUBRESOURCE *m, uint32_t w, uint32_t h)
+{
+    uint32_t x, y, n = 0, nblack = 0;
+    uint64_t sum = 0, hsh = 1469598103934665603ULL;
+    for (y = 2; y < h; y += 4) {
+        const uint32_t *row = (const uint32_t *)((const uint8_t *)m->pData + (size_t)y * m->RowPitch);
+        for (x = 2; x < w; x += 4) {
+            uint32_t c = row[x] & 0xFFFFFFu;
+            uint32_t l = (((c >> 16) & 255) * 77 + ((c >> 8) & 255) * 150 + (c & 255) * 29) >> 8;
+            sum += l; n++;
+            if (l < 16) nblack++;
+            hsh = (hsh ^ c) * 1099511628211ULL;
+        }
+    }
+    s_sig_luma = n ? (double)sum / n : 0;
+    s_sig_black = n ? 100.0 * nblack / n : 0;
+    s_sig_hash = hsh;
+    s_sig_valid = 1;
 }
 
 /* Map a staging copy and write it into guest memory. */
@@ -988,6 +1068,7 @@ static void rb_write(const Rt *rt)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t y, x, w = rt->w, h = rt->h, pitch = rt->pitch, bpp = rt->bpp;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)rt->stage, 0, D3D11_MAP_READ, 0, &m))) return;
+    if ((s_csv || s_flash_dir) && w == 640 && h == 480 && bpp == 4) frame_signature(&m, w, h);
     if (bpp == 4 && pitch >= w * 4) {
         for (y = 0; y < h; y++)
             memcpy(mem + rt->rawva + (size_t)y * pitch, (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
@@ -1039,10 +1120,15 @@ static void dump_rt_bmp(const Rt *rt, const char *dir)
  * for the window: finish the GPU work and write every drawn target back. */
 static void cs_present_sync(void)
 {
-    int i;
+    int i, nrb = 0, readi[MAX_RT];
     static const char *dump_dir = (const char *)-1;
+    static double prev_black = -1;
+    static unsigned flashes;
+    static double last_flip;
+    double t0 = cs_now_ms(), t1;
     int dumping = 0;
     if (!s_inited || s_failed) return;
+    s_sig_valid = 0;
     if (dump_dir == (const char *)-1) dump_dir = getenv("RECOMP_CS_DUMP");
     if (dump_dir) {
         char flag[MAX_PATH];
@@ -1056,8 +1142,52 @@ static void cs_present_sync(void)
         if (dumping) dump_rt_bmp(rt, dump_dir);
         rb_write(rt);
         rt->dirty = 0;
-        st_rb++;
+        readi[nrb] = i;
+        st_rb++; nrb++;
     }
+    if (s_flash_dir && s_sig_valid) {
+        if (prev_black >= 0 && prev_black < 20.0 && s_sig_black >= 95.0 && s_fr_draws > 2 && flashes < 10) {
+            unsigned k, f;
+            flashes++;
+            fprintf(stderr, "[FLASH] frame %u at %.1f ms: black %.0f%% after %.0f%%; %u draws. Previous frame, then this one:\n",
+                    s_frame, t0, s_sig_black, prev_black, s_fr_draws);
+            for (f = 0; f < 2; f++) {
+                unsigned which = f == 0 ? (s_dlc ^ 1u) : s_dlc;
+                fprintf(stderr, "[FLASH]  %s frame (%u draws)\n", f == 0 ? "previous" : "black", s_dln[which]);
+                for (k = 0; k < s_dln[which]; k++) {
+                    const DrawRec *d = &s_dl[which][k];
+                    fprintf(stderr, "[FLASH]   #%u rt=%08X %ux%u n=%u kept=%u tex=%08X fmt=%02X %ux%u rc=%u bl=%u %X/%X at=%u/%X/%u dt=%u cm=%08X v0=(%.1f,%.1f,z%.0f,rhw%g) c=%08X uv=(%.1f,%.1f)\n",
+                            k, d->rt, d->rw, d->rh, d->n, d->kept, d->tex, d->fmt, d->tw, d->th, d->comb, d->bl, d->bsrc, d->bdst,
+                            d->at, d->afunc, d->aref, d->dt, d->cm, d->x0, d->y0, d->z0, d->rhw0, d->c0, d->u0, d->v0);
+                    if (d->rw == 640 && d->rh == 480)
+                        fprintf(stderr, "[FLASH]       rc ctl=%08X sp=%08X f0=%08X f1=%08X s0 cicw=%08X aicw=%08X cocw=%08X aocw=%08X k0=%08X valid=%X st0 fmt=%02X off=%08X %ux%u srv=%s\n",
+                                d->rc_ctl, d->rc_sp, d->rc_f0, d->rc_f1, d->rc_cicw, d->rc_aicw, d->rc_cocw, d->rc_aocw, d->rc_k0,
+                                d->st_valid, d->st0_fmt, d->st0_off, d->st0_w, d->st0_h,
+                                d->srv_kind == 1 ? "rendertarget" : d->srv_kind == 2 ? "decoded" : d->srv_kind == 0 ? "WHITE" : "n/a");
+                    if (d->rw == 640 && d->rh == 480)
+                        fprintf(stderr, "[FLASH]       tri (%.1f,%.1f,%g,%g)/(%.1f,%.1f,%g,%g)/(%.1f,%.1f,%g,%g) tex0 (%g,%g,%g,%g)/(%g,%g,%g,%g)/(%g,%g,%g,%g)\n",
+                                d->vx[0][0], d->vx[0][1], d->vx[0][2], d->vx[0][3], d->vx[1][0], d->vx[1][1], d->vx[1][2], d->vx[1][3],
+                                d->vx[2][0], d->vx[2][1], d->vx[2][2], d->vx[2][3], d->vt[0][0], d->vt[0][1], d->vt[0][2], d->vt[0][3],
+                                d->vt[1][0], d->vt[1][1], d->vt[1][2], d->vt[1][3], d->vt[2][0], d->vt[2][1], d->vt[2][2], d->vt[2][3]);
+                }
+            }
+            fflush(stderr);
+            for (k = 0; k < (unsigned)nrb; k++) dump_rt_bmp(&s_rt[readi[k]], s_flash_dir);
+        }
+        prev_black = s_sig_black;
+    }
+    if (s_flash_dir) { s_dlc ^= 1u; s_dln[s_dlc] = 0; }
+    if (s_csv) {
+        t1 = cs_now_ms();
+        if (s_sig_valid)
+            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,%.1f,%.2f,%016llX\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
+                    s_fr_draws, s_fr_tris, nrb, t1 - t0, s_sig_luma, s_sig_black, (unsigned long long)s_sig_hash);
+        else
+            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,,,\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
+                    s_fr_draws, s_fr_tris, nrb, t1 - t0);
+        last_flip = t0;
+    }
+    s_fr_draws = s_fr_tris = 0;
 }
 
 static void cs_flip(void)
@@ -1066,6 +1196,7 @@ static void cs_flip(void)
     DWORD now;
     if (!s_inited || s_failed) return;
     s_frame++; s_tick++; st_flips++;
+    if (s_csv && (s_frame % 30) == 0) fflush(s_csv);   /* runs are often ended by killing the process */
     now = GetTickCount();
     if (s_log && now - last >= 2000) {
         fprintf(stderr, "[CS-D3D11] frame=%u flips=%u draws=%u tris=%u culled=%u clears=%u texdecodes=%u rtsamples=%u readbacks=%u vbdrop=%u\n",
@@ -1084,5 +1215,14 @@ void cs_d3d11_init(void)
         fprintf(stderr, "[CS-D3D11] disabled (RECOMP_CS_D3D11=0): toolkit CPU rasteriser\n");
         return;
     }
+    {
+        const char *csv = getenv("RECOMP_CS_FRAME_CSV");
+        s_flash_dir = getenv("RECOMP_CS_FLASH");
+        if (csv && (s_csv = fopen(csv, "w")) != NULL) {
+            setvbuf(s_csv, NULL, _IOFBF, 1 << 16);
+            fprintf(s_csv, "t_ms,frame,dt_ms,draws,tris,readbacks,rb_ms,luma,black_pct,hash\n");
+        }
+    }
+    cs_now_ms();
     nv2a_backend_register_with_present_sync(&s_backend, cs_present_sync);
 }

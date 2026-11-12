@@ -1,0 +1,118 @@
+From e636ed9bb4099a325ebf596906bb32fef1f0ff1d Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 16:00:00 -0800
+Subject: [PATCH] pb_scan: follow the title's JUMP when the pushbuffer ring
+ wraps (CounterStrikeXB2 local patch)
+
+The default segment scan handled a wrap by scanning from the previous PUT up
+to the highest PUT seen so far and from the lowest PUT seen to the new one.
+XDK D3D ends a lap with a JUMP wherever it runs out of space, which can lie
+past every PUT seen before, so the commands in between were skipped. In
+Counter-Strike these were now and then the register-combiner words of D3D's
+back-buffer resolve; the resolve then ran with the previous menu draw's
+modulate combiner and black vertex colour and showed a black frame on menu
+changes. On a wrap, find the JUMP (decoding headers without executing),
+scan up to it and on from its target; fall back to the old guess when no
+JUMP is found.
+---
+ src/kernel/nv2a_pb_scan.c       | 57 +++++++++++++++++++++++++++++++++
+ src/kernel/xbox_memory_layout.c |  7 ++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5fab4c3..5b697fc 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -535,6 +535,63 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+     return words;
+ }
+ 
++void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va);
++
++/* Find the JUMP that ends the ring at or after `va`, decoding headers and
++ * stepping over their parameters without executing anything. Returns 1 with
++ * the jump word's address and its target (both contiguous-window VAs). */
++static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint32_t *target_va)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    uint32_t unknown = 0;
++
++    while (va < limit_va) {
++        uint32_t w = *(const uint32_t *)(mem + va);
++        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
++            uint32_t t = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
++            *jump_at = va;
++            *target_va = 0x80000000u | (t & 0x0FFFFFFFu);
++            return 1;
++        }
++        if ((w & 0x00030003u) == 0u) {               /* method header: skip its parameters */
++            va += 4 + ((w >> 18) & 0x7FFu) * 4u;
++            unknown = 0;
++            continue;
++        }
++        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u) {  /* CALL / RETURN */
++            va += 4;
++            continue;
++        }
++        if (++unknown > 64)
++            return 0;                                /* not a pushbuffer here */
++        va += 4;
++    }
++    return 0;
++}
++
++/* PUT moved back below its previous value: the title wrapped the ring. XDK D3D
++ * ends the old lap with a JUMP wherever it ran out of space and carries on at
++ * the jump's target. The caller used to guess both ends from the highest and
++ * lowest PUT seen so far, which skipped every command written past the
++ * highest earlier PUT (or before the lowest) -- in Counter-Strike, now and
++ * then the register-combiner words of D3D's back-buffer resolve, which then
++ * ran with the previous menu draw's modulate combiner and black vertex colour:
++ * a black frame on a menu change. So: follow the actual JUMP. Returns 0, having
++ * scanned nothing, if no JUMP is found, and the caller falls back. */
++int nv2a_pb_scan_wrap(uint32_t last_put_va, uint32_t put_va)
++{
++    uint32_t jump_at, target;
++
++    if (!pb_walk_enabled())
++        return 1;
++    if (!pb_find_jump(last_put_va, last_put_va + 0x400000u, &jump_at, &target))
++        return 0;
++    nv2a_pb_scan_segment(last_put_va, jump_at + 4u);   /* stops at the JUMP */
++    if (put_va > target)
++        nv2a_pb_scan_segment(target, put_va);
++    return 1;
++}
++
+ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+ {
+     uint32_t words, jumps = 0, unknown = 0;
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 7ade793..096841f 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1540,6 +1540,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                     extern void nv2a_pb_resync(uint32_t);
+                     extern int  nv2a_pb_dma_walk(void);
+                     extern void nv2a_pb_scan_segment(uint32_t, uint32_t);
++                    extern int  nv2a_pb_scan_wrap(uint32_t, uint32_t);
+ 
+                     if (nv2a_pb_dma_walk()) {
+                         uint32_t get_now = *(volatile uint32_t *)
+@@ -1566,7 +1567,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                         if (last_put && put > last_put) {
+                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
++                        } else if (last_put && put < last_put
++                                   && nv2a_pb_scan_wrap(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
++                                                        XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu))) {
++                            /* Wrapped: scanned up to the title's JUMP and on
++                             * from its target (nv2a_pb_scan.c). */
+                         } else if (last_put && put < last_put) {
++                            /* No JUMP found: the old guess from the PUTs seen. */
+                             if (put_hi > last_put)
+                                 nv2a_pb_scan_segment(
+                                     XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-- 
+2.51.0.windows.2
+

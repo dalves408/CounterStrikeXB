@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "12e55a4e957a35ce4d328a0bd78441bb568f0e4c",
+                       "commit":  "24337f93a097aff5c030ebd263531dace03c2535",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -15,7 +15,8 @@
                                              "patches\\xboxrecomp\\0008-nv2a-honor-video-overlay-stop-and-restart.patch",
                                              "patches\\xboxrecomp\\0009-nv2a-prepare-shaders-and-cache-decoded-textures.patch",
                                              "patches/xboxrecomp/0010-nv2a_backend-pass-register-combiners-texture-stages.patch",
-                                             "patches/xboxrecomp/0011-nv2a-material-alpha-default-and-sz_r8g8b8a8-twin.patch"
+                                             "patches/xboxrecomp/0011-nv2a-material-alpha-default-and-sz_r8g8b8a8-twin.patch",
+                                             "patches/xboxrecomp/0012-pb_scan-follow-the-jump-when-the-ring-wraps.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

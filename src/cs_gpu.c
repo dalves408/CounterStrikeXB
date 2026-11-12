@@ -37,6 +37,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "cs_gpu.h"
 #include "cs_d3d11.h"
@@ -118,6 +119,31 @@ int cs_gpu_mmio_fault(void *exception_pointers)
     if (fault < base || rel < CS_NV2A_PVIDEO_VA ||
         rel >= (uint64_t)CS_NV2A_PVIDEO_VA + CS_NV2A_PVIDEO_SIZE)
         return 0;
-    return nv2a_hook_handle_mmio(ep->ContextRecord, fault, (uint32_t)rel,
-               ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0) ? 1 : 0;
+    {
+        int is_write = ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0;
+        int handled = nv2a_hook_handle_mmio(ep->ContextRecord, fault, (uint32_t)rel, is_write) ? 1 : 0;
+        /* RECOMP_CS_PVIDEO_CSV=<file>: time of every write to NV_PVIDEO_BUFFER
+         * (+0x700, a new movie frame handed to a bank) and NV_PVIDEO_STOP
+         * (+0x704), on the same clock as RECOMP_CS_FRAME_CSV. Movie cadence. */
+        if (handled && is_write && (rel == CS_NV2A_PVIDEO_VA + 0x700u || rel == CS_NV2A_PVIDEO_VA + 0x704u)) {
+            static FILE *pv = (FILE *)-1;
+            if (pv == (FILE *)-1) {
+                const char *p = getenv("RECOMP_CS_PVIDEO_CSV");
+                pv = p ? fopen(p, "w") : NULL;
+                if (pv) fprintf(pv, "t_ms,reg,buffer,stop_gen\n");
+            }
+            if (pv) {
+                static unsigned n;
+                static uint32_t regs[0x1000 / 4];
+                uint64_t gen = 0;
+                /* After the write: BUFFER holds the pending-bank bits; a real
+                 * STOP (bit 0) bumps the stop generation. */
+                nv2a_hook_pvideo_snapshot(regs, &gen);
+                fprintf(pv, "%.2f,%s,%08X,%llu\n", cs_now_ms(), rel == CS_NV2A_PVIDEO_VA + 0x700u ? "BUFFER" : "STOP",
+                        regs[0x700 / 4], (unsigned long long)gen);
+                fflush(pv);              (void)n; /* a few per frame: cheap, and probes read it live */
+            }
+        }
+        return handled;
+    }
 }

@@ -29,6 +29,7 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/cs_gpu.c
     src/cs_d3d11.c
+    src/cs_prof.c
     src/cs_kernel.c
     src/cs_launch.c
 )

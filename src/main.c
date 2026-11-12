@@ -42,6 +42,7 @@
 #include <xbox/xboxrecomp.h>
 #include <ohci.h>
 #include "cs_gpu.h"
+#include "cs_prof.h"
 #include "cs_launch.h"
 
 /*
@@ -298,6 +299,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
 /* â”€â”€ WinMain â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
+static DWORD WINAPI stderr_flusher(LPVOID unused)
+{
+    (void)unused;
+    for (;;) { Sleep(250); fflush(stderr); }
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -312,6 +320,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    /* Fully buffered stderr, flushed every 250 ms by a host thread (default;
+     * RECOMP_CS_STDERR_BUF=0 restores unbuffered). Every unbuffered fprintf is
+     * a WriteFile under the CRT stream lock, and a guest DPC holding the
+     * one-CPU dispatch gate while it logs (or waits for that lock) held every
+     * interrupt off meanwhile: measured vblank/APU delays up to 1.9 s, intro
+     * movies at ~4 fps in bursts, title at 84 s (runs/b0_base, b2_gate).
+     * Buffered: waits < 1 ms, intros at ~24 fps, title at ~24 s (runs/b4_buf).
+     * The crash handler flushes; at most the last 250 ms are lost on exit. */
+    {
+        const char *b = getenv("RECOMP_CS_STDERR_BUF");
+        if (!(b && *b == '0')) {
+            setvbuf(stderr, NULL, _IOFBF, 1 << 20);
+            CloseHandle(CreateThread(NULL, 0, stderr_flusher, NULL, 0, NULL));
+        }
+    }
 
     printf("=== Counter-Strike (Xbox) - Static Recompilation ===\n");
     printf("Loading XBE...\n");
@@ -354,6 +377,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* CS2: D3D8LTCG completion fence (src/cs_gpu.c). */
     cs_gpu_init();
+    /* Host addresses in the logs (e.g. the IRQ wait log's "raised from host")
+     * are ASLR-relocated; scripts/symbolize.py needs this base to name them. */
+    fprintf(stderr, "[CS2] image base %p\n", (void *)GetModuleHandleA(NULL));
+    cs_prof_init();      /* RECOMP_CS_GATE_WATCH / RECOMP_CS_PROF (src/cs_prof.c) */
 
     /* Bring up the emulated APU.
      *
