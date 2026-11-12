@@ -50,6 +50,9 @@
 #include <windows.h>
 #include "recomp_types.h"
 #include "cs_kernel.h"
+#include "cs_d3d11.h"   /* cs_now_ms */
+#include <stdio.h>
+#include <stdlib.h>
 
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 
@@ -75,7 +78,26 @@ static void cs_NtReadFile(void)
     bridge = recomp_lookup_kernel(s_ntreadfile_va);
     if (!bridge)
         return;                    /* cannot happen once the table is bridged */
-    bridge();
+    {
+        /* RECOMP_CS_IO_CSV=<file>: one line per read -- start on the frame
+         * logs' clock, duration, handle, length, offset, status, thread. */
+        static FILE *io = (FILE *)-1;
+        double t0 = 0;
+        uint32_t handle = MEM32(g_esp + 4), length = MEM32(g_esp + 4 + 6 * 4);
+        uint32_t offp = MEM32(g_esp + 4 + 7 * 4), off = offp ? MEM32(offp) : 0xFFFFFFFFu;
+        if (io == (FILE *)-1) {
+            const char *p = getenv("RECOMP_CS_IO_CSV");
+            io = p ? fopen(p, "w") : NULL;
+            if (io) fprintf(io, "t_ms,dur_ms,handle,length,offset,status,tid\n");
+        }
+        if (io) t0 = cs_now_ms();
+        bridge();
+        if (io) {
+            fprintf(io, "%.2f,%.3f,%08X,%u,%u,%08X,%lu\n", t0, cs_now_ms() - t0, handle, length, off,
+                    g_eax, (unsigned long)GetCurrentThreadId());
+            { static unsigned nio; if ((++nio % 32) == 0) fflush(io); }
+        }
+    }
     if (iosb && nt_error(g_eax)) {
         MEM32(iosb) = keep_status;
         MEM32(iosb + 4) = keep_info;
