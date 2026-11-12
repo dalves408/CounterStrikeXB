@@ -1,0 +1,174 @@
+From 62f99dcdded95f75332a58dc40858a245f32b72b Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nv2a_backend: pass register combiners, texture stages and
+ shader outputs to 3D batches (CounterStrike)
+
+Program and fixed-function batches now carry Nv2aCombiner, the four texture
+stages, the fog colour, and per-vertex d1/tex/fog so a back end can evaluate
+the combiners the way the CPU rasteriser does. Screen-space batches are
+unchanged. P8 textures get their palette address.
+---
+ src/kernel/nv2a_backend.h | 23 ++++++++++++++++++++---
+ src/kernel/nv2a_pb_exec.c | 38 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 87788ed..db89c5c 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -20,14 +20,15 @@
+  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
+  * stencil state arrive in Nv2aRenderState.
+  *
+- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
+- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
+- * matters rather than adding callbacks.
++ * Program and fixed-function batches also carry the register combiners, the
++ * four texture stages and the vertex program's other outputs (see Nv2aBatch).
++ * Screen-space batches still arrive as stage 0 times the diffuse colour.
+  */
+ #ifndef NV2A_BACKEND_H
+ #define NV2A_BACKEND_H
+ 
+ #include <stdint.h>
++#include "nv2a_combiner.h"
+ 
+ /* The colour surface being drawn into, in real (anti-aliased) pixels.
+  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
+@@ -51,6 +52,7 @@ typedef struct {
+      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
+      * 16-23). A back end that ignores them samples level 0. */
+     uint32_t levels, filter;
++    uint32_t palette;           /* guest CLUT address (P8); 0 if none */
+ } Nv2aTexture;
+ 
+ typedef struct {
+@@ -58,6 +60,12 @@ typedef struct {
+     float    rhw;               /* 1/w, 1 for pre-transformed batches */
+     uint32_t diffuse;           /* 0xAARRGGBB */
+     float    u, v;              /* texels */
++    /* Program / fixed-function (transformed) batches only, for register
++     * combiners: the vertex program's other outputs, as it produced them.
++     * tex[] is in the units the title wrote (normalised for swizzled and DXT
++     * textures, texels for linear ones), fog the fog factor. Zero for
++     * screen-space batches. */
++    float    d1[4], tex[4][4], fog;
+ } Nv2aVertex;
+ 
+ /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
+@@ -87,6 +95,15 @@ typedef struct {
+     uint32_t           count;
+     const Nv2aTexture *texture;     /* NULL: untextured */
+     const Nv2aRenderState *state;
++    /* Non-NULL for program / fixed-function batches (the 3D path): the
++     * register combiners to evaluate, the four texture stages and a bit mask
++     * of the valid ones, and the fog colour (r,g,b,1). Screen-space batches
++     * leave it NULL and use texture + diffuse above. Valid during draw()
++     * only. */
++    const Nv2aCombiner *combiner;
++    const Nv2aTexture  *stages;     /* four entries when combiner is set */
++    uint32_t            stage_valid;
++    float               fog_color[4];
+ } Nv2aBatch;
+ 
+ typedef struct {
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 722fb5f..67408ee 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -888,7 +888,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+     s_gpu.texs[0].color  = tex->color;
+     s_gpu.texs[0].addr_u = 3;
+     s_gpu.texs[0].addr_v = 3;
+-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
++    s_gpu.texs[0].palette = tex->palette;
+     s_gpu.texs[0].levels = 1;
+     s_gpu.texs[0].filter = 0;
+     s_gpu.texs[0].cube   = 0;
+@@ -2189,6 +2189,8 @@ static int s_xf_no_tex;
+ #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
+ static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
+ static uint32_t   s_bcount;
++static int        s_bxf;         /* the batch came from the program / fixed-function path */
++static float fog_factor(float d);
+ 
+ static Nv2aVertex *backend_slot(void)
+ {
+@@ -2215,6 +2217,10 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->diffuse = pack_color(v->d0);
+     o->u = v->tex[0][0] * su;
+     o->v = v->tex[0][1] * sv;
++    memcpy(o->d1, v->d1, sizeof o->d1);
++    memcpy(o->tex, v->tex, sizeof o->tex);
++    o->fog = fog_factor(v->fog[0]);
++    s_bxf = 1;
+ }
+ 
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+@@ -2224,6 +2230,7 @@ static void backend_flush(int textured)
+     Nv2aSurface surf;
+     Nv2aRenderState rs;
+     Nv2aTexture tex;
++    Nv2aTexture stages[4];
+     Nv2aBatch batch;
+ 
+     if (!s_bcount)
+@@ -2234,6 +2241,30 @@ static void backend_flush(int textured)
+     batch.count = s_bcount;
+     batch.texture = NULL;
+     batch.state = &rs;
++    batch.combiner = NULL;
++    batch.stages = NULL;
++    batch.stage_valid = 0;
++    memset(batch.fog_color, 0, sizeof batch.fog_color);
++    if (s_bxf && s_gpu.rc_seen) {
++        int st;
++        for (st = 0; st < 4; st++) {
++            const Texture *t = &s_gpu.texs[st];
++            stages[st].offset = t->offset;  stages[st].width = t->width;
++            stages[st].height = t->height;  stages[st].pitch = t->pitch;
++            stages[st].color = t->color;
++            stages[st].addr_u = t->addr_u;  stages[st].addr_v = t->addr_v;
++            stages[st].levels = t->pitch ? 1 : t->levels;
++            stages[st].filter = t->filter;
++            stages[st].palette = t->palette;
++            if (t->valid)
++                batch.stage_valid |= 1u << st;
++        }
++        batch.combiner = &s_gpu.rc;
++        batch.stages = stages;
++        /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
++        nv2a_rc_unpack(s_gpu.fog_color, batch.fog_color);
++        { float r = batch.fog_color[2]; batch.fog_color[2] = batch.fog_color[0]; batch.fog_color[0] = r; }
++    }
+     if (textured && s_gpu.texs[0].valid) {
+         tex.offset = s_gpu.texs[0].offset;
+         tex.width  = s_gpu.texs[0].width;
+@@ -2244,11 +2275,13 @@ static void backend_flush(int textured)
+         tex.addr_v = s_gpu.texs[0].addr_v;
+         tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+         tex.filter = s_gpu.texs[0].filter;
++        tex.palette = s_gpu.texs[0].palette;
+         batch.texture = &tex;
+     }
+     s_backend->draw(&surf, &batch);
+     s_gpu.tris_drawn += s_bcount / 3;
+     s_bcount = 0;
++    s_bxf = 0;
+     note_drawn();
+ }
+ 
+@@ -2290,6 +2323,9 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+             o[k].diffuse = vertex_color(ix[k]);
+             o[k].u = textured ? uv[k][0] : 0.0f;
+             o[k].v = textured ? uv[k][1] : 0.0f;
++            memset(o[k].d1, 0, sizeof o[k].d1);
++            memset(o[k].tex, 0, sizeof o[k].tex);
++            o[k].fog = 1.0f;
+         }
+         s_bcount += 3;
+         return;
+-- 
+2.51.0.windows.2
+

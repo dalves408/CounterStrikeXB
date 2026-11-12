@@ -21,3 +21,6 @@ Stopped 2026-11-11 12:02 PT at David's request. Full detail and evidence: docs/S
 
 ## Rules David set
 Planning before work; short TLDR updates; David drives game tests unless he asks; other projects read-only references, borrow only verified-compatible code; no menu bypasses or game-memory hacks; generated code stays pure; push/replace GitHub repo only when David approves.
+
+## Update 2026-11-11 evening
+D3D11 back end added (src/cs_d3d11.c + toolkit patch 0004, uncommitted). Menus and in-game render on the GPU at ~8-13 FPS; BSP world still black in game (worker task 3 in smalltask.md). See docs/STATUS.md last section.
