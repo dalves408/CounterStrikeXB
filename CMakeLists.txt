@@ -28,6 +28,7 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/cs_gpu.c
+    src/cs_d3d11.c
     src/cs_kernel.c
     src/cs_launch.c
 )
@@ -40,9 +41,11 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen
     ${XBOXRECOMP_DIR}/include
     ${XBOXRECOMP_DIR}/src/usb
+    ${XBOXRECOMP_DIR}/src/kernel
+    ${XBOXRECOMP_DIR}/src
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11 dxgi dxguid
+    d3d11 dxgi dxguid d3dcompiler
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>
     winmm dbghelp
 )

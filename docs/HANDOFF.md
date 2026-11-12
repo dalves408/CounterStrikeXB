@@ -81,3 +81,8 @@ post-patch defects need a new frame trace and screenshot.
 
 ## Rules David set
 Planning before work; short TLDR updates; verify changes before handoff; other projects read-only references, borrow only verified-compatible code; no menu bypasses or game-memory hacks; generated code stays pure; push/replace GitHub repo only when David approves.
+
+## D3D11 back end (merged into main 2026-11-12)
+- `src/cs_d3d11.c` registers a Direct3D 11 renderer with the executor (`RECOMP_CS_D3D11=0` = CPU rasteriser). Toolkit patches 0010 (combiner state and texture stages passed to 3D batches) and 0011 (material alpha default, format 0x3C twin) sit on top of patches 0001-0009.
+- Menus and in-game (Airstrip) render on the GPU at about 8-13 FPS by log; the BSP world is still black in game (vertex diffuse alpha 0 from the vertex-program path; `RECOMP_CS_ALPHA_LIFT` is only a partial workaround). Details and evidence: docs/STATUS.md (D3D11 section) and docs/evidence/d3d11_*.
+- Next candidates: find the instruction/default leaving oD0.a at 0 (toolkit side), measure D3D11 vs the CPU path on menus (36.8 FPS CPU-path menu average from patch 0009), relaunch black gap, mips/cube maps.

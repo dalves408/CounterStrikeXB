@@ -410,3 +410,12 @@ build at pin a31cc9e. OHCI operational at 22.5 s; title at ~36 s.
   scale for screen-space/transformed vertices). Unverified.
 - HUD text: earlier ghosting looks milder without the buy overlay; digits readable, colon missing.
 - Light-grey bar across the top-left edge (x 0-370, first ~20 px) of unknown origin.
+## D3D11 back end (2026-11-11 evening, UNCOMMITTED)
+- New `src/cs_d3d11.c`/`.h`: an Nv2aBackend (registered in `cs_gpu_init`) that draws through Direct3D 11 on the GPU instead of the toolkit CPU rasteriser. `RECOMP_CS_D3D11=0` restores the CPU path.
+- Toolkit local patch 0010 (`patches/xboxrecomp/0010-nv2a_backend-pass-register-combiners-texture-stages.patch`; originally 0004 before main renumbered the chain): 3D (program/fixed-function) batches now carry Nv2aCombiner, the four texture stages, fog colour and per-vertex d1/tex/fog. Screen-space 2D batches unchanged.
+- Why it was needed: D3D's back-buffer resolve (640x960 -> 640x480) is a texture-only draw with black vertex colour; only the register combiners make it show the texture. Without them every post-intro frame was black.
+- Combiner HLSL is a port of `nv2a_combiner.c`, checked line by line (also matches the interpreter used by the other xboxrecomp D3D11 back ends on this PC, used as references only).
+- Verified: intro movies (no more PVIDEO garbage), title, Main Menu, menus, loading screen with the 3D map behind it, and in-game (Airstrip) with models/foliage. In-game about 8-13 FPS by log (was 0-4).
+- Open: BSP world (ground/walls/sky) is still black in game while models/foliage draw (`docs/evidence/d3d11_ingame_airstrip_*`); no first-person weapon seen; HUD layout unchanged. Task 3 (worker) investigates the world: cull / depth / combiner modes. Not modelled yet: mip levels, cube maps, bump stages.
+- Debug switches: RECOMP_CS_D3D11_LOG, RECOMP_CS_TRACE=N, RECOMP_CS_DUMP=<dir> (+dump.flag), RECOMP_CS_CULL=0, RECOMP_CS_PIXOFS.
+- Gotcha: `scripts/probe.ps1 -Keys` needs one semicolon-separated string. In game Enter = START (pause); use Z (A) to dismiss prompts.

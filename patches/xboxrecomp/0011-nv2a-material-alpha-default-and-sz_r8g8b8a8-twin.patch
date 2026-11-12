@@ -1,0 +1,41 @@
+From 12e55a4e957a35ce4d328a0bd78441bb568f0e4c Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 07:20:00 -0800
+Subject: [PATCH] nv2a: default material alpha to 1 and map SZ_R8G8B8A8 (0x3C)
+ to LIN_R8G8B8A8 (CounterStrikeXB2 local patch)
+
+SET_MATERIAL_ALPHA (0x03B4) was BSS-zero, so lit fixed-function batches got
+diffuse.a=0; D3D's material diffuse alpha defaults to 1.
+linear_twin() lacked SZ_R8G8B8A8 (0x3C), so such textures failed to decode and
+were replaced by white.
+---
+ src/kernel/nv2a_pb_exec.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 8f0b8ae..1073143 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -1184,6 +1184,7 @@ static uint32_t linear_twin(uint32_t fmt)
+     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
+     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
+     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
++    case 0x3C: return 0x41;                /* SZ_R8G8B8A8 -> LIN_R8G8B8A8 */
+     default:   return fmt;                 /* already linear, or unhandled */
+     }
+ }
+@@ -4488,6 +4489,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         s_reg[0x0370 / 4] = s_reg[0x0374 / 4] = s_reg[0x0378 / 4] = 0x1E00u;
+         s_reg[0x03A0 / 4] = 0x900u;                            /* clockwise front */
+         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
++        /* SET_MATERIAL_ALPHA (0x03B4): D3D material Diffuse.a defaults to 1.
++         * s_reg is BSS-zero, so lit_color() used to read 0 and every lit FFP
++         * batch got diffuse.a=0; combiners that multiply by V0.a then fail
++         * GREATER/127 / SRC_ALPHA (Counter-Strike world brushes). */
++        { float one = 1.0f; memcpy(&s_reg[0x03B4 / 4], &one, 4); }
+         {
+             int i;
+             for (i = 0; i < NV_VERTEX_ATTRS; i++)
+-- 
+2.51.0.windows.2
+

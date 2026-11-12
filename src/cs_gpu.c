@@ -39,6 +39,7 @@
 #include <stdio.h>
 
 #include "cs_gpu.h"
+#include "cs_d3d11.h"
 
 /* kernel/xbox_memory_layout.h (pinned toolkit f0f8a46) */
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va, uint32_t put_off, uint32_t get_ptr_off);
@@ -96,6 +97,10 @@ void cs_gpu_init(void)
      * first fault already has somewhere to go. */
     nv2a_hook_init(xbox_GetMemoryOffset());
     s_pvideo_hooked = 1;
+
+    /* GPU rasterisation back end for the pushbuffer executor (src/cs_d3d11.c);
+     * RECOMP_CS_D3D11=0 keeps the toolkit CPU rasteriser. */
+    cs_d3d11_init();
 }
 
 int cs_gpu_mmio_fault(void *exception_pointers)
