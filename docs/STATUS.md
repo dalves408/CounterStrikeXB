@@ -3,26 +3,141 @@
 Fresh rebuild of the Counter-Strike (Xbox, 0x4D530036) -> Windows static recomp.
 Old project `C:\Recomp\CounterStrikeXB` and the shared `C:\Recomp\tools\xboxrecomp`
 are read-only references. Generated code (`src/recomp/gen/`, gitignored) is pure
-pipeline output; every fix lives in hand-written files under `src/`.
+pipeline output; fixes live in hand-written project code, seeds, or toolkit patches.
 
 ## Goal (David)
-1. Clean boot through intros to the real menus, rendering correctly (no menu bypass).
+1. Reliable intros, flash-free real menus, quicker loading, and at least 60 FPS
+   from actual menu rendering (not repeated presentation of an old frame).
 2. Proper controller (XInput -> USB XID via toolkit OHCI/XAPI) and keyboard input in
    hand-written code. No guest-memory pokes.
-Map loading / gameplay: out of scope for now.
+3. Correct in-game rendering and stable gameplay, checked through Single Player ->
+   Beginner -> Airstrip (not Training).
+
+## Current intro/menu work (2026-11-12)
+- Gameplay work is deferred until the intro/menu goals are met. Keep the one-CPU
+  dispatch gate enabled; no guest timing changes, menu bypasses, generated-code
+  edits, or forced audio completions were used for the performance work.
+- `runs\menu_baseline_20261112_110948` recorded roughly 12 FPS in the main menu.
+  Its frame trace identifies a 640x960 DXT background, font/icon draws, and a
+  full-screen linear-texture resolve into the 640x480 display surface. All of
+  this shading runs on the CPU; D3D11 currently presents the resulting image.
+- Patch 0009 prepares supported single-product combiner programs once per draw
+  and keeps the general interpreter for unsupported programs. It preserves
+  input mappings, intermediate saturation, final constants, and alpha.
+  DXT palettes are decoded once per block; a bounded image cache compares
+  source bytes at each draw, so rewritten textures do not remain stale.
+  SSE2 color conversion/filtering and row-invariant edge calculations reduce
+  scalar pixel work without fast-math or changed interpolation arithmetic.
+- Focused checks cover 76,800 general prepared-program comparisons, the recorded
+  copy/modulate patterns, unsupported-program fallback, DXT color/alpha modes,
+  texture rewrites, cache eviction, format changes, filtering, transforms, and
+  raster ordering. All 22 focused CTest cases and the format smoke test pass.
+- On the same 12-worker RelWithDebInfo synthetic workload, resolve time fell
+  from 16.44 to 6.64 ms per batch and UI modulation from 16.12 to 6.69 ms;
+  framebuffer hashes remain `e4d1b967` and `9f1efad0`. A separate full-size
+  background-plus-resolve fixture takes about 16.7 ms, but contains only two
+  draws and is not a measurement of a complete game frame.
+- The compiler-inlining hypothesis was investigated separately. Release and
+  RelWithDebInfo differ in `/Ob2` versus `/Ob1`; no project compiler flags were
+  changed. Final measurements above use the game's RelWithDebInfo settings.
+- Final pinned-build run: `runs\menu_final_confirmed_20261112`. Both movies
+  completed without being skipped; START was sent after the title appeared
+  around 69 seconds. The menu workload appeared around 72 seconds. From
+  75 seconds onward, 22 one-second main-menu samples averaged **36.8 FPS**,
+  ranging **18-42 FPS**. These count completed guest flips, not window refreshes.
+  The process was closed normally after the bounded run.
+- `runs\menu_cached_20261112` additionally verified Main Menu -> Single Player
+  difficulty selection -> Back, with composed screenshots and real keyboard
+  input. No Training or gameplay was entered.
+- Two intervening final-build runs exposed unreliable fixed-time input
+  scheduling: one pressed START before the title; another observed the title
+  briefly before the attract movie started. They are not menu verification
+  passes. The final confirmation instead reacts to the title's draw workload.
+- **Still open:** sustained 60 FPS, smooth decoded movie cadence, proof that
+  no individual frame flashes, and normal loading times. Five-second screenshots
+  do not prove flash-free presentation. Startup timing varied materially between
+  runs. IRQ logs still show delayed delivery while a dispatch-gate holder has no
+  safe point (roughly 0.1 s in the final confirmation, up to about 0.74 s in the
+  attract-movie run). These waits warrant investigation, not disabling the gate.
+- Toolkit pin `1e6abc3` is clean, all nine patches replay to the same commit, and
+  the supported `scripts\build.ps1` build succeeds. This is a verified
+  performance improvement, **not completion of the frontend milestone**.
+
+## Earlier gameplay and audio work (2026-11-12)
+- The supplied Airstrip log reported eight unresolved calls to x87 dispatch target
+  `0x002353A4`. It and the verified sibling target `0x00235446` are now pipeline seeds.
+- Toolkit patch 0004 shares fixed-function matrix/texgen state with the vertex-program
+  constant file, transforms fixed-function inline and immediate vertices, and clips
+  large raster bounds before integer conversion. Both constant-upload paths and the
+  software pixels have focused regression coverage.
+- The old log counted roughly two million batches rejected as non-screen-space; it
+  did not identify their contents. The post-fix Airstrip run reported none.
+- Toolkit patch 0005 removes shared per-pixel statistics writes from raster workers,
+  publishes the counters after each batch, and fixes the Windows small-batch worker
+  diagnostic. It also publishes visibility statistics on the allocation-failure
+  fallback. Raster, fixed-function, and shader regressions cover these paths.
+- On the same synthetic batches with 12 workers, solid raster time fell from
+  8.05 to 1.93 ms per batch and textured combiner time from 12.74 to 7.13 ms.
+  Framebuffer hashes matched before and after; these are not gameplay FPS results.
+- Toolkit patch 0006 honors the cull and front-face registers in both software
+  paths and uses alternating triangle-strip winding when culling is enabled.
+  The reported Airstrip run frequently enabled back-face culling, which the
+  software renderer previously ignored. Focused tests cover both orientations,
+  front/back/both modes, strips, near-plane clipping, and the optional backend.
+  The y-down winding convention matches xemu's
+  [front-face setup](https://github.com/xemu-project/xemu/blob/5759e9c0ee3fe0e699986f2aa939c11a69a497b1/hw/xbox/nv2a/pgraph/gl/draw.c)
+  and [screen-to-clip transform](https://github.com/xemu-project/xemu/blob/5759e9c0ee3fe0e699986f2aa939c11a69a497b1/hw/xbox/nv2a/pgraph/glsl/vsh-prog.c).
+- In a synthetic workload that duplicated every face with the opposite winding,
+  culling reduced median solid-batch time from 3.01 to 2.00 ms with the same
+  framebuffer hash. The scene and its speedup are not representative measurements
+  of Airstrip.
+- In the post-fix run (`runs\airstrip_fix_20261112_091216`), David reported that
+  graphics improved but still had substantial glitches and missing renders, and
+  gameplay ran at about 1 FPS. Intro videos stuttered and Airstrip loaded slowly.
+  Stability and the remaining graphics defects are not yet established.
+- The game window closed before an in-game frame trace or screenshot was captured;
+  the log records a window-close exit but does not establish why. A future
+  user-driven check should follow Single Player -> Beginner -> Airstrip and capture
+  the frame trace while gameplay remains open.
+- A standalone reproduction of 3,750 representative failed opens, including the
+  toolkit path translation, file open, logging, and missing-file reporting, took
+  2.17 seconds total (median 0.49 ms; p90 0.81 ms). This is not a loaded game
+  measurement and does not identify the cause of the roughly 130-second period
+  with no flips during the recorded load.
+- Intro movies use the guest XMV decoder and the PVIDEO overlay. A synthetic
+  640x480 PVIDEO conversion measured 2.43 ms per frame; this alone does not explain
+  the much larger observed vblank gaps.
+- In the subsequent run (`runs\airstrip_final_20261112_100759`), the first intro
+  froze: two composed captures over a minute apart were identical, even though
+  the window and GPU flips continued. Two guest audio packets remained pending;
+  one voice described a two-entry scatter list whose second entry was zero.
+  The malformed entry previously underflowed the stream end offset and could
+  never complete. This establishes the stuck state, not its original cause.
+- Toolkit patch 0007 waits for guest-locked voices, publishes notification bytes
+  together, includes the final stream sample, and reports malformed descriptors
+  without falsely completing them. A controlled test reproduces the observed
+  missing-descriptor shape when concurrent guest submissions run without the
+  one-CPU dispatch gate; the game launch now enables that gate. The test does
+  not prove that race caused the live freeze.
+- Toolkit patch 0008 delivers self-clearing PVIDEO STOP events to the presenter
+  and prevents an old snapshot from consuming a bank restarted after STOP.
+  Presenter and PVIDEO tests cover stopping, restart, and bank reuse.
+- At this earlier checkpoint the audio/overlay changes still needed live
+  verification. The frontend checks above supersede that status; gameplay
+  graphics, speed, loading, and stability remain deferred.
 
 ## How to rebuild from scratch
 - `scripts\setup.ps1` : private toolkit clone at `tools\xboxrecomp`, pinned in
   `dependencies.json` (xboxrecomp v0.17.0 `343b6d8`), capstone 5.0.9 in `.deps\`.
 - `scripts\extract_disc.py` : `game_files\` from the ISO (sha256 in dependencies.json).
-- `scripts\pipeline.py` : regenerate `src\recomp\gen\` (seed 0x000C6310; 14343 functions).
+- `scripts\pipeline.py` : regenerate `src\recomp\gen\` using `seeds\cs_seed_functions.json`.
 - `scripts\build.ps1` : `build\RelWithDebInfo\cs2_xbox_recomp.exe`.
 - `scripts\run.ps1 [-Seconds N]` : launch; logs in `runs\<label>\`. Scrubs inherited
   RECOMP_*/CS_* env. SaveData is project-local (`SaveData\`).
 - `scripts\probe.ps1 -Label x -Seconds N -Keys '60:Return'` : bounded run with FB
   snapshots (`snap_<sec>.png`) and a keyboard schedule via `send_key.ps1`.
 
-## Hand-written CS code (all fixes live here)
+## Hand-written CS code
 - `src/main.c` : host entry from toolkit template, entry 0x00202C3C, CS_SAVE_ROOT.
 - `src/cs_gpu.c` : registers toolkit `xbox_Nv2aMirrorFence` for the D3D8LTCG
   completion fence (device ptr 0x316FE8, +0x2C put, +0x30 -> semaphore). Without it

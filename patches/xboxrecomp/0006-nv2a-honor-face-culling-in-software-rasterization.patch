@@ -1,0 +1,303 @@
+From 10bbf456dc3e6b6941a6fdb1facc92067d20b6f3 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 10:15:00 -0800
+Subject: [PATCH] nv2a: honor face culling in software rasterization
+
+Apply the requested front and back face modes after clipping, and preserve triangle strip winding whenever culling is enabled.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/kernel/nv2a_pb_exec.c                     |  45 +++++--
+ tests/nv2a_ffp_backend/CMakeLists.txt         |   3 +-
+ .../nv2a_ffp_backend/nv2a_ffp_backend_test.c  |  13 ++
+ tests/nv2a_raster_batch/CMakeLists.txt        |   2 +
+ .../nv2a_raster_batch_test.c                  | 111 +++++++++++++++++-
+ 5 files changed, 163 insertions(+), 11 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 09c99f6..08006a7 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -1721,6 +1721,32 @@ static uint32_t aniso_taps(const float a[2], const float b[2], const float c[2],
+     return aniso_footprint(gx, gy, max_taps, start, step);
+ }
+ 
++static int triangle_culled(float area)
++{
++    uint32_t face, winding;
++    int front;
++    static int warned;
++
++    if (!s_reg[0x0308 / 4])
++        return 0;
++    face = s_reg[0x039C / 4];
++    if (face == 0x408u)
++        return 1;
++    winding = s_reg[0x03A0 / 4];
++    if ((face != 0x404u && face != 0x405u)
++     || (winding != 0x900u && winding != 0x901u)) {
++        if (!warned) {
++            fprintf(stderr, "  [GPU] invalid cull state: face 0x%X, front 0x%X\n",
++                    face, winding);
++            warned = 1;
++        }
++        return 0;
++    }
++    /* Window y increases downward, so a positive signed area is clockwise. */
++    front = winding == 0x900u ? area > 0.0f : area < 0.0f;
++    return face == 0x404u ? front : !front;
++}
++
+ /* Half-space fill. Barycentric edge functions rather than scanline slopes:
+  * the same test decides both windings, so a title that emits clockwise
+  * triangles does not silently render nothing. */
+@@ -1742,8 +1768,8 @@ static void raster_triangle(const float a[2], const float b[2],
+         return;
+ 
+     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+-    if (area == 0.0f)
+-        return;                            /* degenerate */
++    if (area == 0.0f || triangle_culled(area))
++        return;
+ 
+     if (textured) {
+         tex_filter_config(&bilinear, &aniso);
+@@ -1960,15 +1986,14 @@ static int batch_is_ffp(void)
+  * wrong rather than dark. */
+ #define NV_LIGHTS 8
+ 
+-/* RECOMP_STRIP_ALT_WINDING, off by default: emit every odd triangle of a
+- * triangle strip with its first two vertices swapped, so all of a strip's
+- * triangles wind the same way, as a strip does on hardware. Left alone the
+- * executor emits (i, i+1, i+2) for every i, so a back end that culls or lights
+- * two-sided from the winding drops or back-lights every second triangle. */
++/* Culling requires the hardware's alternating strip winding. The existing
++ * RECOMP_STRIP_ALT_WINDING option also enables it when culling is off. */
+ static int strip_alt_winding(void)
+ {
+     static int on = -1;
+ 
++    if (s_reg[0x0308 / 4])
++        return 1;
+     if (on < 0) {
+         const char *e = getenv("RECOMP_STRIP_ALT_WINDING");
+         on = e && strcmp(e, "0") != 0;
+@@ -3141,6 +3166,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+         }
+         return;
+     }
++    if (triangle_culled(area))
++        return;
+     for (k = 0; k < 3; k++) {
+         if (!s_gpu.xf_seeded)
+             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
+@@ -4294,6 +4321,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         s_reg[0x0364 / 4] = 0x207u;                            /* FUNC */
+         s_reg[0x0360 / 4] = s_reg[0x036C / 4] = 0xFFu;         /* MASK, FUNC_MASK */
+         s_reg[0x0370 / 4] = s_reg[0x0374 / 4] = s_reg[0x0378 / 4] = 0x1E00u;
++        s_reg[0x03A0 / 4] = 0x900u;                            /* clockwise front */
+         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+         {
+             int i;
+@@ -4706,6 +4734,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         nv2a_vsh_set_constant_load(param);
+         break;
+ 
++    case 0x0308: case 0x039C: case 0x03A0:       /* cull and front face */
++        break;
++
+     /* Depth. */
+     case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
+     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
+diff --git a/tests/nv2a_ffp_backend/CMakeLists.txt b/tests/nv2a_ffp_backend/CMakeLists.txt
+index 4579537..8ac2688 100644
+--- a/tests/nv2a_ffp_backend/CMakeLists.txt
++++ b/tests/nv2a_ffp_backend/CMakeLists.txt
+@@ -23,7 +23,6 @@ add_test(NAME nv2a-present-sync COMMAND nv2a-present-sync-test
+          "${CMAKE_CURRENT_BINARY_DIR}/nv2a-present-sync-")
+ set_tests_properties(nv2a-present-sync PROPERTIES ENVIRONMENT
+     "RECOMP_FB_DUMP_FLIPS=1;RECOMP_FB_DUMP=${CMAKE_CURRENT_BINARY_DIR}/nv2a-present-sync-")
+-# Triangle strips alternate their winding only with RECOMP_STRIP_ALT_WINDING; the same test
+-# checks the unchanged order without it (the test above) and the swapped one with it.
++# With culling off, the existing compatibility option controls strip winding.
+ add_test(NAME nv2a-ffp-backend-strip-winding COMMAND nv2a-ffp-backend-test)
+ set_tests_properties(nv2a-ffp-backend-strip-winding PROPERTIES ENVIRONMENT "RECOMP_STRIP_ALT_WINDING=1")
+diff --git a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+index a380c55..4e3f3ea 100644
+--- a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
++++ b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+@@ -469,6 +469,19 @@ int main(void)
+         }
+     }
+ 
++    /* A backend that culls needs the hardware winding even without the
++     * compatibility option. The cull state still reaches the backend. */
++    m(0x0308, 1); m(0x039C, 0x405); m(0x03A0, 0x900);
++    m(0x17FC, 6); m(0x1810, 3u << 24); m(0x17FC, 0);
++    CHECK(s_be.rs.cull_enable == 1 && s_be.rs.cull_face == 0x405
++       && s_be.rs.front_face == 0x900);
++    CHECK(s_be.count == 6);
++    CHECK(near_(s_be.v[3].x, 320.0f) && near_(s_be.v[4].x, 640.0f)
++       && near_(s_be.v[5].x, 640.0f));
++    CHECK(near_(s_be.v[3].y, 0.0f) && near_(s_be.v[4].y, 480.0f)
++       && near_(s_be.v[5].y, 0.0f));
++    m(0x0308, 0);
++
+     /* A garbage index (the walk is 32 bits wide now) must not reach outside
+      * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
+      * array, and the batch is dropped instead of read. The test buffer is
+diff --git a/tests/nv2a_raster_batch/CMakeLists.txt b/tests/nv2a_raster_batch/CMakeLists.txt
+index f809c7a..98771d1 100644
+--- a/tests/nv2a_raster_batch/CMakeLists.txt
++++ b/tests/nv2a_raster_batch/CMakeLists.txt
+@@ -13,6 +13,8 @@ elseif(NOT WIN32)
+     target_link_libraries(nv2a-raster-batch-test PRIVATE m pthread)
+ endif()
+ add_test(NAME nv2a-raster-batch COMMAND nv2a-raster-batch-test)
++add_test(NAME nv2a-raster-cull-screen COMMAND nv2a-raster-batch-test cull-screen)
++add_test(NAME nv2a-raster-cull-transform COMMAND nv2a-raster-batch-test cull-transform)
+ add_test(NAME nv2a-raster-pixel-stats COMMAND nv2a-raster-batch-test stats)
+ set_tests_properties(nv2a-raster-pixel-stats PROPERTIES
+     PASS_REGULAR_EXPRESSION "\\[GPU\\] brightest pixel written 0xFF807F40[\r\n]+\\[GPU\\] 140035 pixels written")
+diff --git a/tests/nv2a_raster_batch/nv2a_raster_batch_test.c b/tests/nv2a_raster_batch/nv2a_raster_batch_test.c
+index b62c4a8..d332e4e 100644
+--- a/tests/nv2a_raster_batch/nv2a_raster_batch_test.c
++++ b/tests/nv2a_raster_batch/nv2a_raster_batch_test.c
+@@ -223,9 +223,109 @@ static int verify(int nq, int *drawn)
+     return bad;
+ }
+ 
++static int expect_pixel(int x, int y, uint32_t want, const char *label)
++{
++    uint32_t got;
++    memcpy(&got, s_mem + COLOR_AT + 4u * (uint32_t)(y * W + x), 4);
++    if (got == want)
++        return 0;
++    fprintf(stderr, "FAIL -- %s pixel %d,%d: got %08X, expected %08X\n",
++            label, x, y, got, want);
++    return 1;
++}
++
++static void draw_cull_triangle(int reverse)
++{
++    put_vertex(0, 16, 16, 0xFFFFFFFFu);
++    put_vertex(1, reverse ? 16.0f : 144.0f, reverse ? 144.0f : 16.0f, 0xFFFFFFFFu);
++    put_vertex(2, reverse ? 144.0f : 16.0f, reverse ? 16.0f : 144.0f, 0xFFFFFFFFu);
++    m(0x17FC, 5);
++    m(0x1810, 2u << 24);
++    m(0x17FC, 0);
++}
++
++static int test_culling(int transformed)
++{
++    static const float perspective[16] = {
++        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.5f, 0, 0, 0, 1, 0
++    };
++    int front, face, reverse, bad = 0;
++
++    s_stage = "face culling";
++    m(0x0308, 1);                            /* CULL_FACE_ENABLE */
++    m(0x039C, 0x405);                        /* CULL_FACE: back */
++    clear_surface();
++    draw_cull_triangle(0);
++    bad += expect_pixel(32, 32, 0xFFFFFFFFu, "default clockwise front");
++    clear_surface();
++    draw_cull_triangle(1);
++    bad += expect_pixel(32, 32, 0, "default clockwise back");
++
++    for (front = 0; front < 2; front++) {
++        m(0x03A0, front ? 0x901u : 0x900u); /* FRONT_FACE: CCW or CW */
++        for (face = 0; face < 2; face++) {
++            m(0x039C, face ? 0x404u : 0x405u);
++            for (reverse = 0; reverse < 2; reverse++) {
++                int is_front = reverse == front;
++                int visible = face ? !is_front : is_front;
++                clear_surface();
++                draw_cull_triangle(reverse);
++                bad += expect_pixel(32, 32, visible ? 0xFFFFFFFFu : 0,
++                                    "front/back culling");
++            }
++        }
++    }
++
++    m(0x039C, 0x408);                        /* CULL_FACE: front and back */
++    for (reverse = 0; reverse < 2; reverse++) {
++        clear_surface();
++        draw_cull_triangle(reverse);
++        bad += expect_pixel(32, 32, 0, "cull both faces");
++    }
++    m(0x0308, 0);
++    for (reverse = 0; reverse < 2; reverse++) {
++        clear_surface();
++        draw_cull_triangle(reverse);
++        bad += expect_pixel(32, 32, 0xFFFFFFFFu, "culling disabled");
++    }
++
++    m(0x0308, 1); m(0x039C, 0x405); m(0x03A0, 0x900);
++    clear_surface();
++    put_vertex(0, 0, 0, 0xFFFFFFFFu);
++    put_vertex(1, 128, 0, 0xFFFFFFFFu);
++    put_vertex(2, 0, 128, 0xFFFFFFFFu);
++    put_vertex(3, 128, 128, 0xFFFFFFFFu);
++    m(0x17FC, 6);                            /* TRIANGLE_STRIP */
++    m(0x1810, 3u << 24);
++    m(0x17FC, 0);
++    bad += expect_pixel(32, 32, 0xFFFFFFFFu, "strip first triangle");
++    bad += expect_pixel(96, 96, 0xFFFFFFFFu, "strip second triangle");
++
++    if (transformed) {
++        const float verts[3][3] = {{20, 20, 1}, {200, 20, 1}, {0, 0, -1}};
++        int i;
++        for (i = 0; i < 16; i++)
++            mf(0x0680 + 4u * (uint32_t)i, perspective[i]);
++        for (reverse = 0; reverse < 2; reverse++) {
++            clear_surface();
++            for (i = 0; i < 3; i++) {
++                int src = reverse && i ? 3 - i : i;
++                uint32_t white = 0xFFFFFFFFu;
++                memcpy(s_mem + POS_AT + 12u * (uint32_t)i, verts[src], 12);
++                memcpy(s_mem + DIFF_AT + 4u * (uint32_t)i, &white, 4);
++            }
++            m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
++            bad += expect_pixel(180, 100, reverse ? 0 : 0xFFFFFFFFu,
++                                "near-clipped winding");
++        }
++    }
++    return bad;
++}
++
+ int main(int argc, char **argv)
+ {
+     static const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
++    int cull_screen = argc > 1 && !strcmp(argv[1], "cull-screen");
+     uint32_t n = 0, start;
+     int i, x, y, bad = 0, drawn = 0, pool = 0, workers = 0;
+ 
+@@ -242,8 +342,9 @@ int main(int argc, char **argv)
+     m(0x0204, (uint32_t)H << 16);            /* CLIP_VERTICAL */
+     m(0x020C, W * 4);                        /* SET_SURFACE_PITCH */
+     m(0x0210, COLOR_AT);                     /* SET_SURFACE_COLOR_OFFSET */
+-    for (i = 0; i < 16; i++)
+-        mf(0x0680 + 4 * i, I[i]);            /* composite: positions are pixels */
++    if (!cull_screen)
++        for (i = 0; i < 16; i++)
++            mf(0x0680 + 4 * i, I[i]);        /* composite: positions are pixels */
+     m(0x1E94, 0);                            /* TRANSFORM_EXECUTION_MODE: fixed */
+ 
+     /* Quads with integer corners, overlapping heavily, two triangles each,
+@@ -258,6 +359,12 @@ int main(int argc, char **argv)
+     m(0x1720, POS_AT);  m(0x1760, 2 | (3 << 4) | (12 << 8));       /* attr 0: float3 */
+     m(0x172C, DIFF_AT); m(0x176C, 0 | (4 << 4) | (4 << 8));        /* attr 3: D3DCOLOR */
+ 
++    if (cull_screen || (argc > 1 && !strcmp(argv[1], "cull-transform"))) {
++        bad = test_culling(!cull_screen);
++        s_finished = 1;
++        return bad ? 1 : 0;
++    }
++
+     if (argc > 1 && !strcmp(argv[1], "noqueue")) {
+         uint32_t zpass;
+         s_stage = "the allocation-failure fallback";
+-- 
+2.56.1.windows.1
+

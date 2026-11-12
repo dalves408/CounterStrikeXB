@@ -1,13 +1,19 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "a31cc9e16579b890440cad35d1fec724a49092dc",
+                       "commit":  "1e6abc3ba3e8b310dfab7b167749e89f099695bc",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
                                              "patches/xboxrecomp/0001-disasm-drop-phase-shifted-call-targets-CounterStrike.patch",
                                              "patches/xboxrecomp/0002-pb_exec-present-the-display-sized-surface-over-a-tal.patch",
-                                             "patches/xboxrecomp/0003-usb-ohci-keep-waiting-for-the-driver-to-start-the-co.patch"
+                                             "patches/xboxrecomp/0003-usb-ohci-keep-waiting-for-the-driver-to-start-the-co.patch",
+                                             "patches\\xboxrecomp\\0004-nv2a-unify-fixed-function-transform-state-and-inline.patch",
+                                             "patches\\xboxrecomp\\0005-nv2a-accumulate-raster-statistics-per-worker.patch",
+                                             "patches\\xboxrecomp\\0006-nv2a-honor-face-culling-in-software-rasterization.patch",
+                                             "patches\\xboxrecomp\\0007-apu-protect-voice-updates-and-streamed-samples.patch",
+                                             "patches\\xboxrecomp\\0008-nv2a-honor-video-overlay-stop-and-restart.patch",
+                                             "patches\\xboxrecomp\\0009-nv2a-prepare-shaders-and-cache-decoded-textures.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

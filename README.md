@@ -8,12 +8,20 @@ The game's `default.xbe` is translated to C by the toolkit's pipeline and linked
 
 ## Status (work in progress)
 
-Working:
+Previously verified:
 - Boots and plays the intro movies (MGS and Valve logos), title screen and attract movie.
 - Menus are fully navigable with the keyboard or an XInput pad (title START, profile creation, Main Menu, Training, Single Player, Xbox Live, System Link screens), full 640x480 framing.
 - Loading a map: the game relaunches itself (`XLaunchNewImage`), which is modelled as a host relaunch (`src/cs_launch.c`). Training > Hostage Rescue and Single Player > Beginner > Airstrip both load in-game.
 
-Known issues (priority order):
+Current focus: reliable intros, flash-free menus, quicker loading, and real menu
+rendering at 60 FPS or better, before returning to gameplay. The latest pinned
+build completes both intros and reaches the main menu. Its measured main-menu
+average is 36.8 FPS (18-42 FPS samples), improved from the roughly 12 FPS baseline
+but still below target. Submenu entry and Back also worked in a bounded run.
+Smooth movie cadence, absence of individual-frame flashes, and normal loading
+times remain unverified. Earlier gameplay still had major glitches at about 1 FPS.
+
+Known issues from the earlier gameplay baseline:
 1. In-game world geometry (BSP brushes) and sky are not drawn; only props/foliage render. No first-person weapon (viewmodel).
 2. HUD is drawn about 45% down the screen instead of at the screen edges; radar and crosshair misplaced; HUD digits ghosted; timer colon missing.
 3. Performance: 0-4 FPS in a match, game clock runs at about half speed; map load takes about 2 minutes.
@@ -21,7 +29,8 @@ Known issues (priority order):
 5. Intro movies don't play smoothly.
 6. Not yet verified with a physical XInput controller.
 
-Planned: a DX11 renderer back end (like the other xboxrecomp-based projects), which is expected to address items 1-3.
+The current renderer is CPU-based; the optional D3D11 renderer does not yet
+cover all the state needed by this game.
 
 ## Requirements
 
@@ -54,7 +63,9 @@ Output: `build\RelWithDebInfo\cs2_xbox_recomp.exe`.
 powershell -ExecutionPolicy Bypass -File scripts\run.ps1
 ```
 
-The title screen appears after roughly 30-40 seconds; press START or A to skip the intros. Close the window to quit. Logs are written to `runs\<label>\`, and saves to the project-local `SaveData\`.
+On the earlier verified build the title screen appeared after roughly 30-40
+seconds; press START or A to skip the intros. Close the window to quit. Logs
+are written to `runs\<label>\`, and saves to the project-local `SaveData\`.
 
 Keyboard controls:
 
@@ -73,11 +84,20 @@ A connected XInput controller is also passed through.
 
 ## Toolkit pin and local patches
 
-`dependencies.json` pins xboxrecomp to tag v0.17.0 (`343b6d8`) plus three local patches in `patches/xboxrecomp/`, applied by `scripts/setup.ps1` with a fixed identity so the resulting commit (`a31cc9e`) is reproducible:
+`dependencies.json` pins xboxrecomp to tag v0.17.0 (`343b6d8`) plus nine local
+patches in `patches/xboxrecomp/`, applied by `scripts/setup.ps1` with a fixed
+identity so the resulting commit (`1e6abc3`) is reproducible:
 
 - `0001` disasm: drop phase-shifted call targets (fixes the game's controller-open routine being split mid-function).
 - `0002` pb_exec: present the display-sized 640x480 surface instead of the oversized back buffer.
 - `0003` usb-ohci: keep waiting for the driver to start the controller when the game starts USB late.
+- `0004` nv2a: unify fixed-function transform state and handle large raster bounds.
+- `0005` nv2a: accumulate raster statistics per worker rather than per pixel.
+- `0006` nv2a: honor face culling and triangle-strip winding.
+- `0007` apu: synchronize voice updates and correct streamed-sample boundaries.
+- `0008` nv2a: clear stopped video overlays and protect restarted banks.
+- `0009` nv2a: prepare common combiner programs per draw, cache byte-validated
+  decoded DXT images, and reduce per-pixel conversion/filtering work.
 
 The generated code in `src/recomp/gen` is pure pipeline output and is never edited by hand; game-specific code lives in `src/`.
 

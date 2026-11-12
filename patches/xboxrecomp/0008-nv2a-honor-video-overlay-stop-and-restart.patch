@@ -1,0 +1,397 @@
+From 09ceb8b9ebc7f593a931cf6e76348867f7b525b1 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 11:00:00 -0800
+Subject: [PATCH] nv2a: honor video overlay stop and restart
+
+Track self-clearing STOP commands for the presenter and prevent an older snapshot from consuming a bank submitted after a stop.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/nv2a/nv2a_core.c          |   4 +-
+ src/nv2a/nv2a_mmio_hook.c     |  30 +++++----
+ src/nv2a/nv2a_mmio_hook.h     |   8 +--
+ src/nv2a/nv2a_state.h         |   1 +
+ src/video/fb_present.c        |  15 +++--
+ tests/fb_present/test_main.c  | 114 +++++++++++++++++++++++++++++++++-
+ tests/nv2a_pvideo/test_main.c |  27 +++++++-
+ 7 files changed, 176 insertions(+), 23 deletions(-)
+
+diff --git a/src/nv2a/nv2a_core.c b/src/nv2a/nv2a_core.c
+index 2432df4..cf4b9a3 100644
+--- a/src/nv2a/nv2a_core.c
++++ b/src/nv2a/nv2a_core.c
+@@ -493,8 +493,10 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+     /* STOP is a command, not storage. The title's D3D waits for the pending
+      * banks in BUFFER to clear after issuing it; xemu clears them at once. */
+     if (addr == NV_PVIDEO_STOP) {
+-        if (val & 1)
++        if (val & 1) {
+             d->pvideo.regs[NV_PVIDEO_BUFFER] = 0;
++            d->pvideo.stop_generation++;
++        }
+         d->pvideo.regs[addr] = 0;
+         return;
+     }
+diff --git a/src/nv2a/nv2a_mmio_hook.c b/src/nv2a/nv2a_mmio_hook.c
+index ff0bcb9..b17a036 100644
+--- a/src/nv2a/nv2a_mmio_hook.c
++++ b/src/nv2a/nv2a_mmio_hook.c
+@@ -35,7 +35,7 @@ static int g_mmio_decode_fail = 0;
+  * hook and read by the window thread for scanout. */
+ static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
+ 
+-bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
++bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4], uint64_t *stop_generation)
+ {
+     NV2AState *state = nv2a_get_state();
+     unsigned i;
+@@ -43,22 +43,29 @@ bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+     AcquireSRWLockShared(&g_pvideo_lock);
+     for (i = 0; i < 0x1000 / 4; ++i)
+         regs[i] = state->pvideo.regs[i * 4];
++    if (stop_generation) *stop_generation = state->pvideo.stop_generation;
+     ReleaseSRWLockShared(&g_pvideo_lock);
+     return true;
+ }
+ 
+-/* The scanout has taken the bank: clear its pending bit in BUFFER, which is
+- * what the title polls before it reuses the memory. */
+-void nv2a_hook_pvideo_consume(unsigned bank)
++/* Clear the bank only if STOP has not allowed the title to resubmit it since
++ * the snapshot. The title polls BUFFER before reusing its memory. */
++bool nv2a_hook_pvideo_consume(unsigned bank, uint64_t stop_generation)
+ {
+     NV2AState *state = nv2a_get_state();
+-    uint64_t buffer;
+-    if (!state || bank > 1) return;
++    uint64_t buffer, mask;
++    bool consumed = false;
++    if (!state || bank > 1) return false;
++    mask = (uint64_t)1u << (bank * 4);
+     AcquireSRWLockExclusive(&g_pvideo_lock);
+     buffer = nv2a_mmio_read(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER, 4);
+-    nv2a_mmio_write(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER,
+-                    buffer & ~(uint64_t)(1u << (bank * 4)), 4);
++    if (state->pvideo.stop_generation == stop_generation && (buffer & mask)) {
++        nv2a_mmio_write(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER,
++                        buffer & ~mask, 4);
++        consumed = true;
++    }
+     ReleaseSRWLockExclusive(&g_pvideo_lock);
++    return consumed;
+ }
+ 
+ /* ============================================================
+@@ -470,9 +477,10 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
+ 
+ #else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
+ 
+-bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+-{ (void)regs; return false; }
+-void nv2a_hook_pvideo_consume(unsigned bank) { (void)bank; }
++bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4], uint64_t *stop_generation)
++{ (void)regs; (void)stop_generation; return false; }
++bool nv2a_hook_pvideo_consume(unsigned bank, uint64_t stop_generation)
++{ (void)bank; (void)stop_generation; return false; }
+ 
+ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
+ { (void)xbox_mem_offset; }
+diff --git a/src/nv2a/nv2a_mmio_hook.h b/src/nv2a/nv2a_mmio_hook.h
+index ad07e31..5d604c5 100644
+--- a/src/nv2a/nv2a_mmio_hook.h
++++ b/src/nv2a/nv2a_mmio_hook.h
+@@ -26,10 +26,10 @@
+  */
+ void nv2a_hook_init(ptrdiff_t xbox_mem_offset);
+ 
+-/* For the host scanout thread: copy the modeled PVIDEO registers (false
+- * when there is no NV2A model), and mark a bank's frame as taken. */
+-bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4]);
+-void nv2a_hook_pvideo_consume(unsigned bank);
++/* For the host scanout thread: copy the modeled registers and, optionally,
++ * the self-clearing STOP command's generation under the same lock. */
++bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4], uint64_t *stop_generation);
++bool nv2a_hook_pvideo_consume(unsigned bank, uint64_t stop_generation);
+ 
+ /*
+  * Handle an NV2A MMIO access fault.
+diff --git a/src/nv2a/nv2a_state.h b/src/nv2a/nv2a_state.h
+index edd0453..65357e1 100644
+--- a/src/nv2a/nv2a_state.h
++++ b/src/nv2a/nv2a_state.h
+@@ -110,6 +110,7 @@ typedef struct NV2AState {
+ 
+     struct {
+         uint32_t regs[0x1000];
++        uint64_t stop_generation;
+     } pvideo;
+ 
+     struct {
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index cee70c0..5a06253 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -72,23 +72,25 @@ static uint8_t      *s_pvideo_source;
+ static size_t        s_pvideo_bytes;
+ static unsigned      s_pvideo_bank;
+ static uint32_t      s_pvideo_regs[0x1000 / 4];
++static uint64_t      s_pvideo_stop_generation;
+ 
+ /* Draw the video overlay over s_rgb: a newly submitted bank if there is one
+  * (copied, drawn, then handed back to the title), else the last frame. */
+ static void fb_overlay(void)
+ {
+     uint32_t regs[0x1000 / 4];
++    uint64_t stop_generation;
+     unsigned bank;
+     bool presented = false;
+ 
+-    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs)) return;
+-    if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
++    if (!s_rgb || !nv2a_hook_pvideo_snapshot(regs, &stop_generation)) return;
++    if (s_pvideo_stop_generation != stop_generation ||
+         (s_pvideo_source &&
+          regs[(NV_PVIDEO_SIZE_IN + s_pvideo_bank * 4) / 4] == UINT32_MAX)) {
+         free(s_pvideo_source);
+         s_pvideo_source = NULL;
+-        if (regs[NV_PVIDEO_STOP / 4] & 1u) return;
+     }
++    s_pvideo_stop_generation = stop_generation;
+     for (bank = 0; bank < 2; ++bank) {
+         uint64_t physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
+                             regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
+@@ -116,13 +118,18 @@ static void fb_overlay(void)
+             free(snapshot);
+             continue;
+         }
++        if (!nv2a_hook_pvideo_consume(bank, stop_generation)) {
++            free(snapshot);
++            free(s_pvideo_source);
++            s_pvideo_source = NULL;
++            continue;
++        }
+         free(s_pvideo_source);
+         s_pvideo_source = snapshot;
+         s_pvideo_bytes = (size_t)bytes;
+         s_pvideo_bank = bank;
+         memcpy(s_pvideo_regs, regs, sizeof(s_pvideo_regs));
+         presented = true;
+-        nv2a_hook_pvideo_consume(bank);
+     }
+     if (!presented && s_pvideo_source)
+         pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
+diff --git a/tests/fb_present/test_main.c b/tests/fb_present/test_main.c
+index 79cf1dc..dcb65ad 100644
+--- a/tests/fb_present/test_main.c
++++ b/tests/fb_present/test_main.c
+@@ -8,11 +8,13 @@
+ #define xbox_GetMemoryOffset present_test_memory_offset
+ #include "../../src/video/fb_present.c"
+ #undef xbox_GetMemoryOffset
++#include "../../src/nv2a/nv2a_state.h"
+ 
+ #define FRAME_VA 0x1000u
+ #define FRAME_PIXELS (640u * 480u)
+ #define FRAME_BYTES (FRAME_PIXELS * 4u)
+ #define THREAD_TIMEOUT_MS 5000
++#define NV2A_PVIDEO_MMIO 0x8000u
+ 
+ typedef void (*recomp_func_t)(void);
+ 
+@@ -21,10 +23,11 @@ static uint32_t *output;
+ static HANDLE started, finished;
+ static int copy_result;
+ static volatile LONG stress_done;
++static ptrdiff_t guest_offset_adjustment;
+ 
+ ptrdiff_t present_test_memory_offset(void)
+ {
+-    return (ptrdiff_t)guest;
++    return (ptrdiff_t)guest + guest_offset_adjustment;
+ }
+ 
+ recomp_func_t recomp_lookup(uint32_t xbox_va)
+@@ -201,6 +204,112 @@ static int test_concurrent_frames(void)
+     return ok;
+ }
+ 
++static void program_video_bank(NV2AState *d, unsigned bank, uint32_t offset)
++{
++    unsigned b = bank * 4u;
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_BASE + b, 0, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_OFFSET + b, offset, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_LIMIT + b, 0x03FFFFFFu, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_SIZE_IN + b, (2u << 16) | 4u, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_POINT_OUT + b, 0, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_SIZE_OUT + b, (2u << 16) | 4u, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_DS_DX + b, NV_PVIDEO_DIN_DOUT_UNITY, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_DT_DY + b, NV_PVIDEO_DIN_DOUT_UNITY, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_FORMAT + b,
++                    (NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8 << 16) | 8u, 4);
++}
++
++static void fill_video(uint32_t offset, uint8_t y)
++{
++    unsigned i;
++    for (i = 0; i < 16; i += 4) {
++        guest[offset + i] = y;
++        guest[offset + i + 1] = 128;
++        guest[offset + i + 2] = y;
++        guest[offset + i + 3] = 128;
++    }
++}
++
++static void submit_video_bank(NV2AState *d, unsigned bank)
++{
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER,
++                    1u << (bank * 4u), 4);
++}
++
++#define CHECK_VIDEO(condition) do { \
++    if (!(condition)) { \
++        fprintf(stderr, "Video check failed on line %d: %s\n", __LINE__, #condition); \
++        return 0; \
++    } \
++} while (0)
++
++static int test_video_stop_and_restart(void)
++{
++    static uint8_t vram[0x10000], ramin[0x10000];
++    NV2AState *d = nv2a_init_standalone(vram, sizeof(vram), ramin, sizeof(ramin));
++    CHECK_VIDEO(d);
++
++    guest_offset_adjustment = -(ptrdiff_t)0x80000000u;
++    s_rgb = output;
++    fill_video(FRAME_VA, 235);
++    fill_video(FRAME_VA + 16, 16);
++    program_video_bank(d, 0, FRAME_VA);
++    program_video_bank(d, 1, FRAME_VA + 16);
++
++    submit_video_bank(d, 0);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0xFFFFFFFFu && s_pvideo_source &&
++                nv2a_mmio_read(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER, 4) == 0);
++
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_STOP, 0, 4);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0xFFFFFFFFu);
++
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_STOP, 1, 4);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0x12121212u && !s_pvideo_source);
++
++    submit_video_bank(d, 1);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0xFF000000u && s_pvideo_bank == 1);
++
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_STOP, 1, 4);
++    submit_video_bank(d, 0);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0xFFFFFFFFu && s_pvideo_bank == 0);
++
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_STOP, 1, 4);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_FORMAT + 4, 0, 4);
++    submit_video_bank(d, 1);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0x12121212u && !s_pvideo_source);
++
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_STOP, 1, 4);
++    program_video_bank(d, 0, FRAME_VA);
++    submit_video_bank(d, 0);
++    fb_overlay();
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_SIZE_IN, UINT32_MAX, 4);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0x12121212u && !s_pvideo_source);
++
++    program_video_bank(d, 1, FRAME_VA + 16);
++    submit_video_bank(d, 1);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0xFF000000u && s_pvideo_bank == 1);
++    nv2a_mmio_write(d, NV2A_PVIDEO_MMIO + NV_PVIDEO_SIZE_IN + 4, UINT32_MAX, 4);
++    memset(output, 0x12, FRAME_BYTES);
++    fb_overlay();
++    CHECK_VIDEO(output[0] == 0x12121212u && !s_pvideo_source);
++    return 1;
++}
++
+ int main(void)
+ {
+     int ok;
+@@ -224,12 +333,15 @@ int main(void)
+         fprintf(stderr, "Presentation reader did not respect the snapshot lock\n");
+     if (ok && !(ok = test_concurrent_frames()))
+         fprintf(stderr, "Concurrent presentation produced a torn frame\n");
++    if (ok && !(ok = test_video_stop_and_restart()))
++        fprintf(stderr, "Video overlay stop or restart regression\n");
+ 
+     InterlockedExchange(&s_fb_running, 0);
+     CloseHandle(started);
+     CloseHandle(finished);
+     free(s_present[0]);
+     free(s_present[1]);
++    free(s_pvideo_source);
+     free(output);
+     free(guest);
+     return ok ? 0 : 1;
+diff --git a/tests/nv2a_pvideo/test_main.c b/tests/nv2a_pvideo/test_main.c
+index fda541d..6a91cd4 100644
+--- a/tests/nv2a_pvideo/test_main.c
++++ b/tests/nv2a_pvideo/test_main.c
+@@ -147,15 +147,37 @@ static void stop_clears_pending_banks(NV2AState *d)
+ static void consume_clears_its_bank(NV2AState *d)
+ {
+     uint32_t regs[0x1000 / 4];
++    uint64_t generation;
+ 
+     nv2a_mmio_write(d, PVIDEO + NV_PVIDEO_BUFFER,
+                     NV_PVIDEO_BUFFER_0_USE | NV_PVIDEO_BUFFER_1_USE, 4);
+-    nv2a_hook_pvideo_consume(0);
+-    CHECK(nv2a_hook_pvideo_snapshot(regs), "no snapshot with a model");
++    CHECK(nv2a_hook_pvideo_snapshot(regs, &generation), "no snapshot with a model");
++    CHECK(nv2a_hook_pvideo_consume(0, generation), "could not consume bank 0");
++    CHECK(nv2a_hook_pvideo_snapshot(regs, NULL), "no snapshot with a model");
+     CHECK(regs[NV_PVIDEO_BUFFER / 4] == NV_PVIDEO_BUFFER_1_USE,
+           "consuming bank 0 left BUFFER %08X", regs[NV_PVIDEO_BUFFER / 4]);
+ }
+ 
++static void stop_rejects_stale_consume(NV2AState *d)
++{
++    uint32_t regs[0x1000 / 4];
++    uint64_t before, after;
++
++    nv2a_mmio_write(d, PVIDEO + NV_PVIDEO_BUFFER, NV_PVIDEO_BUFFER_0_USE, 4);
++    CHECK(nv2a_hook_pvideo_snapshot(regs, &before), "no snapshot with a model");
++    nv2a_mmio_write(d, PVIDEO + NV_PVIDEO_STOP, 0, 4);
++    CHECK(nv2a_hook_pvideo_snapshot(regs, &after), "no snapshot after STOP 0");
++    CHECK(after == before, "STOP 0 changed the generation");
++    nv2a_mmio_write(d, PVIDEO + NV_PVIDEO_STOP, 1, 4);
++    nv2a_mmio_write(d, PVIDEO + NV_PVIDEO_BUFFER, NV_PVIDEO_BUFFER_0_USE, 4);
++    CHECK(!nv2a_hook_pvideo_consume(0, before), "stale consume succeeded");
++    CHECK(nv2a_hook_pvideo_snapshot(regs, &after), "no snapshot after restart");
++    CHECK(after != before, "STOP 1 did not change the generation");
++    CHECK(regs[NV_PVIDEO_BUFFER / 4] == NV_PVIDEO_BUFFER_0_USE,
++          "stale consume cleared the restarted bank");
++    CHECK(nv2a_hook_pvideo_consume(0, after), "could not consume restarted bank");
++}
++
+ int main(void)
+ {
+     static uint8_t vram[0x10000], ramin[0x10000];
+@@ -170,6 +192,7 @@ int main(void)
+     if (!d) { fprintf(stderr, "no NV2A model\n"); return 2; }
+     stop_clears_pending_banks(d);
+     consume_clears_its_bank(d);
++    stop_rejects_stale_consume(d);
+ 
+     if (s_failures) {
+         fprintf(stderr, "%d check(s) failed\n", s_failures);
+-- 
+2.56.1.windows.1
+

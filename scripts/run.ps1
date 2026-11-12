@@ -41,6 +41,7 @@ $envs = [ordered]@{
     RECOMP_CONTIG_AVOID_IMAGE = '1'       # contiguous allocations placed above the XBE image
     RECOMP_AC97_READY         = '1'       # AC97 codec reports ready (DSOUND init)
     RECOMP_VBLANK             = 'paced'   # paced 60 Hz vblank interrupts
+    RECOMP_DISPATCH_GATE      = '1'       # serialize raised-IRQL guest code and DPCs on one CPU
 }
 if ($FbDumpEvery -gt 0) {
     $envs['RECOMP_FB_DUMP'] = (Join-Path $dir 'fb.bmp')

@@ -1,0 +1,894 @@
+From 1e6abc3ba3e8b310dfab7b167749e89f099695bc Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 11:42:41 -0800
+Subject: [PATCH] nv2a: prepare shaders and cache decoded textures
+
+Prepare single-product combiner programs per batch with an interpreter fallback. Reuse byte-validated DXT image snapshots and shared block palettes, retain bounded block fallback, and reduce per-pixel scalar work without changing output arithmetic. Cover mappings, saturation, constants, alpha modes, texture rewrites, eviction, and format changes.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/d3d/d3d8_swizzle.h                       |  98 +++++------
+ src/kernel/nv2a_combiner.c                   | 115 ++++++++++++-
+ src/kernel/nv2a_combiner.h                   |  14 ++
+ src/kernel/nv2a_pb_exec.c                    | 167 ++++++++++++++++---
+ tests/d3d8_smoke/test_main.c                 |  43 +++++
+ tests/nv2a_combiner/nv2a_combiner_test.c     | 142 ++++++++++++++++
+ tests/nv2a_tex_filter/nv2a_tex_filter_test.c |  40 +++++
+ 7 files changed, 551 insertions(+), 68 deletions(-)
+
+diff --git a/src/d3d/d3d8_swizzle.h b/src/d3d/d3d8_swizzle.h
+index 281b4d2..04e1cfe 100644
+--- a/src/d3d/d3d8_swizzle.h
++++ b/src/d3d/d3d8_swizzle.h
+@@ -322,59 +322,37 @@ static inline uint32_t d3d8_format_dxt_block_bytes(uint32_t fmt)
+     }
+ }
+ 
+-/**
+- * Check if an Xbox D3D8 format is swizzled (vs linear/compressed).
+- * Xbox formats with "LIN_" prefix are linear; DXT formats are block-compressed.
+- * All other uncompressed formats are swizzled by default.
+- */
+-/* Decode one texel out of a DXT1/DXT3/DXT5 image.
+- *
+- * These are the only formats here that are neither linear nor swizzled: texels
+- * live in 4x4 blocks, so there is no offset to compute and read -- the block
+- * has to be decoded to get at one texel.
+- *
+- * ponytail: decodes the whole 4x4 block for every texel, so a filled triangle
+- * decodes each block up to sixteen times. It is ~20 arithmetic ops on 16 bytes
+- * that are already in L1 from the neighbouring texel, and the menu draws at
+- * 640x480. Cache the last block by index if a textured 3D scene ever runs
+- * through here.
+- */
+-static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
+-                                        uint32_t u, uint32_t v,
+-                                        uint32_t width, uint32_t *argb)
++/* Decode a range within one block, sharing the colour/alpha palettes. A
++ * single-texel lookup need not expand all sixteen pixels, while a cache fill
++ * need not rebuild the same palettes sixteen times. */
++static inline int d3d8_dxt_decode_pixels(const uint8_t *block, uint32_t fmt,
++                                         uint32_t first, uint32_t count,
++                                         uint32_t *argb)
+ {
+     uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
+-    uint32_t blocks_per_row = (width + 3u) / 4u;
+-    const uint8_t *b;
+-    uint32_t bx = u & 3u, by = v & 3u, texel = by * 4u + bx;
+-    uint32_t c[4], idx, alpha = 255u;
+-    uint32_t c0, c1, i;
++    const uint8_t *b = block;
++    uint32_t c[4] = {0}, alphas[8], indices;
++    uint32_t c0, c1, i, texel;
++    uint64_t alpha_bits = 0;
+ 
+-    if (!block_bytes || !blocks_per_row)
++    if (!block_bytes || first >= 16 || count > 16 - first)
+         return 0;
+-    b = base + ((size_t)(v >> 2) * blocks_per_row + (u >> 2)) * block_bytes;
+ 
+     /* Alpha comes first in DXT3 and DXT5; the colour block follows it. */
+     if (block_bytes == 16) {
+-        if (fmt == 0x0E) {                 /* DXT3: 4 bits per texel, packed */
+-            uint32_t nib = b[texel >> 1];
+-            alpha = d3d8_expand_channel((texel & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
+-        } else {                           /* DXT5: two endpoints + 3-bit index */
+-            uint32_t a0 = b[0], a1 = b[1], a[8], sel;
+-            uint64_t bits = 0;
++        if (fmt == 0x0F) {                 /* DXT5: two endpoints + 3-bit index */
++            uint32_t a0 = b[0], a1 = b[1];
+             for (i = 0; i < 6; i++)
+-                bits |= (uint64_t)b[2 + i] << (8 * i);
+-            a[0] = a0; a[1] = a1;
++                alpha_bits |= (uint64_t)b[2 + i] << (8 * i);
++            alphas[0] = a0; alphas[1] = a1;
+             if (a0 > a1)
+                 for (i = 1; i < 7; i++)
+-                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
++                    alphas[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+             else {
+                 for (i = 1; i < 5; i++)
+-                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+-                a[6] = 0; a[7] = 255;
++                    alphas[i + 1] = ((5 - i) * a0 + i * a1) / 5;
++                alphas[6] = 0; alphas[7] = 255;
+             }
+-            sel = (uint32_t)((bits >> (3 * texel)) & 7u);
+-            alpha = a[sel];
+         }
+         b += 8;
+     }
+@@ -405,16 +383,42 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
+         c[3] = 0;                          /* transparent black */
+     }
+ 
+-    idx = ((uint32_t)b[4] | ((uint32_t)b[5] << 8)
+-        | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24)) >> (2 * texel);
+-    idx &= 3u;
+-    if (block_bytes == 8 && c0 <= c1 && idx == 3)
+-        alpha = 0;                         /* DXT1's one bit of alpha */
+-
+-    *argb = (alpha << 24) | (c[idx] & 0x00FFFFFFu);
++    indices = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
++            | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
++    for (texel = first; texel < first + count; ++texel) {
++        uint32_t idx = (indices >> (2 * texel)) & 3u, alpha = 255;
++        if (fmt == 0x0E) {
++            uint32_t nib = block[texel >> 1];
++            alpha = ((texel & 1) ? nib >> 4 : nib & 15u) * 17u;
++        } else if (fmt == 0x0F) {
++            alpha = alphas[(alpha_bits >> (3 * texel)) & 7u];
++        } else if (c0 <= c1 && idx == 3) {
++            alpha = 0;
++        }
++        argb[texel - first] = (alpha << 24) | (c[idx] & 0x00FFFFFFu);
++    }
+     return 1;
+ }
+ 
++static inline int d3d8_dxt_decode_block(const uint8_t *block, uint32_t fmt,
++                                        uint32_t argb[16])
++{
++    return d3d8_dxt_decode_pixels(block, fmt, 0, 16, argb);
++}
++
++static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
++                                        uint32_t u, uint32_t v,
++                                        uint32_t width, uint32_t *argb)
++{
++    uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
++    uint32_t blocks_per_row = (width + 3u) / 4u;
++    if (!block_bytes || !blocks_per_row)
++        return 0;
++    return d3d8_dxt_decode_pixels(
++        base + ((size_t)(v >> 2) * blocks_per_row + (u >> 2)) * block_bytes,
++        fmt, (v & 3u) * 4u + (u & 3u), 1, argb);
++}
++
+ static inline int d3d8_format_is_swizzled(uint32_t fmt)
+ {
+     /* Linear formats (0x10-0x41 range excludes the non-LIN 0x19-0x3C range) */
+diff --git a/src/kernel/nv2a_combiner.c b/src/kernel/nv2a_combiner.c
+index 0113446..c02dfd8 100644
+--- a/src/kernel/nv2a_combiner.c
++++ b/src/kernel/nv2a_combiner.c
+@@ -10,6 +10,9 @@
+ #include "nv2a_combiner.h"
+ 
+ #include <string.h>
++#if defined(_M_X64) || defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ 
+ /* The rasteriser evaluates pixels on several threads. */
+ #if defined(_MSC_VER)
+@@ -23,10 +26,18 @@ enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
+ 
+ void nv2a_rc_unpack(uint32_t c, float o[4])
+ {
++#if defined(_M_X64) || defined(__SSE2__)
++    __m128i bytes = _mm_cvtsi32_si128((int)c);
++    __m128i words = _mm_unpacklo_epi8(bytes, _mm_setzero_si128());
++    __m128i channels = _mm_unpacklo_epi16(words, _mm_setzero_si128());
++    channels = _mm_shuffle_epi32(channels, _MM_SHUFFLE(3, 0, 1, 2));
++    _mm_storeu_ps(o, _mm_div_ps(_mm_cvtepi32_ps(channels), _mm_set1_ps(255.0f)));
++#else
+     o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+     o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+     o[2] = (float)( c        & 0xFF) / 255.0f;
+     o[3] = (float)( c >> 24        ) / 255.0f;
++#endif
+ }
+ 
+ /* D3DCOLOR to floats, memoised: a program's constants are the same for
+@@ -46,13 +57,13 @@ static const float *unpack_cached(uint32_t c)
+     return val[slot];
+ }
+ 
+-static float clampf(float x, float lo, float hi)
++static inline float clampf(float x, float lo, float hi)
+ {
+     return x < lo ? lo : (x > hi ? hi : x);
+ }
+ 
+ /* PS_INPUTMAPPING, psh.c get_input_var. */
+-static float map_in(float x, uint32_t byte)
++static inline float map_in(float x, uint32_t byte)
+ {
+     float p = x < 0.0f ? 0.0f : x;
+     switch ((byte >> 5) & 7) {
+@@ -94,6 +105,106 @@ static float read_alpha(float R[16][4], uint32_t byte)
+     return map_in((byte & 0x10) ? r[3] : r[2], byte);
+ }
+ 
++static int product_source(uint8_t byte)
++{
++    unsigned reg = byte & 15;
++    return reg <= R_V1 || (reg >= R_T0 && reg < R_R0);
++}
++
++void nv2a_rc_prepare(const Nv2aCombiner *rc, Nv2aCombinerProgram *p)
++{
++    unsigned i;
++    p->state = rc;
++    p->kind = 0;
++    if ((rc->control & 0xff) != 1 ||
++        (rc->color_ocw[0] != 0xC0 && rc->color_ocw[0] != 0xC00) ||
++        (rc->alpha_ocw[0] != 0xC0 && rc->alpha_ocw[0] != 0xC00) ||
++        (rc->color_icw[0] & 0xffff) || (rc->alpha_icw[0] & 0xffff))
++        return;
++    if (rc->final0 || rc->final1) {
++        if ((rc->final1 & 0xffffff00u) != 0x1C00 ||
++            (rc->final0 != R_R0 && rc->final0 != 0x010C0002))
++            return;
++    }
++    for (i = 0; i < 2; ++i) {
++        p->rgb[i] = (uint8_t)(rc->color_icw[0] >> (24 - i * 8));
++        p->alpha[i] = (uint8_t)(rc->alpha_icw[0] >> (24 - i * 8));
++        if (!product_source(p->rgb[i]) || !product_source(p->alpha[i]))
++            return;
++    }
++    nv2a_rc_unpack(rc->factor0[0], p->c0);
++    nv2a_rc_unpack(rc->factor1[0], p->c1);
++    p->kind = rc->final0 == 0x010C0002 ? 2 : 1;
++    if (p->kind == 2) {
++        nv2a_rc_unpack(rc->final_c0, p->scale);
++        nv2a_rc_unpack(rc->final_c1, p->bias);
++    }
++    if (p->kind == 1 && rc->color_icw[0] == 0x08200000 &&
++        rc->alpha_icw[0] == 0x14200000)
++        p->kind = 3;
++    else if (p->kind == 2 && rc->color_icw[0] == 0x08040000 &&
++             rc->alpha_icw[0] == 0x18140000)
++        p->kind = 4;
++}
++
++static inline const float *product_register(const Nv2aCombinerProgram *p,
++                                             uint8_t byte, const float v0[4],
++                                             const float v1[4], const float fog[4],
++                                             const float t[4][4])
++{
++    static const float zero[4] = {0};
++    switch (byte & 15) {
++    case R_C0: return p->c0;
++    case R_C1: return p->c1;
++    case R_FOG: return fog;
++    case R_V0: return v0;
++    case R_V1: return v1;
++    case 8: case 9: case 10: case 11: return t[(byte & 15) - R_T0];
++    default: return zero;
++    }
++}
++
++void nv2a_rc_eval_prepared(const Nv2aCombinerProgram *p, const float v0[4],
++                          const float v1[4], const float fog[4],
++                          const float t[4][4], float out[4])
++{
++    const float *a, *b, *aa, *ab;
++    unsigned i;
++    if (!p->kind) {
++        nv2a_rc_eval(p->state, v0, v1, fog, t, out);
++        return;
++    }
++    if (p->kind == 3) { /* texture RGB, diffuse alpha */
++        for (i = 0; i < 3; ++i)
++            out[i] = clampf(t[0][i], 0.0f, 1.0f);
++        out[3] = clampf(v0[3], 0.0f, 1.0f);
++        return;
++    }
++    if (p->kind == 4) { /* texture * diffuse, then the final constant transform */
++        for (i = 0; i < 3; ++i) {
++            float value = clampf(map_in(t[0][i], 0) * map_in(v0[i], 0), 0.0f, 1.0f);
++            out[i] = clampf(p->bias[i] + value * p->scale[i], 0.0f, 1.0f);
++        }
++        out[3] = clampf(map_in(t[0][3], 0) * map_in(v0[3], 0), 0.0f, 1.0f);
++        return;
++    }
++    a = product_register(p, p->rgb[0], v0, v1, fog, t);
++    b = product_register(p, p->rgb[1], v0, v1, fog, t);
++    aa = product_register(p, p->alpha[0], v0, v1, fog, t);
++    ab = product_register(p, p->alpha[1], v0, v1, fog, t);
++    /* CD is zero and only AB (or AB+CD) writes r0. The final stage either
++     * passes r0 through or computes c1 + c0*r0; both read unsigned r0. */
++    for (i = 0; i < 3; ++i) {
++        float value = clampf(map_in(a[(p->rgb[0] & 16) ? 3 : i], p->rgb[0]) *
++                             map_in(b[(p->rgb[1] & 16) ? 3 : i], p->rgb[1]),
++                             0.0f, 1.0f);
++        out[i] = p->kind == 2
++            ? clampf(p->bias[i] + value * p->scale[i], 0.0f, 1.0f) : value;
++    }
++    out[3] = clampf(map_in(aa[(p->alpha[0] & 16) ? 3 : 2], p->alpha[0]) *
++                    map_in(ab[(p->alpha[1] & 16) ? 3 : 2], p->alpha[1]), 0.0f, 1.0f);
++}
++
+ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
+                   const float v1[4], const float fog[4],
+                   const float t[4][4], float out[4])
+diff --git a/src/kernel/nv2a_combiner.h b/src/kernel/nv2a_combiner.h
+index 8abfc5f..dfc9fce 100644
+--- a/src/kernel/nv2a_combiner.h
++++ b/src/kernel/nv2a_combiner.h
+@@ -35,6 +35,20 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
+                   const float v1[4], const float fog[4],
+                   const float t[4][4], float out[4]);
+ 
++typedef struct {
++    const Nv2aCombiner *state;
++    unsigned kind;
++    uint8_t rgb[2], alpha[2];
++    float c0[4], c1[4], scale[4], bias[4];
++} Nv2aCombinerProgram;
++
++/* Prepare once per batch. The state must remain unchanged until all pixels
++ * finish; the prepared program is read-only and may be shared by workers. */
++void nv2a_rc_prepare(const Nv2aCombiner *rc, Nv2aCombinerProgram *program);
++void nv2a_rc_eval_prepared(const Nv2aCombinerProgram *program, const float v0[4],
++                          const float v1[4], const float fog[4],
++                          const float t[4][4], float out[4]);
++
+ /* D3DCOLOR (0xAARRGGBB) to r,g,b,a floats. */
+ void nv2a_rc_unpack(uint32_t argb, float out[4]);
+ 
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 08006a7..1aec3a6 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -30,6 +30,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#if defined(_M_X64) || defined(__SSE2__)
++#include <emmintrin.h>
++#endif
+ #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+ #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+ #include "nv2a_flip_hold.h"
+@@ -274,6 +277,8 @@ typedef struct {
+     int      border_color;              /* FORMAT: BORDER reads `border` */
+     int      cube;                      /* FORMAT: six faces, not one    */
+     int      valid;
++    const uint32_t *decoded;            /* immutable for this draw batch */
++    uint32_t decoded_pitch;
+ } Texture;
+ 
+ static struct {
+@@ -1143,6 +1148,8 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
+      * texel 0 is -1, which must wrap to the far edge or clamp to 0 -- as an
+      * unsigned value it clamped to the far edge instead. */
+     int32_t sc = (int32_t)c, n = (int32_t)size;
++    if (c < size)
++        return c;
+     if (!size)
+         return 0;
+     if (mode == 1)                         /* wrap */
+@@ -1181,6 +1188,97 @@ static uint32_t linear_twin(uint32_t fmt)
+     }
+ }
+ 
++/* Validate compressed images once per batch, not once per bilinear tap.
++ * Entries retain the source bytes, so in-place writes invalidate the image.
++ * The executor prepares all stages before releasing workers, and joins them
++ * before another draw can replace an entry. Larger images/cubemaps retain
++ * the bounded thread-local block cache below. */
++#define NV_DECODED_TEXTURES 8
++#define NV_DECODED_MAX_PIXELS (1024u * 1024u)
++static struct {
++    uint32_t offset, format, width, height;
++    uint64_t used;
++    size_t raw_capacity, pixel_capacity;
++    uint8_t *raw;
++    uint32_t *pixels;
++} s_decoded[NV_DECODED_TEXTURES];
++static uint64_t s_decoded_clock;
++
++static int combiners_enabled(void)
++{
++    static int disabled = -1;
++    if (disabled < 0)
++        disabled = getenv("RECOMP_NO_COMBINERS") != NULL;
++    return s_gpu.rc_seen && !disabled;
++}
++
++static void prepare_textures(uint32_t stages)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    uint64_t batch = ++s_decoded_clock;
++    int st;
++    for (st = 0; st < 4; ++st) {
++        Texture *t = &s_gpu.texs[st];
++        uint32_t bb = d3d8_format_dxt_block_bytes(t->color), w, h, x, y;
++        size_t raw_size, pixel_size;
++        int i, slot = -1, same = 0;
++        t->decoded = NULL;
++        if (!(stages & (1u << st)) || !t->valid || !bb || t->cube)
++            continue;
++        w = (t->width + 3u) & ~3u; h = (t->height + 3u) & ~3u;
++        if (!w || !h || (uint64_t)w * h > NV_DECODED_MAX_PIXELS)
++            continue;
++        raw_size = (size_t)(w / 4) * (h / 4) * bb;
++        pixel_size = (size_t)w * h * sizeof(uint32_t);
++        if (!guest_span_ok(t->offset, (uint32_t)raw_size))
++            continue;
++        for (i = 0; i < NV_DECODED_TEXTURES; ++i) {
++            if (s_decoded[i].used && s_decoded[i].offset == t->offset &&
++                s_decoded[i].format == t->color && s_decoded[i].width == w &&
++                s_decoded[i].height == h) {
++                slot = i; same = 1; break;
++            }
++            /* Never evict a different texture prepared for this batch. */
++            if (s_decoded[i].used != batch &&
++                (slot < 0 || s_decoded[i].used < s_decoded[slot].used))
++                slot = i;
++        }
++        if (slot < 0)
++            continue;
++        if (s_decoded[slot].raw_capacity < raw_size) {
++            uint8_t *raw = (uint8_t *)realloc(s_decoded[slot].raw, raw_size);
++            if (!raw) {
++                fprintf(stderr, "[GPU] compressed texture source allocation failed (%zu bytes)\n", raw_size);
++                continue;
++            }
++            s_decoded[slot].raw = raw; s_decoded[slot].raw_capacity = raw_size;
++        }
++        if (s_decoded[slot].pixel_capacity < pixel_size) {
++            uint32_t *pixels = (uint32_t *)realloc(s_decoded[slot].pixels, pixel_size);
++            if (!pixels) {
++                fprintf(stderr, "[GPU] decoded texture allocation failed (%zu bytes)\n", pixel_size);
++                continue;
++            }
++            s_decoded[slot].pixels = pixels; s_decoded[slot].pixel_capacity = pixel_size;
++        }
++        if (!same || memcmp(s_decoded[slot].raw, mem + t->offset, raw_size)) {
++            memcpy(s_decoded[slot].raw, mem + t->offset, raw_size);
++            for (y = 0; y < h; y += 4)
++                for (x = 0; x < w; x += 4) {
++                    uint32_t block[16], row;
++                    const uint8_t *src = s_decoded[slot].raw + ((size_t)(y / 4) * (w / 4) + x / 4) * bb;
++                    d3d8_dxt_decode_block(src, t->color, block);
++                    for (row = 0; row < 4; ++row)
++                        memcpy(s_decoded[slot].pixels + (size_t)(y + row) * w + x, block + row * 4, 16);
++                }
++            s_decoded[slot].offset = t->offset; s_decoded[slot].format = t->color;
++            s_decoded[slot].width = w; s_decoded[slot].height = h;
++        }
++        s_decoded[slot].used = batch;
++        t->decoded = s_decoded[slot].pixels; t->decoded_pitch = w;
++    }
++}
++
+ /* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
+ static int sample_tex(const Texture *t, uint32_t face_offset,
+                       uint32_t u, uint32_t v, uint32_t *argb)
+@@ -1204,6 +1302,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+     u = wrap_coord(u, t->width,  t->addr_u);
+     v = wrap_coord(v, t->height, t->addr_v);
+ 
++    if (t->decoded) {
++        *argb = t->decoded[(size_t)v * t->decoded_pitch + u];
++        return 1;
++    }
+     fmt = t->color;
+     if (d3d8_format_dxt_block_bytes(fmt)) {
+         /* Decoded blocks, direct-mapped by address. Every texel of a DXT
+@@ -1211,8 +1313,8 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+          * neighbours that nearly always share one -- this was a tenth of
+          * the executor's time. Keyed on the block's bytes as well as its
+          * address, so a texture rewritten in place (a render target reused,
+-         * a streamed mip) never returns stale texels.
+-         * ponytail: single-threaded executor, so a plain static table. */
++         * a streamed mip) never returns stale texels. Each worker owns its
++         * cache; decode from the bytes used to validate the entry. */
+         static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                         uint32_t px[16]; } cache[4096];
+         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+@@ -1224,11 +1326,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         memcpy(raw, blk, bb);
+         if (cache[slot].key != key || cache[slot].fmt != fmt
+             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
+-            uint32_t i;
+-            for (i = 0; i < 16; i++)
+-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+-                                      by * 4 + (i >> 2), t->width,
+-                                      &cache[slot].px[i]);
++            d3d8_dxt_decode_block((const uint8_t *)raw, fmt, cache[slot].px);
+             cache[slot].key = key;
+             cache[slot].fmt = fmt;
+             cache[slot].raw[0] = raw[0];
+@@ -2478,7 +2576,7 @@ static void rc_tent(const Texture *t, uint32_t face, float u, float v,
+ {
+     uint32_t texel;
+     float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
+-    int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
++    int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k;
+ 
+     wu = fu - (float)iu;
+     wv = fv - (float)iv;
+@@ -2489,9 +2587,22 @@ static void rc_tent(const Texture *t, uint32_t face, float u, float v,
+         else
+             c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+     }
++#if defined(_M_X64) || defined(__SSE2__)
++    {
++        __m128 u0 = _mm_set1_ps(1.0f - wu), u1 = _mm_set1_ps(wu);
++        __m128 top = _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(c[0]), u0),
++                               _mm_mul_ps(_mm_loadu_ps(c[1]), u1));
++        __m128 bottom = _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(c[2]), u0),
++                                  _mm_mul_ps(_mm_loadu_ps(c[3]), u1));
++        _mm_storeu_ps(out, _mm_add_ps(_mm_mul_ps(top, _mm_set1_ps(1.0f - wv)),
++                                      _mm_mul_ps(bottom, _mm_set1_ps(wv))));
++    }
++#else
++    int j;
+     for (j = 0; j < 4; j++)
+         out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
+                + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
++#endif
+ }
+ 
+ /* `g`, when not NULL, is this pixel's gradient of (u, v): du/dx, dv/dx, du/dy,
+@@ -2667,6 +2778,8 @@ typedef struct {
+     int minx, maxx, miny, maxy, use_rc, textured;
+ } XfTri;
+ 
++static Nv2aCombinerProgram s_rc_program;
++
+ typedef struct {
+     uint64_t depth_fail, pixels;
+     uint32_t zpass;
+@@ -2727,15 +2840,20 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+ {
+     const float *a = T->a, *b = T->b, *c = T->c;
+     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
++    const float ax = a[0], ay = a[1], bx = b[0], by = b[1], cx = c[0], cy = c[1];
++    const float abx = bx - ax, aby = by - ay, bcx = cx - bx, bcy = cy - by;
++    const float cax = ax - cx, cay = ay - cy;
+     int x, y, k, bilinear, aniso;
+ 
+     tex_filter_config(&bilinear, &aniso);
+     for (y = y0; y < T->maxy; y += step) {
++        float py = (float)y + 0.5f;
++        float wa = abx * (py - ay), wb = bcx * (py - by), wc = cax * (py - cy);
+         for (x = T->minx; x < T->maxx; x++) {
+-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
++            float px = (float)x + 0.5f;
++            float w0 = wa - aby * (px - ax);
++            float w1 = wb - bcy * (px - bx);
++            float w2 = wc - cay * (px - cx);
+             float l0, l1, l2, z, col[4], pw;
+             uint32_t argb;
+             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+@@ -2788,8 +2906,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
+                         }
+                         if (!keep)
+                             continue;
+-                        nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
+-                                     (const float (*)[4])t, out);
++                        nv2a_rc_eval_prepared(&s_rc_program, col, d1, fog,
++                                            (const float (*)[4])t, out);
+                         if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
+                             continue;
+                         argb = pack_color(out);
+@@ -3131,15 +3249,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     const float *a, *b, *c;
+     float area, minx, maxx, miny, maxy, su = 1.0f, sv = 1.0f;
+     int k;
+-    static int no_rc = -1;
+-
+-    if (no_rc < 0)
+-        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+     memset(&T, 0, sizeof T);
+     T.mem = (uint8_t *)xbox_GetMemoryOffset();
+     T.bpp = surface_bpp();
+     T.textured = s_gpu.texs[0].valid && !s_xf_no_tex;
+-    T.use_rc = s_gpu.rc_seen && !no_rc;
++    T.use_rc = combiners_enabled();
+     T.va = va; T.vb = vb; T.vc = vc;
+ 
+     v[0] = va; v[1] = vb; v[2] = vc;
+@@ -3521,6 +3635,7 @@ static void raster_batch_program(void)
+     if (s_gpu.texs[0].valid)
+         note_texture_use();
+ 
++    nv2a_rc_prepare(&s_gpu.rc, &s_rc_program);
+     switch (s_gpu.prim) {
+     case NV_PRIM_TRIANGLES:
+         for (i = 0; i + 2 < n; i += 3)
+@@ -3568,6 +3683,20 @@ static void raster_batch(void)
+ 
+     if (s_gpu.idx_count < 3)
+         return;
++    {
++        uint32_t stages = 0;
++        const VertexAttr *tc = texcoord_attr();
++        if ((batch_uses_program() || batch_is_ffp()) && combiners_enabled()) {
++            for (i = 0; i < 4; ++i) {
++                uint32_t mode = (s_gpu.rc.stage_program >> (5 * i)) & 31;
++                if (mode >= 1 && mode <= 3)
++                    stages |= 1u << i;
++            }
++        } else if (tc->offset && tc->stride) {
++            stages = 1;
++        }
++        prepare_textures(stages);
++    }
+     if (batch_uses_program() || batch_is_ffp()) {
+         raster_batch_program();
+         return;
+diff --git a/tests/d3d8_smoke/test_main.c b/tests/d3d8_smoke/test_main.c
+index 90f7018..868debf 100644
+--- a/tests/d3d8_smoke/test_main.c
++++ b/tests/d3d8_smoke/test_main.c
+@@ -232,6 +232,48 @@ static void test_swizzle_offset(void)
+  */
+ static void put16(BYTE *p, UINT v) { p[0] = (BYTE)(v & 0xFF); p[1] = (BYTE)(v >> 8); }
+ 
++static void test_dxt_blocks(void)
++{
++    static const UINT32 rgb[4] = {0xFF0000, 0x0000FF, 0xAA0055, 0x5500AA};
++    static const UINT32 alpha[2][8] = {
++        {255, 0, 218, 182, 145, 109, 72, 36},
++        {0, 255, 51, 102, 153, 204, 0, 255}
++    };
++    BYTE block[16] = {0};
++    UINT32 pixels[16], fmt, pass, i;
++    for (fmt = 0x0C; fmt <= 0x0F; ++fmt) {
++        BYTE *color;
++        if (fmt == 0x0D) continue;
++        color = block + (fmt == 0x0C ? 0 : 8);
++        put16(color, 0xF800); put16(color + 2, 0x001F);
++        memset(color + 4, 0xE4, 4); /* All four color selectors, every row. */
++        for (pass = 0; pass < 2; ++pass) {
++            if (fmt == 0x0E) {
++                for (i = 0; i < 8; ++i) block[i] = (BYTE)((2 * i) | ((2 * i + 1) << 4));
++            } else if (fmt == 0x0F) {
++                uint64_t bits = 0;
++                block[0] = pass ? 0 : 255;
++                block[1] = pass ? 255 : 0;
++                for (i = 0; i < 16; ++i) bits |= (uint64_t)(i & 7) << (3 * i);
++                for (i = 0; i < 6; ++i) block[2 + i] = (BYTE)(bits >> (8 * i));
++            }
++            CHECK("decode entire DXT block", d3d8_dxt_decode_block(block, fmt, pixels));
++            for (i = 0; i < 16; ++i) {
++                UINT32 a = fmt == 0x0E ? i * 17 : (fmt == 0x0F ? alpha[pass][i & 7] : 255);
++                CHECK("DXT block pixel including alpha", pixels[i] == ((a << 24) | rgb[i & 3]));
++            }
++        }
++    }
++    memset(block, 0, sizeof block);
++    put16(block, 0x001F); put16(block + 2, 0xF800);
++    memset(block + 4, 0xE4, 4);
++    CHECK("DXT1 transparent block", d3d8_dxt_decode_block(block, 0x0C, pixels));
++    for (i = 0; i < 16; ++i) {
++        static const UINT32 colors[4] = {0xFF0000FF, 0xFFFF0000, 0xFF7F007F, 0};
++        CHECK("DXT1 three-color block pixel", pixels[i] == colors[i & 3]);
++    }
++}
++
+ static void test_dxt_decode(void)
+ {
+     BYTE blk[16];
+@@ -395,6 +437,7 @@ int main(void)
+     test_unswizzle_roundtrip();
+     test_swizzle_offset();
+     test_dxt_decode();
++    test_dxt_blocks();
+     test_convert_linear();
+     test_fvf_position();
+ 
+diff --git a/tests/nv2a_combiner/nv2a_combiner_test.c b/tests/nv2a_combiner/nv2a_combiner_test.c
+index 93fe4a2..03a1c61 100644
+--- a/tests/nv2a_combiner/nv2a_combiner_test.c
++++ b/tests/nv2a_combiner/nv2a_combiner_test.c
+@@ -14,6 +14,144 @@ enum { ZERO = 0, C0 = 1, V0 = 4, V1 = 5, T0 = 8, T1 = 9, R0 = 12, SUM = 14 };
+ #define EXPAND 0x40        /* 2x - 1 */
+ #define ICW(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
+ 
++static int prepared_products(void)
++{
++    Nv2aCombiner rc = {0};
++    Nv2aCombinerProgram program;
++    float inputs[7][4], actual[4], expected[4];
++    unsigned a, b, final, i, j;
++    uint32_t seed = 42;
++
++    rc.control = 1;
++    rc.stage_program = 1;
++    /* All input maps, selectors and immutable sources, including negative
++     * and over-range inputs. Change constants between batches, including
++     * colors that collide in the general evaluator's unpack cache. */
++    for (final = 0; final < 3; ++final) {
++        rc.final0 = final == 2 ? 0x010C0002 : (final == 1 ? R0 : 0);
++        rc.final1 = final ? 0x1CFF : 0;
++        for (a = 0; a < 256; ++a) {
++            if ((a & 15) > 5 && ((a & 15) < 8 || (a & 15) > 11))
++                continue;
++            for (b = 0; b < 256; ++b) {
++                if ((b & 15) > 5 && ((b & 15) < 8 || (b & 15) > 11))
++                    continue;
++                for (i = 0; i < 7; ++i)
++                    for (j = 0; j < 4; ++j) {
++                        seed = seed * 1664525u + 1013904223u;
++                        inputs[i][j] = ((float)(seed >> 24) - 128.0f) / 64.0f;
++                    }
++                rc.factor0[0] = (a & 1) ? 0x01010101 : seed;
++                rc.factor1[0] = (a & 1) ? 0x80808080 : ~seed;
++                rc.final_c0 = (b & 1) ? 0xFFFFFFFF : seed;
++                rc.final_c1 = (b & 1) ? 0 : ~seed;
++                rc.color_icw[0] = ICW(a, b, ZERO, ZERO);
++                rc.alpha_icw[0] = ICW(b, a, ZERO, ZERO);
++                rc.color_ocw[0] = R0 << ((a & 1) ? 4 : 8);
++                rc.alpha_ocw[0] = R0 << ((b & 1) ? 8 : 4);
++                nv2a_rc_prepare(&rc, &program);
++                CHECK(program.kind != 0);
++                nv2a_rc_eval(&rc, inputs[0], inputs[1], inputs[2],
++                             (const float (*)[4])&inputs[3], expected);
++                nv2a_rc_eval_prepared(&program, inputs[0], inputs[1], inputs[2],
++                                      (const float (*)[4])&inputs[3], actual);
++                for (i = 0; i < 4; ++i) {
++                    if (actual[i] != expected[i]) {
++                        printf("product mismatch final %u inputs %02X %02X"
++                               " channel %u: %g != %g\n",
++                               final, a, b, i, actual[i], expected[i]);
++                        return 1;
++                    }
++                }
++            }
++        }
++    }
++    return 0;
++}
++
++static int prepared_fallbacks(void)
++{
++    Nv2aCombiner base = {0};
++    float v0[4] = {0.8f, 0.2f, 0.9f, 0.4f}, v1[4] = {0.3f, 0.9f, 0.2f, 1};
++    float fog[4] = {0}, t[4][4] = {{0.3f, 0.7f, 0.2f, 0.6f}};
++    unsigned variant, i;
++    base.control = 1;
++    base.stage_program = 1;
++    base.color_icw[0] = ICW(T0, V0, ZERO, ZERO);
++    base.alpha_icw[0] = ICW(T0 | ALPHA, V0 | ALPHA, ZERO, ZERO);
++    base.color_ocw[0] = base.alpha_ocw[0] = R0 << 4;
++    base.final0 = R0;
++    base.final1 = (R0 | ALPHA) << 8;
++    for (variant = 0; variant < 10; ++variant) {
++        Nv2aCombiner rc = base;
++        Nv2aCombinerProgram program;
++        float actual[4], expected[4];
++        switch (variant) {
++        case 0: rc.control = 2; break;
++        case 1: rc.color_ocw[0] |= 2 << 12; break; /* dot product */
++        case 2: rc.alpha_ocw[0] |= 0x10 << 12; break; /* output scale */
++        case 3: rc.color_icw[0] |= ICW(0, 0, V1, T0); break;
++        case 4: rc.alpha_icw[0] |= ICW(0, 0, V1 | ALPHA, T0 | ALPHA); break;
++        case 5: rc.color_icw[0] = ICW(R0 | ALPHA, T0, 0, 0); break;
++        case 6: rc.alpha_icw[0] = ICW(R0 | ALPHA, T0 | ALPHA, 0, 0); break;
++        case 7: rc.final1 = (T0 | ALPHA) << 8; break;
++        case 8: rc.final0 = ICW(C0, T0, V1, R0); break;
++        case 9: rc.color_ocw[0] = V0 << 4; break;
++        }
++        nv2a_rc_prepare(&rc, &program);
++        CHECK(program.kind == 0);
++        nv2a_rc_eval(&rc, v0, v1, fog, t, expected);
++        nv2a_rc_eval_prepared(&program, v0, v1, fog, t, actual);
++        for (i = 0; i < 4; ++i)
++            CHECK(actual[i] == expected[i]);
++    }
++    return 0;
++}
++
++static int prepared_copy_and_modulate(void)
++{
++    unsigned profile, i, k;
++    for (profile = 0; profile < 2; ++profile) {
++        Nv2aCombiner rc = {0};
++        rc.control = 1;
++        rc.color_icw[0] = profile ? 0x08040000 : 0x08200000;
++        rc.alpha_icw[0] = profile ? 0x18140000 : 0x14200000;
++        rc.color_ocw[0] = rc.alpha_ocw[0] = 0xC00;
++        rc.final0 = profile ? 0x010C0002 : 0xC;
++        rc.final1 = 0x1C80;
++        for (i = 0; i < 256; ++i) {
++            Nv2aCombinerProgram program;
++            float v[4], zero[4] = {0}, t[4][4] = {{0}}, actual[4], expected[4];
++            for (k = 0; k < 4; ++k) {
++                v[k] = ((float)((i + 43 * k) % 256) - 64.0f) / 64.0f;
++                t[0][k] = ((float)((3 * i + 71 * k) % 256) - 64.0f) / 64.0f;
++            }
++            rc.final_c0 = i * 0x01010101u;
++            rc.final_c1 = (255 - i) * 0x01010101u;
++            nv2a_rc_prepare(&rc, &program);
++            nv2a_rc_eval(&rc, v, zero, zero, t, expected);
++            nv2a_rc_eval_prepared(&program, v, zero, zero, t, actual);
++            for (k = 0; k < 4; ++k)
++                CHECK(actual[k] == expected[k]);
++        }
++    }
++    return 0;
++}
++
++static int unpack_channels(void)
++{
++    unsigned i, k;
++    static const unsigned shifts[4] = {16, 8, 0, 24};
++    for (i = 0; i < 256; ++i) {
++        uint32_t color = (i << 24) | ((255 - i) << 16) | (((i * 3) & 255) << 8) | ((i * 7) & 255);
++        float actual[4];
++        nv2a_rc_unpack(color, actual);
++        for (k = 0; k < 4; ++k)
++            CHECK(actual[k] == (float)((color >> shifts[k]) & 255) / 255.0f);
++    }
++    return 0;
++}
++
+ int main(void)
+ {
+     Nv2aCombiner rc;
+@@ -57,6 +195,10 @@ int main(void)
+     nv2a_rc_eval(&rc, v0, v1, fog, t, out);            /* no final: r0 */
+     CHECK(NEAR(out[0], 1.0f) && NEAR(out[1], 1.0f) && NEAR(out[2], 1.0f));
+ 
++    CHECK(prepared_products() == 0);
++    CHECK(prepared_fallbacks() == 0);
++    CHECK(prepared_copy_and_modulate() == 0);
++    CHECK(unpack_channels() == 0);
+     puts("ok");
+     return 0;
+ }
+diff --git a/tests/nv2a_tex_filter/nv2a_tex_filter_test.c b/tests/nv2a_tex_filter/nv2a_tex_filter_test.c
+index 5a01c4a..1420b6d 100644
+--- a/tests/nv2a_tex_filter/nv2a_tex_filter_test.c
++++ b/tests/nv2a_tex_filter/nv2a_tex_filter_test.c
+@@ -194,6 +194,46 @@ int main(int argc, char **argv)
+         }
+     }
+ 
++    /* Rewriting a compressed block at the same address must invalidate the
++     * decoded cache, including its last texel. */
++    if (!strcmp(variant, "rc")) {
++        int pass;
++        put_vertex(0, 0, 0, 0, 0); put_vertex(1, W, 0, 1, 0);
++        put_vertex(2, W, H, 1, 1); put_vertex(3, 0, 0, 0, 0);
++        put_vertex(4, W, H, 1, 1); put_vertex(5, 0, H, 0, 1);
++        m(0x1B00, TEX1_AT);
++        m(0x1B04, (0x0Cu << 8) | (1u << 16) | (2u << 20) | (2u << 24));
++        m(0x1B08, 3u | (3u << 8));
++        for (pass = 0; pass < 2; ++pass) {
++            uint16_t endpoint = pass ? 0x001F : 0xF800;
++            uint32_t pixel;
++            memset(s_mem + TEX1_AT, 0, 8);
++            memcpy(s_mem + TEX1_AT, &endpoint, 2);
++            m(0x17FC, 5); m(0x1810, 5u << 24); m(0x17FC, 0);
++            memcpy(&pixel, s_mem + COLOR2_AT + 4u * (60 * W + 60), 4);
++            CHECK(pixel == (pass ? 0xFF0000FFu : 0xFFFF0000u),
++                  "rewritten DXT block pass %d got %08X", pass, pixel);
++        }
++        for (pass = 0; pass < 12; ++pass) {
++            uint32_t address = TEX1_AT + 32u * (uint32_t)pass, pixel;
++            uint16_t endpoint = (pass & 1) ? 0x001F : 0xF800;
++            memset(s_mem + address, 0, 8);
++            memcpy(s_mem + address, &endpoint, 2);
++            m(0x1B00, address);
++            m(0x17FC, 5); m(0x1810, 5u << 24); m(0x17FC, 0);
++            memcpy(&pixel, s_mem + COLOR2_AT + 4u * (60 * W + 60), 4);
++            CHECK(pixel == ((pass & 1) ? 0xFF0000FFu : 0xFFFF0000u),
++                  "decoded cache eviction pass %d got %08X", pass, pixel);
++        }
++        {
++            uint32_t green = 0xFF00FF00u, pixel;
++            /* Reuse a decoded image address as a linear texture. */
++            memcpy(s_mem + TEX1_AT, &green, 4);
++            draw_quad(COLOR2_AT, TEX1_AT, 1, 1, 3);
++            memcpy(&pixel, s_mem + COLOR2_AT + 4u * (60 * W + 60), 4);
++            CHECK(pixel == green, "DXT to linear format change got %08X", pixel);
++        }
++    }
+     printf("%s %s: %s\n", mode, variant, s_fail ? "FAIL" : "PASS");
+     return s_fail ? 1 : 0;
+ }
+-- 
+2.56.1.windows.1
+

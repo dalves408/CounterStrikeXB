@@ -1,0 +1,561 @@
+From 58ca4b65d7412e9a81a232ce26459145ec5154e4 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 03:16:00 -0800
+Subject: [PATCH] nv2a: unify fixed-function transform state and inline draws
+
+Share the hardware transform context with vertex-program constants, transform inline vertices in fixed-function mode, and safely clip large raster bounds.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/kernel/nv2a_pb_exec.c                     | 112 +++++----
+ src/kernel/nv2a_vsh_interp.c                  |   5 +-
+ src/kernel/nv2a_vsh_interp.h                  |   6 +-
+ tests/nv2a_ffp_backend/CMakeLists.txt         |   2 +
+ .../nv2a_ffp_backend/nv2a_ffp_backend_test.c  | 223 ++++++++++++++++++
+ 5 files changed, 300 insertions(+), 48 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 722fb5f..2827940 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -360,10 +360,8 @@ static struct {
+      * applies once both have been. */
+     uint32_t clear_rect_h, clear_rect_v;
+     int clear_rect_set;
+-    /* Fixed-function transform: the composite matrix (world * view *
+-     * projection * viewport, as D3D uploads it) and whether the title has
+-     * sent one. The viewport offset is the constant-file entry c[59]. */
+-    float    composite[16];
++    /* Whether a fixed-function composite matrix has been sent. Its rows
++     * share the vertex-program constant file at c[0..3]. */
+     int      composite_set;
+     uint32_t batches_ffp;
+ } s_gpu;
+@@ -1915,12 +1913,10 @@ static uint32_t vertex_color(uint32_t index)
+  * coordinates are taken from the attribute streams as they are), no fog
+  * coordinate, no specular, no point sprites. */
+ 
+-/* Is this batch transformed by the fixed-function unit? Inline-array batches
+- * are left to the screen-space path, as they were before. */
++/* Inline and immediate vertices use the same transform mode as arrays. */
+ static int batch_is_ffp(void)
+ {
+-    return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2
+-        && !s_gpu.inline_active;
++    return s_gpu.composite_set && (s_gpu.xf_mode & 3) != 2;
+ }
+ 
+ /* Fixed-function vertex lighting (SET_LIGHTING_ENABLE).
+@@ -1971,7 +1967,6 @@ static int ffp_flip_normals(void)
+ 
+ static int lit_color(uint32_t index, float out[4])
+ {
+-    const float *mv = (const float *)&s_reg[0x0480 / 4];
+     float pos[4], nrm[4], vc[4], e[3], n[3], len;
+     uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
+     int i, have_vc;
+@@ -1984,10 +1979,10 @@ static int lit_color(uint32_t index, float out[4])
+     have_vc = fetch_attr(color_attr(), index, vc);
+ 
+     for (i = 0; i < 3; i++) {
+-        e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
+-             + mv[4 * i + 2] * pos[2] + mv[4 * i + 3];
+-        n[i] = mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1]
+-             + mv[4 * i + 2] * nrm[2];
++        const float *row = nv2a_vsh_constant(8u + (uint32_t)i);
++        e[i] = row[0] * pos[0] + row[1] * pos[1]
++             + row[2] * pos[2] + row[3];
++        n[i] = row[0] * nrm[0] + row[1] * nrm[1] + row[2] * nrm[2];
+     }
+     len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+     if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+@@ -2052,16 +2047,18 @@ static int lit_color(uint32_t index, float out[4])
+ /* One fixed-function vertex, in the shape a vertex program produces. */
+ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
+ {
+-    const float *m = s_gpu.composite, *off = nv2a_vsh_constant(59);
++    const float *off = nv2a_vsh_constant(59);
+     float in[4], clip[4], c[4], w;
+     uint32_t st;
+     int i;
+ 
+     if (!fetch_attr(&s_gpu.attr[0], index, in))
+         return 0;
+-    for (i = 0; i < 4; i++)
+-        clip[i] = m[4 * i] * in[0] + m[4 * i + 1] * in[1]
+-                + m[4 * i + 2] * in[2] + m[4 * i + 3] * in[3];
++    for (i = 0; i < 4; i++) {
++        const float *row = nv2a_vsh_constant((uint32_t)i);
++        clip[i] = row[0] * in[0] + row[1] * in[1]
++                + row[2] * in[2] + row[3] * in[3];
++    }
+     /* A vertex behind the camera (w < 0) is kept: the clipper cuts it at the
+      * near plane, and rejecting it dropped every batch that reached behind
+      * the eye -- X-Men Legends' street and sidewalk meshes, which extend past
+@@ -3073,7 +3070,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     XfCount cnt = {0, 0, 0};
+     const Nv2aVshOutput *v[3];
+     const float *a, *b, *c;
+-    float area, su = 1.0f, sv = 1.0f;
++    float area, minx, maxx, miny, maxy, su = 1.0f, sv = 1.0f;
+     int k;
+     static int no_rc = -1;
+ 
+@@ -3096,7 +3093,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+         return;
+     }
+     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+-    if (area == 0.0f || area != area) {
++    if (area == 0.0f || !isfinite(area)) {
+         s_gpu.xf_degenerate++;
+         return;
+     }
+@@ -3143,21 +3140,23 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+         { float r = T.fogc[2]; T.fogc[2] = T.fogc[0]; T.fogc[0] = r; }
+     }
+ 
+-    T.minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
+-    T.maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
+-    T.miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
+-    T.maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+-    if (T.minx < (int)s_gpu.clip_x) T.minx = (int)s_gpu.clip_x;
+-    if (T.miny < (int)s_gpu.clip_y) T.miny = (int)s_gpu.clip_y;
+-    if (T.maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) T.maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
+-    if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
+-    if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
+-    if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
+-    if (T.minx >= T.maxx || T.miny >= T.maxy) {
++    /* Clip in floating point before converting: a vertex near the eye can be
++     * far outside the integer range even when its triangle crosses the view. */
++    minx = fmaxf(fminf(a[0], fminf(b[0], c[0])), (float)s_gpu.clip_x);
++    maxx = fminf(fmaxf(a[0], fmaxf(b[0], c[0])),
++                 fminf((float)(s_gpu.clip_x + s_gpu.clip_w), NV_ZBUF_W));
++    miny = fmaxf(fminf(a[1], fminf(b[1], c[1])), (float)s_gpu.clip_y);
++    maxy = fminf(fmaxf(a[1], fmaxf(b[1], c[1])),
++                 fminf((float)(s_gpu.clip_y + s_gpu.clip_h), NV_ZBUF_H));
++    if (minx >= maxx || miny >= maxy) {
+         s_gpu.tris_skipped_offscreen++;
+         s_gpu.xf_offscreen++;
+         return;
+     }
++    T.minx = (int)floorf(minx);
++    T.maxx = (int)ceilf(maxx);
++    T.miny = (int)floorf(miny);
++    T.maxy = (int)ceilf(maxy);
+     s_gpu.xf_drawn++;
+     T.inv_area = 1.0f / area;
+     /* The edge functions are linear, so a barycentric moves by a constant per
+@@ -3380,8 +3379,10 @@ static void raster_batch_program(void)
+         if (ftrace < 0)
+             ftrace = getenv("RECOMP_FFP_TRACE") != NULL;
+         if (ftrace && s_gpu.batches_ffp <= 4) {
+-            const float *m = s_gpu.composite;
+-            float in[4];
++            float m[16], in[4];
++
++            for (i = 0; i < 4; i++)
++                memcpy(&m[4 * i], nv2a_vsh_constant(i), 4 * sizeof(float));
+ 
+             fprintf(stderr, "  [FFP] batch %u prim %u n %u mode 0x%X"
+                             " clip %ux%u+%u+%u aa %gx%g\n"
+@@ -4208,7 +4209,37 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+     if (!on || !s_exec_inited)
+         return 0;
+     s_reg[(method & 0x1FFCu) / 4] = param;
+-    nv2a_vsh_constant_word(param);
++    if (nv2a_vsh_constant_word(param) < 4)
++        s_gpu.composite_set = 1;
++    return 1;
++}
++
++/* Matrix and texgen methods address the same context memory that vertex
++ * programs read as constants. Keep one copy so uploads through either route
++ * also affect fixed-function transforms and lighting. */
++static int transform_context_method(uint32_t method, uint32_t param)
++{
++    uint32_t slot, word;
++
++    if (method >= 0x0440 && method < 0x0480) {
++        slot = 4u + (method - 0x0440u) / 16u;
++    } else if (method >= 0x0480 && method < 0x0680) {
++        word = (method - 0x0480u) / 4u;
++        slot = 8u + 8u * ((word / 16u) % 4u)
++                  + 4u * (word / 64u) + (word / 4u) % 4u;
++    } else if (method >= 0x0680 && method < 0x06C0) {
++        slot = (method - 0x0680u) / 16u;
++        s_gpu.composite_set = 1;
++    } else if (method >= 0x06C0 && method < 0x07C0) {
++        word = (method - 0x06C0u) / 4u;
++        slot = 68u + 8u * (word / 16u) + (word / 4u) % 4u;
++    } else if (method >= 0x0840 && method < 0x0940) {
++        word = (method - 0x0840u) / 4u;
++        slot = 64u + 8u * (word / 16u) + (word / 4u) % 4u;
++    } else {
++        return 0;
++    }
++    nv2a_vsh_constant_component(slot, (method / 4u) % 4u, param);
+     return 1;
+ }
+ 
+@@ -4642,16 +4673,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         nv2a_vsh_set_constant_load(param);
+         break;
+ 
+-    /* Fixed-function transform: the composite matrix, 16 floats. The viewport
+-     * offset arrives in the constant file, above. */
+-    case 0x0680: case 0x0684: case 0x0688: case 0x068C:
+-    case 0x0690: case 0x0694: case 0x0698: case 0x069C:
+-    case 0x06A0: case 0x06A4: case 0x06A8: case 0x06AC:
+-    case 0x06B0: case 0x06B4: case 0x06B8: case 0x06BC:
+-        memcpy(&s_gpu.composite[(method - 0x0680) / 4], &param, 4);
+-        s_gpu.composite_set = 1;
+-        break;
+-
+     /* Depth. */
+     case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
+     case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
+@@ -4660,6 +4681,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+ 
+     default:
++        if (transform_context_method(method, param))
++            break;
+         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
+             s_gpu.rc.alpha_icw[(method - 0x0260) / 4] = param;
+             break;
+@@ -4715,7 +4738,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             break;
+         }
+         if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
+-            nv2a_vsh_constant_word(param);
++            if (nv2a_vsh_constant_word(param) < 4)
++                s_gpu.composite_set = 1;
+             break;
+         }
+         if (method >= NV_TEX_FIRST && method <= NV_TEX_LAST)
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c7fd25d..bde3f3c 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -93,8 +93,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
+         fprintf(stderr, "  [VSH] constant load -> c[%u]\n", index);
+ }
+ 
+-void nv2a_vsh_constant_word(uint32_t word)
++uint32_t nv2a_vsh_constant_word(uint32_t word)
+ {
++    uint32_t slot = s_const_load;
++
+     if (s_const_load < NV2A_VSH_CONSTANTS)
+         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+     else if (vsh_dump_enabled()) {
+@@ -115,6 +117,7 @@ void nv2a_vsh_constant_word(uint32_t word)
+         s_const_word = 0;
+         s_const_load++;
+     }
++    return slot;
+ }
+ 
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 8acb0af..1aed7a3 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -41,7 +41,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
+ void nv2a_vsh_program_word(uint32_t word);            /* _PROGRAM(i)        */
+ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
+ void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
+-void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
++uint32_t nv2a_vsh_constant_word(uint32_t word);       /* _CONSTANT(i): written slot */
+ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+ 
+ /* Run the program from the start slot on one vertex. Inputs are the ten
+@@ -53,8 +53,8 @@ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+-/* One component of a constant, raw bits: the viewport methods write c[58]
+- * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
++/* One component, raw bits: fixed-function transform and viewport methods
++ * write the same context memory a word at a time. */
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
+ 
+diff --git a/tests/nv2a_ffp_backend/CMakeLists.txt b/tests/nv2a_ffp_backend/CMakeLists.txt
+index 3841f25..4579537 100644
+--- a/tests/nv2a_ffp_backend/CMakeLists.txt
++++ b/tests/nv2a_ffp_backend/CMakeLists.txt
+@@ -17,6 +17,8 @@ foreach(target nv2a-ffp-backend-test nv2a-present-sync-test)
+     endif()
+ endforeach()
+ add_test(NAME nv2a-ffp-backend COMMAND nv2a-ffp-backend-test)
++add_test(NAME nv2a-ffp-backend-fast-constants COMMAND nv2a-ffp-backend-test)
++set_tests_properties(nv2a-ffp-backend-fast-constants PROPERTIES ENVIRONMENT "NV2A_TEST_FAST_CONSTANT_UPLOAD=1")
+ add_test(NAME nv2a-present-sync COMMAND nv2a-present-sync-test
+          "${CMAKE_CURRENT_BINARY_DIR}/nv2a-present-sync-")
+ set_tests_properties(nv2a-present-sync PROPERTIES ENVIRONMENT
+diff --git a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+index 88c69ee..a380c55 100644
+--- a/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
++++ b/tests/nv2a_ffp_backend/nv2a_ffp_backend_test.c
+@@ -22,6 +22,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "nv2a_backend.h"
++#include "nv2a_vsh_interp.h"
+ 
+ #define MEM_BYTES 0x10000u
+ static uint8_t s_mem[MEM_BYTES];
+@@ -92,6 +93,7 @@ static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
+ 
+ /* ---- driving the executor ---------------------------------------------- */
+ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
++extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
+ static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
+ static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+ static void mf(uint32_t method, float f) { m(method, f2u(f)); }
+@@ -102,6 +104,207 @@ static int s_fail;
+ #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
+ static int near_(float a, float b) { return fabsf(a - b) < 1e-3f; }
+ 
++static void inline_triangle(const float vertices[3][3])
++{
++    uint32_t i, j;
++    m(0x17FC, 5);
++    for (i = 0; i < 3; i++)
++        for (j = 0; j < 3; j++)
++            mf(0x1818, vertices[i][j]);
++    m(0x17FC, 0);
++}
++
++static void immediate_triangle(const float vertices[3][3])
++{
++    uint32_t i, j;
++    m(0x17FC, 5);
++    m(0x194C, 0xFFFFFFFFu);
++    for (i = 0; i < 3; i++)
++        for (j = 0; j < 3; j++)
++            mf(0x1500 + 4 * j, vertices[i][j]);
++    m(0x17FC, 0);
++}
++
++static void test_initial_constant_matrix(void)
++{
++    const float M[16] = {320, 0, 0, 320, 0, -240, 0, 240,
++                         0, 0, 1, 0, 0, 0, 0, 1};
++    const float vertices[3][3] = {{-1, -1, 0}, {1, -1, 0}, {0, 1, 0}};
++    const int fast = getenv("NV2A_TEST_FAST_CONSTANT_UPLOAD") != NULL;
++    uint32_t i;
++    int draws = s_be.draws;
++
++    m(0x1EA4, 0);
++    for (i = 0; i < 16; i++) {
++        uint32_t method = 0x0B80 + 4 * i, word = f2u(M[i]);
++        if (!fast || !nv2a_pb_exec_constant_word(method, word))
++            m(method, word);
++    }
++    inline_triangle(vertices);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 0) && near_(s_be.v[1].x, 1280));
++}
++
++static void test_transform_context(void)
++{
++    static const struct {
++        uint32_t method, slot, component;
++        float value;
++    } cases[] = {
++        {0x0440, 4, 0, 11}, {0x047C, 7, 3, 12},
++        {0x0480, 8, 0, 13}, {0x04C0, 16, 0, 14},
++        {0x0580, 12, 0, 15}, {0x067C, 39, 3, 16},
++        {0x0680, 0, 0, 17}, {0x06BC, 3, 3, 18},
++        {0x06C0, 68, 0, 19}, {0x07BC, 95, 3, 20},
++        {0x0840, 64, 0, 21}, {0x093C, 91, 3, 22}
++    };
++    const uint32_t shader[4] = {
++        0, (3u << 21) | (8u << 13) | 0x1Bu,
++        (2u << 26) | (0x1Bu << 2),
++        (3u << 28) | (0xFu << 12) | (1u << 11) | 1u
++    };
++    const float offset[4] = {100, 120, 0.5f, 0};
++    const float composite[16] = {300, 0, 0, 320, 0, -240, 0, 240,
++                                 0, 0, 1, 0, 0, 0, 0, 1};
++    const float modelview[16] = {-1, 0, 0, 0, 0, 1, 0, 0,
++                                 0, 0, -1, 0, 0, 0, 0, 1};
++    uint32_t i;
++    int draws;
++
++    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
++        mf(cases[i].method, cases[i].value);
++        CHECK(near_(nv2a_vsh_constant(cases[i].slot)[cases[i].component],
++                    cases[i].value));
++    }
++    nv2a_pb_exec_method(5, 0x0440, f2u(999));
++    CHECK(near_(nv2a_vsh_constant(4)[0], 11));
++
++    /* A program reads the model-view row sent by the fixed-function method. */
++    for (i = 0; i < 4; i++)
++        mf(0x0480 + 4 * i, offset[i]);
++    m(0x1E9C, 0);
++    for (i = 0; i < 4; i++)
++        m(0x0B00 + 4 * i, shader[i]);
++    m(0x1EA0, 0);
++    m(0x1E94, 2);
++    draws = s_be.draws;
++    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 99) && near_(s_be.v[0].y, 119));
++
++    /* Constant uploads also update the matrix used by fixed-function draws. */
++    m(0x1E94, 0);
++    m(0x1EA4, 0);
++    for (i = 0; i < 16; i++)
++        mf(0x0B80 + 4 * i, composite[i]);
++    draws = s_be.draws;
++    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 20) && near_(s_be.v[1].x, 620));
++
++    m(0x1EA4, 8);
++    for (i = 0; i < 16; i++)
++        mf(0x0B80 + 4 * i, modelview[i]);
++    m(0x0314, 1);
++    draws = s_be.draws;
++    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK((s_be.v[0].diffuse & 0x00FF0000u) == 0);
++    m(0x0314, 0);
++}
++
++static void test_inline_fixed_function(void)
++{
++    const float vertices[3][3] = {{-1, -1, 0}, {1, -1, 0}, {0, 1, 0}};
++    const float overflow[3][3] = {{-1e30f, -1e30f, 0},
++                                   {1e30f, -1e30f, 0}, {0, 1e30f, 0}};
++    const float offset[4] = {100, 120, 0.5f, 0};
++    uint32_t i;
++    int draws;
++
++    m(0x1760, 2 | (3 << 4) | (12 << 8));
++    m(0x1768, 0); m(0x176C, 0);
++
++    draws = s_be.draws;
++    inline_triangle(vertices);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 20) && near_(s_be.v[1].x, 620));
++
++    draws = s_be.draws;
++    immediate_triangle(vertices);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 20) && near_(s_be.v[1].x, 620));
++
++    draws = s_be.draws;
++    inline_triangle(overflow);
++    CHECK(s_be.draws == draws);
++
++    /* A loaded program must still take precedence over the fixed matrix. */
++    for (i = 0; i < 4; i++)
++        mf(0x0480 + 4 * i, offset[i]);
++    m(0x1E94, 2);
++    draws = s_be.draws;
++    inline_triangle(vertices);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 99) && near_(s_be.v[0].y, 119));
++    draws = s_be.draws;
++    immediate_triangle(vertices);
++    CHECK(s_be.draws == draws + 1);
++    if (s_be.draws == draws + 1)
++        CHECK(near_(s_be.v[0].x, 99) && near_(s_be.v[0].y, 119));
++    m(0x1E94, 0);
++}
++
++static void test_inline_software(void)
++{
++    const float M[16] = {8, 0, 0, 8, 0, -8, 0, 8,
++                         0, 0, 1, 0, 0, 0, 0, 1};
++    const float vertices[3][3] = {{-1, -1, 0}, {1, -1, 0}, {0, 1, 0}};
++    const float wide[3][3] = {{-1e12f, -1, 0}, {1e12f, -1, 0}, {0, 1, 0}};
++    uint32_t i, pixel;
++
++    nv2a_backend_register(NULL);
++    m(0x0208, 0x0008);
++    m(0x0200, 16u << 16); m(0x0204, 16u << 16);
++    m(0x020C, 16u * 4); m(0x0210, 0x8000);
++    m(0x030C, 0); m(0x035C, 0); m(0x032C, 0);
++    for (i = 0; i < 16; i++)
++        mf(0x0680 + 4 * i, M[i]);
++
++    memset(s_mem + 0x8000, 0, 16u * 16u * 4u);
++    inline_triangle(vertices);
++    memcpy(&pixel, s_mem + 0x8000 + 4u * (8u * 16u + 8u), 4);
++    CHECK((pixel & 0xFFFFFFu) == 0xFFFFFFu);
++    memcpy(&pixel, s_mem + 0x8000, 4);
++    CHECK(pixel == 0);
++
++    memset(s_mem + 0x8000, 0, 16u * 16u * 4u);
++    immediate_triangle(vertices);
++    memcpy(&pixel, s_mem + 0x8000 + 4u * (8u * 16u + 8u), 4);
++    CHECK((pixel & 0xFFFFFFu) == 0xFFFFFFu);
++
++    /* Large, partially visible triangles must be clipped before integer conversion. */
++    memset(s_mem + 0x8000, 0, 16u * 16u * 4u);
++    inline_triangle(wide);
++    memcpy(&pixel, s_mem + 0x8000 + 4u * (8u * 16u + 8u), 4);
++    CHECK((pixel & 0xFFFFFFu) == 0xFFFFFFu);
++
++    /* A zero homogeneous w cannot produce a drawable position. */
++    memset(s_mem + 0x8000, 0, 16u * 16u * 4u);
++    mf(0x06BC, 0);
++    inline_triangle(vertices);
++    immediate_triangle(vertices);
++    memcpy(&pixel, s_mem + 0x8000 + 4u * (8u * 16u + 8u), 4);
++    CHECK(pixel == 0);
++}
++
+ int main(void)
+ {
+     uint32_t i;
+@@ -123,6 +326,22 @@ int main(void)
+     m(0x020C, 5120);                         /* SET_SURFACE_PITCH */
+     m(0x0210, 0x8000);                       /* SET_SURFACE_COLOR_OFFSET */
+ 
++    /* A pretransformed batch without a composite matrix stays screen-space. */
++    {
++        const float vertices[3][3] = {{100, 100, 0}, {200, 100, 0}, {100, 200, 0}};
++        m(0x1760, 2 | (3 << 4) | (12 << 8));
++        m(0x1EA4, 0);                       /* a load without data changes nothing */
++        inline_triangle(vertices);
++        CHECK(s_be.draws == 1 && near_(s_be.v[0].x, 200));
++        immediate_triangle(vertices);
++        CHECK(s_be.draws == 2 && near_(s_be.v[0].x, 200));
++        memset(&s_be, 0, sizeof s_be);
++    }
++
++    /* A matrix first uploaded through the constant port is still a matrix. */
++    test_initial_constant_matrix();
++    memset(&s_be, 0, sizeof s_be);
++
+     /* Composite matrix: viewport scale for a 640x480 logical surface, y down.
+      * clip = (320 x + 320, -240 y + 240, z, 1). */
+     {
+@@ -300,6 +519,10 @@ int main(void)
+     m(0x0130, 0);                                     /* FLIP_STALL */
+     CHECK(s_be.flips == 1);
+ 
++    test_transform_context();
++    test_inline_fixed_function();
++    test_inline_software();
++
+     if (!s_fail)
+         printf("nv2a fixed-function path through a back end: ok\n");
+     return s_fail;
+-- 
+2.56.1.windows.1
+

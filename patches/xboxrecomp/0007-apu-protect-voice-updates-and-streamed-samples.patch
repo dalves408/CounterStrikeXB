@@ -1,0 +1,486 @@
+From 8754389d849fc2a1beea3981303fc2468c4780c3 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 10:36:00 -0800
+Subject: [PATCH] apu: protect voice updates and streamed samples
+
+Wait for locked voices, publish notifier bytes together, and consume the inclusive last sample. Refuse malformed stream descriptors without reporting a false completion, and cover the one-CPU submission race.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/apu/apu_vp.c            |  37 ++++--
+ tests/apu_vp/test_main.c    | 235 +++++++++++++++++++++++++++++++++++-
+ tests/dpc_order/test_main.c |  79 ++++++++++++
+ 3 files changed, 340 insertions(+), 11 deletions(-)
+
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 94e57da..bbbd2bc 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -55,8 +55,9 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
+                            v * MCPX_HW_NOTIFIER_COUNT + notifier);
+     notify_offset += 15;
+ 
+-    stb_phys(address_space_memory, notify_offset, (uint8_t)status);
+-    stb_phys(address_space_memory, notify_offset - 1, 1);
++    /* A guest polling the status must also see its companion byte. */
++    stw_le_phys(address_space_memory, notify_offset - 1,
++                (uint16_t)(((uint16_t)(uint8_t)status << 8) | 1u));
+ 
+     qatomic_or(&d->regs[NV_PAPU_ISTS],
+                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
+@@ -1158,9 +1159,20 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
+         segment_offset = ldl_le_phys(address_space_memory, addr);
+         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+-        assert(segment_offset != 0);
+-        assert(segment_length != 0);
+         seg_len = (segment_length >> 0) & 0xffff;
++        if (!segment_offset || !seg_len) {
++            static volatile LONG warned;
++            LONG n = InterlockedIncrement(&warned);
++            if (n <= 8) {
++                fprintf(stderr, "[APU] voice %u SSL%c segment %d/%d "
++                        "(page %d) has invalid offset 0x%08llX, length "
++                        "0x%08X; not consumed%s\n",
++                        v, 'A' + ssl_index, ssl_seg, count, page,
++                        (unsigned long long)segment_offset, segment_length,
++                        n == 8 ? " (further warnings suppressed)" : "");
++            }
++            return -1;
++        }
+         seg_cs = (segment_length >> 16) & 3;
+         seg_spb = (segment_length >> 18) & 0x1f;
+         seg_s = (segment_length >> 23) & 1;
+@@ -1168,7 +1180,6 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
+             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
+         }
+-        assert(seg_len > 0);
+         ebo = seg_len - 1;
+     }
+ 
+@@ -1286,7 +1297,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         vp_ring_check(d, v, ba, ebo, (uint32_t)block_size,
+                       cbo - (uint32_t)sample_count, samples, sample_count);
+ 
+-    if (cbo >= ebo) {
++    /* EBO is inclusive; cbo now points to the next sample. */
++    if (cbo > ebo) {
+         if (stream) {
+             d->vp.ssl[v].ssl_seg += 1;
+             cbo = 0;
+@@ -1688,6 +1700,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+             }
+ 
+             uint16_t v = (uint16_t)d->regs[current];
++            voice_spin_lock(d, v);
++            while (is_voice_locked(d, v)) {
++                /* The guest owns this voice; release the APU mutex while
++                 * waiting so unlock and shutdown can make progress. */
++                voice_spin_unlock(d, v);
++                if (d->pause_requested || qatomic_read(&d->exiting))
++                    return;
++                qemu_cond_timedwait(&d->cond, &d->lock, 1);
++                voice_spin_lock(d, v);
++            }
+             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+ 
+@@ -1702,10 +1724,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+                     fe_method(d, SE2FE_IDLE_VOICE, v);
+             } else {
+                 /* Process voice directly (single-threaded) */
+-                voice_spin_lock(d, v);
+                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+-                voice_spin_unlock(d, v);
+             }
++            voice_spin_unlock(d, v);
+             d->regs[current] = d->regs[next];
+         }
+     }
+diff --git a/tests/apu_vp/test_main.c b/tests/apu_vp/test_main.c
+index bf01319..ab32657 100644
+--- a/tests/apu_vp/test_main.c
++++ b/tests/apu_vp/test_main.c
+@@ -31,9 +31,13 @@ uint8_t *g_apu_ram_ptr;
+ #define VOICE_BASE 0x10000u   /* NV_PAPU_VPVADDR */
+ #define SGE_BASE   0x20000u   /* NV_PAPU_VPSGEADDR */
+ #define DATA_BASE  0x30000u   /* what SGE entry 0 names */
++#define SSL_BASE   0x40000u
++#define NOTIFY_BASE 0x50000u
+ 
+ static uint8_t *s_ram;
+ static int s_failures;
++static uint32_t s_watched_status;
++static int s_status_before_data;
+ 
+ uint8_t *mcpx_apu_phys(uint64_t addr)
+ {
+@@ -42,6 +46,9 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
+                 (unsigned long long)addr);
+         exit(1);
+     }
++    if (s_watched_status && addr == s_watched_status &&
++        s_ram[addr - 1] != 1)
++        s_status_before_data = 1;
+     return s_ram + addr;
+ }
+ 
+@@ -162,6 +169,225 @@ static void voice_lock_waits_only_for_its_voice(void)
+     CHECK(is_voice_locked(d, 3), "voice 3 is not locked");
+ }
+ 
++typedef struct {
++    MCPXAPUState *d;
++    float (*mixbins)[NUM_SAMPLES_PER_FRAME];
++    HANDLE started;
++} FrameThread;
++
++static DWORD WINAPI run_voice_frame(LPVOID arg)
++{
++    FrameThread *frame = (FrameThread *)arg;
++    qemu_mutex_lock(&frame->d->lock);
++    SetEvent(frame->started);
++    mcpx_apu_vp_frame(frame->d, frame->mixbins);
++    qemu_mutex_unlock(&frame->d->lock);
++    return 0;
++}
++
++static void locked_voice_waits_for_unlock_and_allows_pause(void)
++{
++    static MCPXAPUState d;
++    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
++    const uint16_t v = 100;
++    FrameThread frame = { &d, mixbins, NULL };
++    HANDLE t;
++
++    memset(s_ram, 0, RAM_SIZE);
++    memset(&d, 0, sizeof(d));
++    memset(mixbins, 0, sizeof(mixbins));
++    qemu_mutex_init(&d.lock);
++    qemu_cond_init(&d.cond);
++    d.regs[NV_PAPU_VPVADDR] = VOICE_BASE;
++    d.regs[NV_PAPU_TVL2D] = v;
++    d.regs[NV_PAPU_TVL3D] = 0xFFFF;
++    d.regs[NV_PAPU_TVLMP] = 0xFFFF;
++    set_voice_reg(v, NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF);
++    set_voice_reg(v, NV_PAVS_VOICE_CFG_FMT,
++                  NV_PAVS_VOICE_CFG_FMT_MULTIPASS | (20u << 16));
++    set_voice_reg(v, NV_PAVS_VOICE_PAR_STATE,
++                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
++    set_voice_reg(v, NV_PAVS_VOICE_CFG_VBIN, 1);
++    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA,
++                  0xFFFFFFFFu & ~NV_PAVS_VOICE_TAR_VOLA_VOLUME0);
++    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLB, 0xFFFFFFFFu);
++    set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLC, 0xFFFFFFFFu);
++    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
++        mixbins[20][i] = 1.0f;
++
++    frame.started = CreateEventW(NULL, FALSE, FALSE, NULL);
++    voice_lock(&d, v, true);
++    t = CreateThread(NULL, 0, run_voice_frame, &frame, 0, NULL);
++    CHECK(WaitForSingleObject(frame.started, 1000) == WAIT_OBJECT_0,
++          "voice frame did not start");
++    CHECK(WaitForSingleObject(t, 100) == WAIT_TIMEOUT,
++          "voice frame processed a locked voice");
++    voice_lock(&d, v, false);
++    CHECK(WaitForSingleObject(t, 1000) == WAIT_OBJECT_0,
++          "voice frame did not resume after unlock");
++    CHECK(mixbins[1][0] == 1.0f, "unlocked voice did not mix");
++    CloseHandle(t);
++
++    voice_lock(&d, v, true);
++    t = CreateThread(NULL, 0, run_voice_frame, &frame, 0, NULL);
++    CHECK(WaitForSingleObject(frame.started, 1000) == WAIT_OBJECT_0,
++          "second voice frame did not start");
++    CHECK(WaitForSingleObject(t, 100) == WAIT_TIMEOUT,
++          "second voice frame processed a locked voice");
++    qemu_mutex_lock(&d.lock);
++    d.pause_requested = true;
++    qemu_cond_signal(&d.cond);
++    qemu_mutex_unlock(&d.lock);
++    CHECK(WaitForSingleObject(t, 1000) == WAIT_OBJECT_0,
++          "pausing did not stop a frame waiting for a locked voice");
++    voice_lock(&d, v, false);
++    CloseHandle(t);
++    CloseHandle(frame.started);
++    qemu_cond_destroy(&d.cond);
++    qemu_mutex_destroy(&d.lock);
++}
++
++static uint32_t stream_notify_addr(void)
++{
++    return NOTIFY_BASE + 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
++                                MCPX_HW_NOTIFIER_SSLA_DONE) + 15;
++}
++
++static void setup_stream_voice(MCPXAPUState *d)
++{
++    memset(s_ram, 0, RAM_SIZE);
++    memset(d, 0, sizeof(*d));
++    d->regs[NV_PAPU_VPVADDR] = VOICE_BASE;
++    d->regs[NV_PAPU_VPSSLADDR] = SSL_BASE;
++    d->regs[NV_PAPU_FENADDR] = NOTIFY_BASE;
++    d->vp.ssl[0].base[0] = 16;
++    d->vp.ssl[0].count[0] = 2;
++    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
++                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE |
++                  NV_PAVS_VOICE_CFG_FMT_PERSIST |
++                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
++                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30));
++    set_voice_reg(0, NV_PAVS_VOICE_PAR_STATE,
++                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
++    s_ram[stream_notify_addr()] = 0x80;
++}
++
++static void set_stream_segment(unsigned segment, uint32_t data,
++                               uint32_t samples)
++{
++    uint32_t descriptor[2] = {
++        data, (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16) | samples
++    };
++    memcpy(s_ram + SSL_BASE + (16 + segment) * 8, descriptor,
++           sizeof(descriptor));
++}
++
++static void stream_consumes_each_segment_before_notifying(void)
++{
++    static MCPXAPUState d;
++    float samples[4][2];
++    const int16_t pcm[] = { 1000, 2000, 3000, 4000, 5000, 6000 };
++
++    setup_stream_voice(&d);
++    memcpy(s_ram + DATA_BASE, pcm, sizeof(pcm));
++    set_stream_segment(0, DATA_BASE, 4);
++    set_stream_segment(1, DATA_BASE + 8, 2);
++
++    CHECK(voice_get_samples(&d, 0, samples, 3) == 3,
++          "first partial fetch did not return three samples");
++    CHECK(d.vp.ssl[0].ssl_seg == 0 &&
++          voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_OFFSET,
++                         NV_PAVS_VOICE_PAR_OFFSET_CBO) == 3,
++          "segment advanced before its last sample");
++    CHECK(voice_get_samples(&d, 0, samples, 1) == 1 &&
++          samples[0][0] == int16_to_float(pcm[3]),
++          "last sample of the first segment was lost");
++    CHECK(d.vp.ssl[0].ssl_seg == 1 && s_ram[stream_notify_addr()] == 0x80,
++          "first segment incorrectly completed the list");
++    CHECK(voice_get_samples(&d, 0, samples, 2) == 2 &&
++          samples[0][0] == int16_to_float(pcm[4]) &&
++          samples[1][0] == int16_to_float(pcm[5]),
++          "second segment samples were not returned");
++    CHECK(d.vp.ssl[0].ssl_index == 1 &&
++          s_ram[stream_notify_addr()] == NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS,
++          "the completed list was not notified");
++}
++
++static void invalid_stream_segment_is_not_consumed(void)
++{
++    static MCPXAPUState d;
++    float samples[4][2];
++    const int16_t pcm[] = { 1000, 2000, 3000, 4000 };
++
++    setup_stream_voice(&d);
++    d.vp.ssl[0].count[0] = 1;
++    set_stream_segment(0, DATA_BASE, 0);
++    CHECK(voice_get_samples(&d, 0, samples, 4) < 0,
++          "zero-length segment was consumed");
++    CHECK(d.vp.ssl[0].ssl_seg == 0 &&
++          voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_OFFSET,
++                         NV_PAVS_VOICE_PAR_OFFSET_CBO) == 0 &&
++          s_ram[stream_notify_addr()] == 0x80,
++          "invalid segment advanced or reported success");
++    set_stream_segment(0, 0, 4);
++    CHECK(voice_get_samples(&d, 0, samples, 4) < 0 &&
++          s_ram[stream_notify_addr()] == 0x80,
++          "segment with no data address was consumed or reported success");
++    memcpy(s_ram + DATA_BASE, pcm, sizeof(pcm));
++    set_stream_segment(0, DATA_BASE, 4);
++    CHECK(voice_get_samples(&d, 0, samples, 4) == 4 &&
++          samples[3][0] == int16_to_float(pcm[3]) &&
++          s_ram[stream_notify_addr()] == NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS,
++          "valid replacement segment did not play and complete");
++}
++
++static void looping_buffer_keeps_last_sample(void)
++{
++    static MCPXAPUState d;
++    float samples[3][2];
++    const uint32_t sge[] = { DATA_BASE, 0 };
++    const int16_t pcm[] = { 1000, 2000, 3000, 4000 };
++
++    setup_stream_voice(&d);
++    d.regs[NV_PAPU_VPSGEADDR] = SGE_BASE;
++    memcpy(s_ram + SGE_BASE, sge, sizeof(sge));
++    memcpy(s_ram + DATA_BASE, pcm, sizeof(pcm));
++    set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
++                  NV_PAVS_VOICE_CFG_FMT_LOOP |
++                  (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
++                  (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30));
++    set_voice_reg(0, NV_PAVS_VOICE_PAR_NEXT, 3);
++
++    CHECK(voice_get_samples(&d, 0, samples, 3) == 3 &&
++          voice_get_mask(&d, 0, NV_PAVS_VOICE_PAR_OFFSET,
++                         NV_PAVS_VOICE_PAR_OFFSET_CBO) == 3,
++          "looping buffer wrapped before its last sample");
++    CHECK(voice_get_samples(&d, 0, samples, 1) == 1 &&
++          samples[0][0] == int16_to_float(pcm[3]),
++          "looping buffer lost its last sample");
++    CHECK(voice_get_samples(&d, 0, samples, 1) == 1 &&
++          samples[0][0] == int16_to_float(pcm[0]),
++          "looping buffer did not restart from its first sample");
++}
++
++static void notification_publishes_data_with_status(void)
++{
++    static MCPXAPUState d;
++    uint32_t addr;
++
++    setup_stream_voice(&d);
++    addr = stream_notify_addr();
++    s_status_before_data = 0;
++    s_watched_status = addr;
++    set_notify_status(&d, 0, MCPX_HW_NOTIFIER_SSLA_DONE,
++                      NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
++    s_watched_status = 0;
++    CHECK(!s_status_before_data, "completion status was published before its data");
++    CHECK(s_ram[addr - 1] == 1 &&
++          s_ram[addr] == NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS,
++          "completion notification contents are incorrect");
++}
++
+ /* Voice 100 (not 3D, so no HRTF) in multipass mode: its input is mixbin 20,
+  * held at 1.0, and only bin 1 is audible. Full volume for a frame, then
+  * silent: the second frame must fall from the first's level to nothing. */
+@@ -263,8 +489,13 @@ int main(void)
+     if (!s_ram) return 2;
+ 
+     voice_lock_waits_only_for_its_voice();
++    locked_voice_waits_for_unlock_and_allows_pause();
+     adpcm_wide_block_decodes();
+     adpcm_whole_field_fits();
++    stream_consumes_each_segment_before_notifying();
++    invalid_stream_segment_is_not_consumed();
++    looping_buffer_keeps_last_sample();
++    notification_publishes_data_with_status();
+     gain_ramps_across_a_frame();
+     mono_hrtf_keeps_binaural_channels();
+ 
+@@ -273,8 +504,6 @@ int main(void)
+         fprintf(stderr, "%d check(s) failed\n", s_failures);
+         return 1;
+     }
+-    puts("PASS: every ADPCM block count the descriptor can name decodes, "
+-         "VOICE_LOCK waits only for its own voice, and volume "
+-         "changes ramp across a frame; mono HRTF keeps both output channels.");
++    puts("PASS: voice locking, streaming, notifications, ADPCM, gain and HRTF.");
+     return 0;
+ }
+diff --git a/tests/dpc_order/test_main.c b/tests/dpc_order/test_main.c
+index 57d83bb..304843a 100644
+--- a/tests/dpc_order/test_main.c
++++ b/tests/dpc_order/test_main.c
+@@ -409,10 +409,87 @@ static void requeue(void)
+     check(g.regs_ok, "(f) the routine's own raise and lower left the guest's registers alone");
+ }
+ 
++typedef struct {
++    volatile LONG count;
++    uint32_t descriptors[2];
++    HANDLE first_selected, release_first, second_ready, second_done;
++} StreamSubmit;
++
++static DWORD WINAPI first_submit(LPVOID p)
++{
++    StreamSubmit *s = (StreamSubmit *)p;
++    KIRQL old;
++    LONG index;
++    g_fs_base = 0;
++    old = xbox_KfRaiseIrql(DISPATCH_LEVEL);
++    index = s->count;
++    SetEvent(s->first_selected);
++    WaitForSingleObject(s->release_first, 10000);
++    s->descriptors[index] = 1;
++    InterlockedIncrement(&s->count);
++    xbox_KfLowerIrql(old);
++    return 0;
++}
++
++static DWORD WINAPI second_submit(LPVOID p)
++{
++    StreamSubmit *s = (StreamSubmit *)p;
++    KIRQL old;
++    LONG index;
++    g_fs_base = 0;
++    SetEvent(s->second_ready);
++    old = xbox_KfRaiseIrql(DISPATCH_LEVEL);
++    index = s->count;
++    s->descriptors[index] = 2;
++    InterlockedIncrement(&s->count);
++    xbox_KfLowerIrql(old);
++    SetEvent(s->second_done);
++    return 0;
++}
++
++static void stream_submissions(int gated)
++{
++    StreamSubmit s = {0};
++    HANDLE first, second;
++    DWORD second_result;
++
++    s.first_selected = CreateEventW(NULL, FALSE, FALSE, NULL);
++    s.release_first = CreateEventW(NULL, FALSE, FALSE, NULL);
++    s.second_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    s.second_done = CreateEventW(NULL, FALSE, FALSE, NULL);
++    first = CreateThread(NULL, 0, first_submit, &s, 0, NULL);
++    check(WaitForSingleObject(s.first_selected, 10000) == WAIT_OBJECT_0,
++          "stream: first submission selected its descriptor");
++    second = CreateThread(NULL, 0, second_submit, &s, 0, NULL);
++    check(WaitForSingleObject(s.second_ready, 10000) == WAIT_OBJECT_0,
++          "stream: second submission started");
++    second_result = WaitForSingleObject(s.second_done, gated ? 100 : 10000);
++    check(second_result == (gated ? WAIT_TIMEOUT : WAIT_OBJECT_0),
++          gated ? "stream: raised IRQL excludes a second submission"
++                : "stream: without the gate both submissions enter");
++    SetEvent(s.release_first);
++    check(WaitForSingleObject(first, 10000) == WAIT_OBJECT_0 &&
++          WaitForSingleObject(second, 10000) == WAIT_OBJECT_0,
++          "stream: both submissions finish");
++    if (gated)
++        check(s.count == 2 && s.descriptors[0] == 1 && s.descriptors[1] == 2,
++              "stream: the gate keeps both descriptors");
++    else
++        check(s.count == 2 && s.descriptors[0] == 1 && s.descriptors[1] == 0,
++              "stream: overlapping submissions can leave count 2 with descriptor 1 missing");
++    CloseHandle(first);
++    CloseHandle(second);
++    CloseHandle(s.first_selected);
++    CloseHandle(s.release_first);
++    CloseHandle(s.second_ready);
++    CloseHandle(s.second_done);
++}
++
+ int main(void)
+ {
+     int slot;
+ 
++    setvbuf(stdout, NULL, _IONBF, 0);
+     g_fs_base = 0;
+     /* Guest memory where the worker stacks are, plus a page for the KDPC. */
+     g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)calloc(
+@@ -430,10 +507,12 @@ int main(void)
+     xbox_IrqReloadConfig();
+     check(!xbox_DpcOnRaise(), "RECOMP_DPC_ON_RAISE=1 without the gate stays off");
+     test_setenv("RECOMP_DPC_ON_RAISE", NULL);
++    stream_submissions(0);
+     test_setenv("RECOMP_DISPATCH_GATE", "1");
+     xbox_IrqReloadConfig();
+     check(xbox_DispatchGateOn() && xbox_DpcOnRaise(),
+           "RECOMP_DISPATCH_GATE=1: DPCs on raise are on with it");
++    stream_submissions(1);
+     raise_runs_it();
+     raise_holds_cpu();
+     lower_runs_it();
+-- 
+2.56.1.windows.1
+
