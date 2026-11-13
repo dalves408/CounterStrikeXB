@@ -1,0 +1,449 @@
+From e8b14ae8cda73c5cacc56681f77be88bb5697dd2 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nv2a: vertex programs to the back end; answer kickoffs
+ mid-walk (CounterStrikeXB2 local patch)
+
+Back end program hand-off. nv2a_backend_register_program() lets a back end
+run vertex programs itself (on the GPU). For a program batch that does not
+write constants, the executor fetches each distinct vertex index's inputs
+once (only the attributes the program reads), builds a triangle list with
+odd strip triangles flipped as the hardware assembles them, and passes the
+program (start slot..FINAL), c[0..191], the inputs, the fog unit's state and
+the usual render state, combiners and stages. A back end that declines gets
+the CPU path as before. nv2a_vsh_program() exposes the program and its input
+mask; backend_flush's batch-state half is factored out for both paths.
+
+Segment scan answers kickoffs mid-walk. The DMA walk already cleared the PFB
+flush bit every 256 words; the default segment scan did not, so a title's
+next KickOff spun until the whole segment was executed and the title's CPU
+and the executor never overlapped (Counter-Strike: half of every frame).
+Bounded so D3D never takes its "GPU far behind" path, whose software-method
+interrupt is not delivered: at most 8 kicks per walk and while the title is
+under 192 KB past the walked segment, never while a flip is held. The kick
+marker latch (PGRAPH 0x400B10, method 0x0310) is now kept for the segment
+scan too, since D3D reaches that wait there as well. The method inventory is
+collected only when RECOMP_PB_SCAN will report it.
+---
+ src/kernel/nv2a_backend.h    |  34 +++++++
+ src/kernel/nv2a_pb_exec.c    | 183 ++++++++++++++++++++++++++++++-----
+ src/kernel/nv2a_pb_scan.c    |  45 ++++++++-
+ src/kernel/nv2a_vsh_interp.c |  19 ++++
+ src/kernel/nv2a_vsh_interp.h |   6 ++
+ 5 files changed, 263 insertions(+), 24 deletions(-)
+
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index db89c5c..024479d 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -115,6 +115,40 @@ typedef struct {
+     void (*flip)(void);
+ } Nv2aBackend;
+ 
++/* Vertex-program batches, untransformed (optional; see
++ * nv2a_backend_register_program). The back end runs the program itself --
++ * on the GPU, say -- instead of the executor running it on the CPU per vertex.
++ *
++ * inputs holds vertex_count vertices, each popcount(input_mask) float4 rows:
++ * the attributes the program reads, in v0..v15 order, fetched as the CPU path
++ * fetches them (a stream converted to float, or the attribute's current value
++ * when it has no stream). indices is a triangle list into those vertices; strips
++ * already alternate their odd triangles' order, so winding is what the GPU
++ * would cull by. The program's oPos is screen space in logical pixels (scale x,
++ * y by the surface's aa_sx, aa_sy) with w the clip-space w, exactly as
++ * nv2a_vsh_run produces it. Fog: SET_FOG_ENABLE / _MODE / _PARAMS, applied to
++ * oFog.x as the CPU path's fog_factor does. */
++typedef struct {
++    const uint32_t (*program)[4];   /* start slot .. the FINAL instruction */
++    uint32_t     program_count;
++    const float (*constants)[4];    /* c[0..191] */
++    uint32_t     input_mask;
++    const float (*inputs)[4];
++    uint32_t     vertex_count;
++    const uint32_t *indices;
++    uint32_t     index_count;
++    uint32_t     fog_enable, fog_mode;
++    float        fog_param[2];
++} Nv2aProgramDraw;
++
++/* Draw a program batch; b carries state, combiners and stages as for draw()
++ * (vertices NULL, count 0). Return 1 if drawn, 0 to have the executor transform
++ * it on the CPU and call draw() as usual. Only offered for programs that do not
++ * write constants (CXT_WRITE). */
++typedef int (*Nv2aProgramDrawFn)(const Nv2aSurface *s, const Nv2aBatch *b,
++                                 const Nv2aProgramDraw *p);
++void nv2a_backend_register_program(Nv2aProgramDrawFn fn);
++
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
+ void nv2a_backend_register(const Nv2aBackend *backend);
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 09e4b54..a779870 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -832,6 +832,13 @@ static int backend_draws(void)
+     return s_backend && s_backend->draw;
+ }
+ 
++static Nv2aProgramDrawFn s_program_draw;
++
++void nv2a_backend_register_program(Nv2aProgramDrawFn fn)
++{
++    s_program_draw = fn;
++}
++
+ static void current_surface(Nv2aSurface *out)
+ {
+     out->color_va        = dma_resolve(s_gpu.color_offset);
+@@ -2368,6 +2375,13 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+ 
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+  * part of it. */
++/* The state half of a batch (everything but its vertices), as draw() and the
++ * program hand-off see it. `xf`: a program / fixed-function batch, which
++ * carries the combiners and stages once the title has programmed them. */
++static void backend_batch_state(Nv2aSurface *surf, Nv2aRenderState *rs, Nv2aTexture *tex,
++                                Nv2aTexture stages[4], Nv2aBatch *batch,
++                                int textured, int xf);
++
+ static void backend_flush(int textured)
+ {
+     Nv2aSurface surf;
+@@ -2378,17 +2392,33 @@ static void backend_flush(int textured)
+ 
+     if (!s_bcount)
+         return;
+-    current_surface(&surf);
+-    current_render_state(&rs);
++    backend_batch_state(&surf, &rs, &tex, stages, &batch, textured, s_bxf);
+     batch.vertices = s_bverts;
+     batch.count = s_bcount;
++    s_backend->draw(&surf, &batch);
++    s_gpu.tris_drawn += s_bcount / 3;
++    s_bcount = 0;
++    s_bxf = 0;
++    note_drawn();
++}
++
++static void backend_batch_state(Nv2aSurface *surf, Nv2aRenderState *rs, Nv2aTexture *tex,
++                                Nv2aTexture stages[4], Nv2aBatch *batch_out,
++                                int textured, int xf)
++{
++    Nv2aBatch batch;
++
++    current_surface(surf);
++    current_render_state(rs);
++    batch.vertices = NULL;
++    batch.count = 0;
+     batch.texture = NULL;
+-    batch.state = &rs;
++    batch.state = rs;
+     batch.combiner = NULL;
+     batch.stages = NULL;
+     batch.stage_valid = 0;
+     memset(batch.fog_color, 0, sizeof batch.fog_color);
+-    if (s_bxf && s_gpu.rc_seen) {
++    if (xf && s_gpu.rc_seen) {
+         int st;
+         for (st = 0; st < 4; st++) {
+             const Texture *t = &s_gpu.texs[st];
+@@ -2409,23 +2439,19 @@ static void backend_flush(int textured)
+         { float r = batch.fog_color[2]; batch.fog_color[2] = batch.fog_color[0]; batch.fog_color[0] = r; }
+     }
+     if (textured && s_gpu.texs[0].valid) {
+-        tex.offset = s_gpu.texs[0].offset;
+-        tex.width  = s_gpu.texs[0].width;
+-        tex.height = s_gpu.texs[0].height;
+-        tex.pitch  = s_gpu.texs[0].pitch;
+-        tex.color  = s_gpu.texs[0].color;
+-        tex.addr_u = s_gpu.texs[0].addr_u;
+-        tex.addr_v = s_gpu.texs[0].addr_v;
+-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+-        tex.filter = s_gpu.texs[0].filter;
+-        tex.palette = s_gpu.texs[0].palette;
+-        batch.texture = &tex;
+-    }
+-    s_backend->draw(&surf, &batch);
+-    s_gpu.tris_drawn += s_bcount / 3;
+-    s_bcount = 0;
+-    s_bxf = 0;
+-    note_drawn();
++        tex->offset = s_gpu.texs[0].offset;
++        tex->width  = s_gpu.texs[0].width;
++        tex->height = s_gpu.texs[0].height;
++        tex->pitch  = s_gpu.texs[0].pitch;
++        tex->color  = s_gpu.texs[0].color;
++        tex->addr_u = s_gpu.texs[0].addr_u;
++        tex->addr_v = s_gpu.texs[0].addr_v;
++        tex->levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
++        tex->filter = s_gpu.texs[0].filter;
++        tex->palette = s_gpu.texs[0].palette;
++        batch.texture = tex;
++    }
++    *batch_out = batch;
+ }
+ 
+ /* One triangle by vertex index: gather position and, if the batch has one,
+@@ -3563,10 +3589,118 @@ static void xf_set_viewport(void)
+     s_xf_o[2] = of[2];
+ }
+ 
++/* Hand a program batch to the back end untransformed (nv2a_backend_register_
++ * program): each distinct vertex index's inputs fetched once, plus a triangle
++ * list over them. Returns 1 if the back end drew it. */
++static int program_batch_to_backend(void)
++{
++    static float (*inputs)[4];
++    static uint32_t *tris, *cidx, *slot_of, *key, *tag, gen;
++    const uint32_t n = s_gpu.idx_count;
++    const uint32_t (*words)[4];
++    uint32_t mask, count, nin, nverts = 0, ntri = 0, i, a;
++    uint8_t order[NV2A_VSH_INPUTS];
++    Nv2aProgramDraw pd;
++    Nv2aSurface surf;
++    Nv2aRenderState rs;
++    Nv2aTexture tex, stages[4];
++    Nv2aBatch batch;
++
++    if (!s_program_draw || !backend_draws() || nv2a_vsh_cxt_write() || n < 3)
++        return 0;
++    if (s_gpu.prim < NV_PRIM_TRIANGLES || s_gpu.prim > NV_PRIM_POLYGON)
++        return 0;
++    if (!(count = nv2a_vsh_program(&words, &mask)))
++        return 0;
++    if (!inputs) {
++        inputs  = (float (*)[4])malloc((size_t)NV_MAX_INDICES * NV2A_VSH_INPUTS * sizeof *inputs);
++        tris    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * 3 * sizeof *tris);
++        cidx    = (uint32_t *)malloc((size_t)NV_MAX_INDICES * sizeof *cidx);
++        slot_of = (uint32_t *)malloc(131072 * sizeof *slot_of);
++        key     = (uint32_t *)malloc(131072 * sizeof *key);
++        tag     = (uint32_t *)calloc(131072, sizeof *tag);
++        if (!inputs || !tris || !cidx || !slot_of || !key || !tag) {
++            free(inputs); inputs = NULL;
++            return 0;
++        }
++    }
++    for (a = 0, nin = 0; a < NV2A_VSH_INPUTS; a++)
++        if (mask >> a & 1)
++            order[nin++] = (uint8_t)a;
++    if (++gen == 0) { memset(tag, 0, 131072 * sizeof *tag); gen = 1; }
++
++    /* Distinct indices -> compact vertex slots (open addressing). */
++    for (i = 0; i < n; i++) {
++        uint32_t ix = s_gpu.idx[i], h = (ix * 2654435761u) >> 15, k;
++        while (tag[h] == gen && key[h] != ix)
++            h = (h + 1) & 131071u;
++        if (tag[h] != gen) {
++            float (*row)[4] = &inputs[(size_t)nverts * nin];
++            tag[h] = gen; key[h] = ix; slot_of[h] = nverts++;
++            for (k = 0; k < nin; k++) {
++                a = order[k];
++                if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
++                    memcpy(row[k], s_gpu.imm_attr[a], sizeof row[k]);
++                else
++                    fetch_attr(&s_gpu.attr[a], ix, row[k]);
++            }
++        }
++        cidx[i] = slot_of[h];
++    }
++
++    /* Triangles, as the hardware assembles them (odd strip triangles flipped). */
++#define TRI(p, q, r) (tris[ntri++] = cidx[p], tris[ntri++] = cidx[q], tris[ntri++] = cidx[r])
++    switch (s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:
++        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
++        break;
++    case NV_PRIM_TRIANGLE_STRIP:
++        for (i = 0; i + 2 < n; i++) { if (i & 1) TRI(i + 1, i, i + 2); else TRI(i, i + 1, i + 2); }
++        break;
++    case NV_PRIM_TRIANGLE_FAN:
++    case NV_PRIM_POLYGON:
++        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
++        break;
++    case NV_PRIM_QUADS:
++        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
++        break;
++    case NV_PRIM_QUAD_STRIP:
++        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
++        break;
++    }
++#undef TRI
++
++    if (s_gpu.texs[0].valid)
++        note_texture_use();
++    nv2a_rc_prepare(&s_gpu.rc, &s_rc_program);
++    backend_batch_state(&surf, &rs, &tex, stages, &batch, 1, 1);
++    pd.program = words;
++    pd.program_count = count;
++    pd.constants = (const float (*)[4])nv2a_vsh_constant(0);
++    pd.input_mask = mask;
++    pd.inputs = (const float (*)[4])inputs;
++    pd.vertex_count = nverts;
++    pd.indices = tris;
++    pd.index_count = ntri;
++    pd.fog_enable = s_gpu.fog_enable;
++    pd.fog_mode = s_gpu.fog_mode;
++    pd.fog_param[0] = s_gpu.fog_param[0];
++    pd.fog_param[1] = s_gpu.fog_param[1];
++    if (!s_program_draw(&surf, &batch, &pd))
++        return 0;                           /* the CPU path transforms it */
++    s_gpu.batches_program++;
++    s_gpu.verts_program += n;
++    s_gpu.tris_drawn += ntri / 3;
++    note_drawn();
++    return 1;
++}
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
++    if (batch_uses_program() && program_batch_to_backend())
++        return;                             /* the back end runs the program */
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+     {
+@@ -4604,8 +4738,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+      * ever: the title froze at the first screen whose walk was long enough to
+      * enter it. So for a mirrored fence the latch carries the mirror's fence
+      * bits and the marker's address, which is what a GPU that had consumed
+-     * everything would report. */
+-    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
++     * everything would report.
++     *
++     * The segment scan needs it too since it answers kickoffs mid-walk
++     * (nv2a_pb_scan.c): D3D then reaches this wait there as well. */
++    if (method == 0x0310 && subch == 5) {
+         volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
+ 
+         if (!r)
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index b35e65d..4c4db05 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -481,6 +481,17 @@ int nv2a_pb_dma_walk(void)
+ /* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+  * hold is only armed at the top level (nv2a_pb_exec.c). */
+ static int s_in_call;
++static uint32_t s_seg_ack;
++static uint32_t s_walk_put;      /* end (PUT) of the segment being walked; 0 when idle */
++/* 192 KB: two to three frames of Counter-Strike's ring traffic (~70 KB a
++ * frame), against a 512 KB ring that D3D treats as full below 8 KB free. */
++#define PB_ACK_AHEAD 0x30000u
++/* And at most this many kickoffs per walk: XDK D3D tracks its last 64 kicks
++ * against a fence that moves only between walks, and a title let kick more
++ * than that ahead takes the same "far behind" path (froze in game at ~55 s
++ * with the byte bound alone). */
++#define PB_ACK_KICKS 8u
++static uint32_t s_walk_acks;
+ int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ 
+ static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint32_t *target_va);
+@@ -522,6 +533,31 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+         va += 4;
+         words++;
+ 
++        /* Keep answering kickoffs while executing, as the DMA walk does (see
++         * xbox_Nv2aAckBusyBits). Without it a title's next KickOff -- which
++         * spins on the PFB flush bit -- waited for the whole segment, so the
++         * title's CPU and the executor never overlapped: Counter-Strike spent
++         * half of each in-game frame in that spin.
++         *
++         * Bounded: only while the title has submitted less than
++         * PB_ACK_AHEAD bytes past the end of the segment being walked (and
++         * not wrapped). GET moves only when a walk ends, so a title let run
++         * further fills the ring and takes XDK D3D's "GPU far behind" path --
++         * a software-method NOP whose interrupt wakes it -- and no interrupt
++         * comes: it froze loading Airstrip. Not while a flip is held either:
++         * withholding the flush is how the hold paces the title. */
++        if (s_exec_enabled && s_walk_put && s_walk_acks < PB_ACK_KICKS && (++s_seg_ack & 0xFFu) == 0) {
++            extern int nv2a_pb_exec_flip_poll(void);
++            volatile uint32_t *pr = xbox_Nv2aRegPtr(0x800040u);
++            volatile uint32_t *wbc = xbox_Nv2aRegPtr(0x100410u);
++            uint32_t cur = pr ? (0x80000000u | (*pr & 0x0FFFFFFFu)) : 0;
++            if (wbc && (*wbc & 0x10000u) && cur >= s_walk_put && cur - s_walk_put < PB_ACK_AHEAD
++                    && !nv2a_pb_exec_flip_poll()) {
++                xbox_Nv2aAckBusyBits();
++                s_walk_acks++;
++            }
++        }
++
+         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+@@ -564,9 +600,13 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t method =  w & 0x1FFCu;
+             int noninc = (w & 0xE0000000u) == 0x40000000u;
+ 
++            static int inventory = -1;   /* the method survey: RECOMP_PB_SCAN only reports it */
++            if (inventory < 0)
++                inventory = getenv("RECOMP_PB_SCAN") != NULL || !s_exec_enabled;
+             for (uint32_t i = 0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
+-                note(subch, m);
++                if (inventory)
++                    note(subch, m);
+                 if (s_exec_enabled)
+                     exec_word(subch, m, *(const uint32_t *)(mem + va));
+                 va += 4;
+@@ -655,7 +695,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+         extern void nv2a_pb_exec_walk_begin(void);
+         nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+     }
++    s_walk_put = end_va;
++    s_walk_acks = 0;
+     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++    s_walk_put = 0;
+ 
+     s_tot_words += words;
+     s_tot_unknown += unknown;
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index 0d52589..722fa9d 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -510,6 +510,25 @@ static void dec_program(void)
+     s_dec_valid = 1;
+ }
+ 
++uint32_t nv2a_vsh_program(const uint32_t (**words)[4], uint32_t *mask)
++{
++    uint32_t i, m = 0;
++
++    if (!s_dec_valid || s_dec_rev != s_program_revision)
++        dec_program();
++    if (!s_dec_count || !s_dec[s_dec_count - 1].final)
++        return 0;
++    for (i = 0; i < s_dec_count; i++) {
++        int k;
++        for (k = 0; k < 3; k++)
++            if ((s_dec[i].reads >> k & 1) && s_dec[i].src[k].mux == DEC_INPUT)
++                m |= 1u << s_dec[i].src[k].idx;
++    }
++    *words = (const uint32_t (*)[4])&s_program[s_start_slot];
++    *mask = m;
++    return s_dec_count;
++}
++
+ static vec4 dec_read(const DecSrc *d, const float in[NV2A_VSH_INPUTS][4],
+                      const vec4 *regs, int a0)
+ {
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 0a68f6e..3a996ff 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -51,6 +51,12 @@ uint32_t nv2a_vsh_cxt_write(void);                    /* programs may write c[]
+  * transform this batch" rather than drawing garbage. */
+ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+ 
++/* The program as it would run: its instructions from the start slot through
++ * the FINAL one (returns the count, 0 if there is no FINAL), and in *mask the
++ * inputs v0..v15 it reads (bit k = vk). For a back end that runs programs
++ * itself. */
++uint32_t nv2a_vsh_program(const uint32_t (**words)[4], uint32_t *mask);
++
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
+ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+-- 
+2.51.0.windows.2
+

@@ -436,3 +436,12 @@ Compared against David's xemu captures of Airstrip (C:\Recomp\tools\XemuRamDump\
 - `RECOMP_STRIP_ALT_WINDING=1` (toolkit) flips odd strip triangles for culling; no visible difference on the world, left off.
 - **Tools:** `RECOMP_CS_DUMP` now also writes `ram.bin` (64 MB physical/contiguous view) and `va_game_00010000.bin`, laid out like xemu's dumps; `scripts/pbfind.py` (vertex-constant uploads in a RAM image), `scripts/ramtex.py` (decode a texture from a RAM image); `RECOMP_PB_DETOUR_LOG=1` lists detours.
 - **Next:** GPU vertex programs (CPU VSH is the cost now), haze/smoke check, map load time.
+
+## Gameplay milestone: ~60 FPS in Airstrip (2026-11-13)
+21 FPS -> 60-64 FPS (runs/g60_kicks, g61_kicks; median frame 15.8 ms). Menus unchanged (71.8 FPS, 0 flashes, runs/v5_menu). Steps, each measured with `RECOMP_CS_PROF`:
+- **GPU vertex programs** (toolkit patch 0016 + `src/cs_vsh_hlsl.c`): the executor hands program batches over untransformed; each NV2A program is translated to an HLSL vertex shader (cached by content) mirroring the CPU interpreter; GPU culling/clipping. All 6 CS programs translate. 21 -> 35 FPS. `RECOMP_CS_GPU_VSH=0` returns to the CPU path.
+- **Specialised combiner pixel shaders** (`src/cs_rc_hlsl.c`): the generic combiner interpreter (dynamic `R[16]` indexing in a loop) cost the GPU ~23 ms a frame; per-setup shaders take it to ~14 ms. `RECOMP_CS_RC_SPECIAL=0` keeps the generic one (also used by `RECOMP_CS_RC_DEBUG`).
+- **Kickoffs answered mid-walk** (patch 0016): the game's KickOff spun on the PFB flush bit for the whole segment walk, so game and executor never overlapped. Bounded (8 kicks/walk, 192 KB ahead, not while a flip is held) because XDK D3D otherwise takes its "GPU far behind" path, which waits for a software-method interrupt we do not deliver (froze loading / at ~55 s before the bounds). The 0x400B10 kick latch is now kept for the segment scan.
+- Per-draw overhead: texture lookup index, verified-this-frame check before hashing, unchanged constant buffers not re-uploaded.
+- **Tools:** `RECOMP_CS_D3D11_LOG` lines now show GPU ms/frame (timestamp queries) and GPU-VSH/fallback draw counts; `RECOMP_CS_GPU_VSH_DUMP=<file>` writes the HLSL of a program that fails to compile.
+- **Still open:** the far-behind interrupt itself (would remove the bounds), 1% lows (p99 ~35 ms), haze/smoke check, map load time.

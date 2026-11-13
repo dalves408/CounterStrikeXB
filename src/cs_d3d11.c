@@ -51,6 +51,8 @@
 
 #include "cs_d3d11.h"
 #include "nv2a_backend.h"
+#include "cs_vsh_hlsl.h"
+#include "cs_rc_hlsl.h"
 #include "d3d/d3d8_swizzle.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -693,16 +695,32 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
         }
 
     n = tex_bytes(t);
-    sig = sample_sig(mem + t->offset, n);
-    for (i = 0; i < MAX_TEX; i++) {
-        if (tex_matches(&s_tx[i], t)) { e = &s_tx[i]; break; }
-        if (!s_tx[i].tex) { if (free_i < 0) free_i = i; }
-        else if (lru < 0 || s_tx[i].used < s_tx[lru].used) lru = i;
+    {   /* Direct-mapped index in front of the scan: the world binds a few
+         * hundred textures a frame, and the linear search (with its LRU pick)
+         * was ~10% of the executor thread. */
+        static int16_t idx[4096];
+        static int idx_init;
+        uint32_t h = (t->offset * 2654435761u ^ t->width * 40503u ^ t->height * 9973u ^ t->color) >> 20;
+        if (!idx_init) { memset(idx, 0xFF, sizeof idx); idx_init = 1; }
+        if (idx[h] >= 0 && tex_matches(&s_tx[idx[h]], t)) {
+            e = &s_tx[idx[h]];
+        } else {
+            for (i = 0; i < MAX_TEX; i++) {
+                if (tex_matches(&s_tx[i], t)) { e = &s_tx[i]; break; }
+                if (!s_tx[i].tex) { if (free_i < 0) free_i = i; }
+                else if (lru < 0 || s_tx[i].used < s_tx[lru].used) lru = i;
+            }
+            if (e) idx[h] = (int16_t)(e - s_tx);
+        }
     }
+    /* Verified this frame already: the world binds the same lightmap and
+     * detail textures hundreds of times a frame, and re-signing each bind (a
+     * full hash under 32 KB) was ~9% of the executor thread. */
+    if (e && e->verified == s_frame + 1) { e->used = s_tick; return e->srv; }
+    sig = sample_sig(mem + t->offset, n);
     if (e) {
         e->used = s_tick;
         if (e->sig == sig) {
-            if (e->verified == s_frame + 1) return e->srv;       /* verified this frame already */
             if (hash_bytes(mem + t->offset, n) == e->hash) { e->verified = s_frame + 1; return e->srv; }
         }
         free_i = (int)(e - s_tx);                                /* content changed: decode into the same slot */
@@ -811,6 +829,183 @@ static int is_front(float area, uint32_t front_face)
 {
     /* y grows downwards in surface pixels, so a positive area is clockwise. */
     return front_face == 0x901 ? area < 0.0f : area > 0.0f;
+}
+
+/* Specialised combiner pixel shaders (cs_rc_hlsl.c), cached by setup.
+ * RECOMP_CS_RC_SPECIAL=0 keeps the generic interpreter; so does the
+ * RECOMP_CS_RC_DEBUG view, which only the generic shader implements. */
+#define RC_CACHE 512
+typedef struct { uint64_t key; ID3D11PixelShader *ps; } RcEnt;
+static RcEnt s_rcs[RC_CACHE];
+static unsigned s_rcs_n, st_rc_compiles;
+
+static ID3D11PixelShader *rc_shader(const Nv2aCombiner *rc)
+{
+    static int on = -1;
+    static char src[64 * 1024];
+    uint64_t key;
+    unsigned i;
+    size_t n;
+    RcEnt *e;
+    ID3DBlob *blob = NULL, *err = NULL;
+    if (on < 0) { const char *v = getenv("RECOMP_CS_RC_SPECIAL"); on = !(v && v[0] == '0'); }
+    if (!on) return s_ps_rc;
+    key = cs_rc_key(rc);
+    {   /* direct-mapped front, then the list */
+        static int16_t front[1024];
+        static int init;
+        unsigned h = (unsigned)(key >> 54);
+        if (!init) { memset(front, 0xFF, sizeof front); init = 1; }
+        if (front[h] >= 0 && s_rcs[front[h]].key == key) return s_rcs[front[h]].ps ? s_rcs[front[h]].ps : s_ps_rc;
+        for (i = 0; i < s_rcs_n; i++)
+            if (s_rcs[i].key == key) { front[h] = (int16_t)i; return s_rcs[i].ps ? s_rcs[i].ps : s_ps_rc; }
+        if (s_rcs_n == RC_CACHE) return s_ps_rc;
+        e = &s_rcs[s_rcs_n];
+        front[h] = (int16_t)s_rcs_n++;
+    }
+    e->key = key; e->ps = NULL;
+    n = cs_rc_to_hlsl(rc, src, sizeof src);
+    st_rc_compiles++;
+    if (n && SUCCEEDED(D3DCompile(src, n, "nv2a_rc", NULL, NULL, "main", "ps_5_0",
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err)))
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), NULL, &e->ps);
+    if (!e->ps)
+        fprintf(stderr, "[CS-D3D11] combiner %016llX: no specialised shader%s%s\n", (unsigned long long)key,
+                err ? ": " : "", err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
+    SAFE_REL(blob); SAFE_REL(err);
+    return e->ps ? e->ps : s_ps_rc;
+}
+
+/* Everything a draw binds apart from its vertex input and vertex shader:
+ * constants, combiners, textures, samplers, blend/depth state, targets and
+ * viewport. Shared by the CPU-transformed path (cs_draw) and the GPU vertex
+ * program path (cs_draw_program). Returns whether the combiner shader is used;
+ * srvs gets stage 0..3 (for the flash recorder). */
+static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
+                      ID3D11ShaderResourceView *srvs[4])
+{
+    const Nv2aRenderState *r = b->state;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    Cb cb;
+    ID3D11ShaderResourceView *srv = s_white_srv;
+    ID3D11SamplerState *smp = NULL;
+    ID3D11BlendState *bs;
+    ID3D11DepthStencilState *dss;
+    ID3D11Buffer *cbuf;
+    float bf[4];
+    int opaque = 0, use_rc = 0;
+    RcCb rcb;
+    ID3D11Buffer *rcbuf = NULL;
+    ID3D11SamplerState *smps[4];
+
+    srvs[0] = srvs[1] = srvs[2] = srvs[3] = s_white_srv;
+    memset(&cb, 0, sizeof cb);
+    cb.sw = (float)s->width; cb.sh = (float)s->height;
+    cb.afunc = (!s_no_alpha && r->alpha_test_enable) ? r->alpha_func : 0x207;
+    cb.aref = (float)(r->alpha_ref & 0xFF);
+    if (b->texture) {
+        srv = get_tex(b->texture, &opaque);
+        smp = get_sampler(b->texture);
+        cb.textured = (srv != s_white_srv) ? 1u : 0u;
+        cb.opaque = opaque ? 1u : 0u;
+        cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
+    }
+    if (s_force_a1) cb.opaque = 1u;
+    { static int dbg = -1; if (dbg < 0) { const char *e = getenv("RECOMP_CS_RC_DEBUG"); dbg = e ? atoi(e) : 0; } cb.dbg = r->depth_test_enable ? (uint32_t)dbg : 0u; }
+    if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
+
+    if (b->combiner && b->stages) {            /* 3D path: register combiners */
+        const Nv2aCombiner *rc = b->combiner;
+        int st;
+        uint32_t k;
+        use_rc = 1;
+        memset(&rcb, 0, sizeof rcb);
+        rcb.hdr[0] = rc->control; rcb.hdr[1] = rc->stage_program; rcb.hdr[2] = rc->final0; rcb.hdr[3] = rc->final1;
+        rcb.hdr2[0] = rc->final_c0; rcb.hdr2[1] = rc->final_c1;       /* clip-plane stages: not modelled */
+        memcpy(rcb.fogc, b->fog_color, sizeof rcb.fogc);
+        for (k = 0; k < 8; k++) {
+            rcb.stg[2 * k][0] = rc->color_icw[k]; rcb.stg[2 * k][1] = rc->alpha_icw[k];
+            rcb.stg[2 * k][2] = rc->color_ocw[k]; rcb.stg[2 * k][3] = rc->alpha_ocw[k];
+            rcb.stg[2 * k + 1][0] = rc->factor0[k]; rcb.stg[2 * k + 1][1] = rc->factor1[k];
+        }
+        for (st = 0; st < 4; st++) {
+            const Nv2aTexture *t = &b->stages[st];
+            uint32_t mode = (rc->stage_program >> (st * 5)) & 0x1F;
+            int op = 0;
+            Nv2aTexture dflt;
+            memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3;
+            srvs[st] = s_white_srv;
+            smps[st] = get_sampler(&dflt);
+            rcb.uvs[st][0] = rcb.uvs[st][1] = 1.0f;
+            /* WRAP on both axes: wrap the coordinate in the shader (frac), as the
+             * NV2A and the CPU rasteriser do exactly. CS's world detail stage
+             * arrives with coordinates near +-1e6, where GPU texture units keep
+             * no fractional precision and return a constant (dark) texel. */
+            rcb.uvs[st][3] = (t->addr_u == 1 && t->addr_v == 1) ? 1.0f : 0.0f;
+            if ((mode == 1 || mode == 2) && (b->stage_valid & (1u << st))) {
+                srvs[st] = get_tex(t, &op);
+                smps[st] = get_sampler(t);
+                rcb.uvs[st][2] = (srvs[st] != s_white_srv) ? 1.0f : 0.0f;
+                if (!(d3d8_format_is_swizzled(t->color) || d3d8_format_dxt_block_bytes(t->color)) && t->width && t->height) {
+                    rcb.uvs[st][0] = 1.0f / (float)t->width;
+                    rcb.uvs[st][1] = 1.0f / (float)t->height;
+                }
+            }
+        }
+        {   /* the same combiner setup as the last draw: keep its buffer */
+            static RcCb last_rcb;
+            static ID3D11Buffer *last_rcbuf;
+            if (last_rcbuf && !memcmp(&last_rcb, &rcb, sizeof rcb)) {
+                rcbuf = last_rcbuf;
+            } else {
+                rcbuf = s_rcr[s_rc_i++ % CB_RING];
+                if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)rcbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                    memcpy(m.pData, &rcb, sizeof rcb);
+                    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)rcbuf, 0);
+                }
+                last_rcb = rcb; last_rcbuf = rcbuf;
+            }
+        }
+    }
+
+    {   /* likewise the per-draw constants */
+        static Cb last_cb;
+        static ID3D11Buffer *last_cbuf;
+        if (last_cbuf && !memcmp(&last_cb, &cb, sizeof cb)) {
+            cbuf = last_cbuf;
+        } else {
+            cbuf = s_cbr[s_cb_i++ % CB_RING];
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                memcpy(m.pData, &cb, sizeof cb);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)cbuf, 0);
+            }
+            last_cb = cb; last_cbuf = cbuf;
+        }
+    }
+    bs = get_blend(r);
+    dss = get_dss(r, ds != NULL);
+    bf[0] = ((r->blend_color >> 16) & 255) / 255.0f; bf[1] = ((r->blend_color >> 8) & 255) / 255.0f;
+    bf[2] = (r->blend_color & 255) / 255.0f; bf[3] = ((r->blend_color >> 24) & 255) / 255.0f;
+
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, ds ? ds->dsv : NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
+    vp.TopLeftX = vp.TopLeftY = s_pixofs;
+    vp.Width = (float)s->width; vp.Height = (float)s->height; vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_PSSetShader(s_ctx, !use_rc ? s_ps : (cb.dbg ? s_ps_rc : rc_shader(b->combiner)), NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
+    if (use_rc) {
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &rcbuf);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srvs);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
+    } else {
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &smp);
+    }
+    return use_rc;
 }
 
 static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -1039,98 +1234,12 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 
     if (!kept) return;
 
-    memset(&cb, 0, sizeof cb);
-    cb.sw = (float)s->width; cb.sh = (float)s->height;
-    cb.afunc = (!s_no_alpha && r->alpha_test_enable) ? r->alpha_func : 0x207;
-    cb.aref = (float)(r->alpha_ref & 0xFF);
-    if (b->texture) {
-        srv = get_tex(b->texture, &opaque);
-        smp = get_sampler(b->texture);
-        cb.textured = (srv != s_white_srv) ? 1u : 0u;
-        cb.opaque = opaque ? 1u : 0u;
-        cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
-    }
-    if (s_force_a1) cb.opaque = 1u;
-    { static int dbg = -1; if (dbg < 0) { const char *e = getenv("RECOMP_CS_RC_DEBUG"); dbg = e ? atoi(e) : 0; } cb.dbg = r->depth_test_enable ? (uint32_t)dbg : 0u; }
-    if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
-
-    if (b->combiner && b->stages) {            /* 3D path: register combiners */
-        const Nv2aCombiner *rc = b->combiner;
-        int st;
-        uint32_t k;
-        use_rc = 1;
-        memset(&rcb, 0, sizeof rcb);
-        rcb.hdr[0] = rc->control; rcb.hdr[1] = rc->stage_program; rcb.hdr[2] = rc->final0; rcb.hdr[3] = rc->final1;
-        rcb.hdr2[0] = rc->final_c0; rcb.hdr2[1] = rc->final_c1;       /* clip-plane stages: not modelled */
-        memcpy(rcb.fogc, b->fog_color, sizeof rcb.fogc);
-        for (k = 0; k < 8; k++) {
-            rcb.stg[2 * k][0] = rc->color_icw[k]; rcb.stg[2 * k][1] = rc->alpha_icw[k];
-            rcb.stg[2 * k][2] = rc->color_ocw[k]; rcb.stg[2 * k][3] = rc->alpha_ocw[k];
-            rcb.stg[2 * k + 1][0] = rc->factor0[k]; rcb.stg[2 * k + 1][1] = rc->factor1[k];
-        }
-        for (st = 0; st < 4; st++) {
-            const Nv2aTexture *t = &b->stages[st];
-            uint32_t mode = (rc->stage_program >> (st * 5)) & 0x1F;
-            int op = 0;
-            Nv2aTexture dflt;
-            memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3;
-            srvs[st] = s_white_srv;
-            smps[st] = get_sampler(&dflt);
-            rcb.uvs[st][0] = rcb.uvs[st][1] = 1.0f;
-            /* WRAP on both axes: wrap the coordinate in the shader (frac), as the
-             * NV2A and the CPU rasteriser do exactly. CS's world detail stage
-             * arrives with coordinates near +-1e6, where GPU texture units keep
-             * no fractional precision and return a constant (dark) texel. */
-            rcb.uvs[st][3] = (t->addr_u == 1 && t->addr_v == 1) ? 1.0f : 0.0f;
-            if ((mode == 1 || mode == 2) && (b->stage_valid & (1u << st))) {
-                srvs[st] = get_tex(t, &op);
-                smps[st] = get_sampler(t);
-                rcb.uvs[st][2] = (srvs[st] != s_white_srv) ? 1.0f : 0.0f;
-                if (!(d3d8_format_is_swizzled(t->color) || d3d8_format_dxt_block_bytes(t->color)) && t->width && t->height) {
-                    rcb.uvs[st][0] = 1.0f / (float)t->width;
-                    rcb.uvs[st][1] = 1.0f / (float)t->height;
-                }
-            }
-        }
-        rcbuf = s_rcr[s_rc_i++ % CB_RING];
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)rcbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            memcpy(m.pData, &rcb, sizeof rcb);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)rcbuf, 0);
-        }
-    }
-
-    cbuf = s_cbr[s_cb_i++ % CB_RING];
-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, &cb, sizeof cb);
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)cbuf, 0);
-    }
-    bs = get_blend(r);
-    dss = get_dss(r, ds != NULL);
-    bf[0] = ((r->blend_color >> 16) & 255) / 255.0f; bf[1] = ((r->blend_color >> 8) & 255) / 255.0f;
-    bf[2] = (r->blend_color & 255) / 255.0f; bf[3] = ((r->blend_color >> 24) & 255) / 255.0f;
-
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, ds ? ds->dsv : NULL);
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
+    use_rc = bind_state(s, b, rt, ds, srvs);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
-    vp.TopLeftX = vp.TopLeftY = s_pixofs;
-    vp.Width = (float)s->width; vp.Height = (float)s->height; vp.MinDepth = 0; vp.MaxDepth = 1;
-    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_il);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &vb, &stride, &off);
     ID3D11DeviceContext_VSSetShader(s_ctx, use_rc ? s_vs_rc : s_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, use_rc ? s_ps_rc : s_ps, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
-    if (use_rc) {
-        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &rcbuf);
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srvs);
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smps);
-    } else {
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &smp);
-    }
     ID3D11DeviceContext_Draw(s_ctx, kept, s_vb_off / (UINT)sizeof(Nv2aVertex));
     if (s_pick_hit) {   /* RECOMP_CS_PICK: the pixel's value after this draw */
         static ID3D11Texture2D *one;
@@ -1341,6 +1450,10 @@ static void cs_present_sync(void)
                 }
                 rt->dirty = 0;
             }
+            /* Submit the frame now. Left in the driver's command buffer, the
+             * GPU started this frame only when the next flip's Map forced it,
+             * and that Map then waited for the whole frame (~9 ms in game). */
+            ID3D11DeviceContext_Flush(s_ctx);
             goto done;
         }
     }
@@ -1400,20 +1513,271 @@ done:
     s_fr_draws = s_fr_tris = 0;
 }
 
+/* GPU time per frame (RECOMP_CS_D3D11_LOG): timestamp queries around each
+ * flip-to-flip interval, read four frames later so nothing waits. */
+static double s_gpu_ms_sum;
+static unsigned s_gpu_ms_n;
+static unsigned st_gv_draws, st_gv_fallback;   /* GPU vertex program draws (below) */
+
+static void gpu_timer_flip(void)
+{
+    enum { N = 4 };
+    static ID3D11Query *dj[N], *ts[N];
+    static int k, started[N], ok = -1;
+    D3D11_QUERY_DESC qd;
+    int i;
+    if (ok < 0) {
+        ok = 1;
+        for (i = 0; i < N && ok; i++) {
+            qd.MiscFlags = 0;
+            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+            if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &dj[i]))) ok = 0;
+            qd.Query = D3D11_QUERY_TIMESTAMP;
+            if (ok && FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &ts[i]))) ok = 0;
+        }
+    }
+    if (!ok) return;
+    /* close the interval opened at the previous flip */
+    {
+        int p = (k + N - 1) % N;
+        if (started[p] == 1) {
+            ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)dj[p]);
+            started[p] = 2;
+        }
+    }
+    /* the slot we are about to reuse: read its result (four frames old) */
+    if (started[k] == 2) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT d;
+        UINT64 t0 = 0, t1 = 0;
+        int nxt = (k + 1) % N;
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)dj[k], &d, sizeof d, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)ts[k], &t0, sizeof t0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)ts[nxt], &t1, sizeof t1, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && !d.Disjoint && d.Frequency && t1 > t0) {
+            s_gpu_ms_sum += (double)(t1 - t0) * 1000.0 / (double)d.Frequency;
+            s_gpu_ms_n++;
+        }
+        started[k] = 0;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)dj[k]);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)ts[k]);
+    started[k] = 1;
+    k = (k + 1) % N;
+}
+
 static void cs_flip(void)
 {
     static DWORD last;
     DWORD now;
     if (!s_inited || s_failed) return;
+    if (s_log) gpu_timer_flip();
     s_frame++; s_tick++; st_flips++;
     if (s_csv && (s_frame % 30) == 0) fflush(s_csv);   /* runs are often ended by killing the process */
     now = GetTickCount();
     if (s_log && now - last >= 2000) {
-        fprintf(stderr, "[CS-D3D11] frame=%u flips=%u draws=%u tris=%u culled=%u clears=%u texdecodes=%u rtsamples=%u readbacks=%u vbdrop=%u\n",
-                s_frame, st_flips, st_draws, st_tris, st_culled, st_clears, st_decodes, st_rtsamples, st_rb, st_vb_drop);
+        fprintf(stderr, "[CS-D3D11] frame=%u flips=%u draws=%u (gpu-vsh %u, cpu-fallback %u) tris=%u culled=%u clears=%u texdecodes=%u rtsamples=%u readbacks=%u vbdrop=%u gpu_ms/frame=%.2f\n",
+                s_frame, st_flips, st_draws, st_gv_draws, st_gv_fallback, st_tris, st_culled, st_clears, st_decodes, st_rtsamples, st_rb, st_vb_drop,
+                s_gpu_ms_n ? s_gpu_ms_sum / s_gpu_ms_n : 0.0);
         st_flips = st_draws = st_tris = st_culled = st_clears = st_decodes = st_rtsamples = st_rb = 0;
+        st_gv_draws = st_gv_fallback = 0; s_gpu_ms_sum = 0; s_gpu_ms_n = 0;
         last = now;
     }
+}
+
+/* ---- GPU vertex programs (RECOMP_CS_GPU_VSH, default on) -----------------
+ *
+ * The executor hands program batches over untransformed (toolkit patch 0016):
+ * the program, c[0..191], each distinct vertex's inputs and a triangle list.
+ * The program is translated to an HLSL vertex shader once (cs_vsh_hlsl.c,
+ * cached by content) and runs on the GPU; the pixel side is the same combiner
+ * shader and state as the CPU path. A program that fails to translate or
+ * compile, or a batch that does not fit, goes back to the CPU path. */
+#define GV_IN_ROWS  (2u * 1024u * 1024u)        /* float4 input ring: 32 MB */
+#define GV_IB_IDX   (2u * 1024u * 1024u)        /* uint32 index ring: 8 MB */
+#define GV_CACHE    128
+
+typedef struct { uint64_t key; ID3D11VertexShader *vs; int failed; } GvEnt;
+typedef struct { uint32_t in_base, in_n; float aa[2]; uint32_t fog_en, fog_mode; float fog_p[2]; } GvCb;
+
+static GvEnt s_gv[GV_CACHE];
+static unsigned s_gv_n;
+static ID3D11Buffer *s_gv_in, *s_gv_ib, *s_gv_cb, *s_gv_pcb;
+static ID3D11ShaderResourceView *s_gv_srv;
+static ID3D11RasterizerState *s_gv_rs[3][2];    /* none/front/back x front-CCW */
+static uint32_t s_gv_in_off, s_gv_ib_off;       /* ring positions (rows, indices) */
+static int s_gv_ready = -1;
+
+static int gv_init(void)
+{
+    D3D11_BUFFER_DESC bd;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+    D3D11_RASTERIZER_DESC rd;
+    int c, f;
+
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = GV_IN_ROWS * 16u; bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_gv_in))) return 0;
+    memset(&sv, 0, sizeof sv);
+    sv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; sv.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sv.Buffer.FirstElement = 0; sv.Buffer.NumElements = GV_IN_ROWS;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_gv_in, &sv, &s_gv_srv))) return 0;
+    bd.ByteWidth = GV_IB_IDX * 4u; bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_gv_ib))) return 0;
+    bd.ByteWidth = 192u * 16u; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_gv_cb))) return 0;
+    bd.ByteWidth = (UINT)((sizeof(GvCb) + 15u) & ~15u);
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_gv_pcb))) return 0;
+    for (c = 0; c < 3; c++)
+        for (f = 0; f < 2; f++) {
+            memset(&rd, 0, sizeof rd);
+            rd.FillMode = D3D11_FILL_SOLID; rd.DepthClipEnable = TRUE;
+            rd.CullMode = c == 0 ? D3D11_CULL_NONE : (c == 1 ? D3D11_CULL_FRONT : D3D11_CULL_BACK);
+            rd.FrontCounterClockwise = f ? TRUE : FALSE;
+            if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_gv_rs[c][f]))) return 0;
+        }
+    return 1;
+}
+
+static uint64_t gv_key(const Nv2aProgramDraw *p)
+{
+    uint64_t h = 1469598103934665603ull ^ p->input_mask;
+    uint32_t i, k;
+    for (i = 0; i < p->program_count; i++)
+        for (k = 0; k < 4; k++) h = (h ^ p->program[i][k]) * 1099511628211ull;
+    return h;
+}
+
+static ID3D11VertexShader *gv_shader(const Nv2aProgramDraw *p)
+{
+    static char src[256 * 1024];
+    uint64_t key = gv_key(p);
+    ID3DBlob *blob = NULL, *err = NULL;
+    GvEnt *e = NULL;
+    unsigned i;
+    size_t n;
+
+    for (i = 0; i < s_gv_n; i++)
+        if (s_gv[i].key == key) return s_gv[i].failed ? NULL : s_gv[i].vs;
+    if (s_gv_n == GV_CACHE) {           /* full: forget the lot (titles use a handful) */
+        for (i = 0; i < s_gv_n; i++) SAFE_REL(s_gv[i].vs);
+        s_gv_n = 0;
+    }
+    e = &s_gv[s_gv_n++];
+    memset(e, 0, sizeof *e);
+    e->key = key;
+    n = cs_vsh_to_hlsl(p->program, p->program_count, p->input_mask, src, sizeof src);
+    if (!n || FAILED(D3DCompile(src, n, "nv2a_vsh", NULL, NULL, "main", "vs_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err))
+        || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
+                                                  ID3D10Blob_GetBufferSize(blob), NULL, &e->vs))) {
+        e->failed = 1;
+        fprintf(stderr, "[CS-D3D11] vertex program %016llX (%u instructions): no GPU shader%s%s\n",
+                (unsigned long long)key, p->program_count, err ? ": " : "",
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
+        { const char *d = getenv("RECOMP_CS_GPU_VSH_DUMP"); if (d) { FILE *f = fopen(d, "w"); if (f) { fwrite(src, 1, n, f); fclose(f); } } }
+    } else if (s_log) {
+        fprintf(stderr, "[CS-D3D11] vertex program %016llX: %u instructions on the GPU (%u cached)\n",
+                (unsigned long long)key, p->program_count, s_gv_n);
+    }
+    SAFE_REL(blob); SAFE_REL(err);
+    return e->failed ? NULL : e->vs;
+}
+
+static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
+{
+    const Nv2aRenderState *r = b->state;
+    ID3D11VertexShader *vs;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11ShaderResourceView *srvs[4];
+    ID3D11Buffer *cbs[2];
+    uint32_t nin = 0, rows, k;
+    GvCb g;
+    Rt *rt;
+    Ds *ds;
+    int use_rc, cull;
+
+    if (s_gv_ready < 0) {
+        const char *e = getenv("RECOMP_CS_GPU_VSH");
+        s_gv_ready = (e && e[0] == '0') ? 0 : -2;   /* -2: wanted, not created yet */
+    }
+    if (!s_gv_ready || !cs_ready() || !b->combiner || !b->stages) { st_gv_fallback++; return 0; }
+    if (s_gv_ready == -2) {
+        s_gv_ready = gv_init();
+        fprintf(stderr, "[CS-D3D11] GPU vertex programs %s\n", s_gv_ready ? "on" : "unavailable (CPU path)");
+        if (!s_gv_ready) return 0;
+    }
+    for (k = 0; k < 16; k++) nin += (p->input_mask >> k) & 1u;
+    rows = p->vertex_count * nin;
+    if (!nin || rows > GV_IN_ROWS || p->index_count > GV_IB_IDX || !p->index_count) { st_gv_fallback++; return 0; }
+    if (r->cull_enable && r->cull_face == 0x408) return 1;           /* FRONT_AND_BACK: nothing drawn */
+    if (!(vs = gv_shader(p))) { st_gv_fallback++; return 0; }
+    rt = get_rt(s);
+    if (!rt) return 1;
+    ds = get_ds(s, r->zeta_va);
+
+    /* Inputs and indices into their rings; constants and per-draw values. */
+    s_gv_in_off = (s_gv_in_off + nin - 1) / nin * nin;   /* vertex-aligned: indices carry the base */
+    if (s_gv_in_off + rows > GV_IN_ROWS) s_gv_in_off = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_in, 0,
+               s_gv_in_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+    memcpy((uint8_t *)m.pData + (size_t)s_gv_in_off * 16u, p->inputs, (size_t)rows * 16u);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_in, 0);
+    if (s_gv_ib_off + p->index_count > GV_IB_IDX) s_gv_ib_off = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_ib, 0,
+               s_gv_ib_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+    {
+        uint32_t *dst = (uint32_t *)m.pData + s_gv_ib_off, base = s_gv_in_off / nin, q;
+        for (q = 0; q < p->index_count; q++) dst[q] = p->indices[q] + base;
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_ib, 0);
+    {   /* c[0..191] only when they changed since the last program draw */
+        static float last_c[192][4];
+        static int have_c;
+        if (!have_c || memcmp(last_c, p->constants, sizeof last_c)) {
+            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+            memcpy(m.pData, p->constants, sizeof last_c);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_cb, 0);
+            memcpy(last_c, p->constants, sizeof last_c);
+            have_c = 1;
+        }
+    }
+    memset(&g, 0, sizeof g);
+    g.in_base = 0; g.in_n = nin;
+    g.aa[0] = (float)(s->aa_sx ? s->aa_sx : 1); g.aa[1] = (float)(s->aa_sy ? s->aa_sy : 1);
+    g.fog_en = p->fog_enable; g.fog_mode = p->fog_mode; g.fog_p[0] = p->fog_param[0]; g.fog_p[1] = p->fog_param[1];
+    {
+        static GvCb last_g;
+        static int have_g;
+        if (!have_g || memcmp(&last_g, &g, sizeof g)) {
+            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_pcb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+            memcpy(m.pData, &g, sizeof g);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_pcb, 0);
+            last_g = g; have_g = 1;
+        }
+    }
+
+    use_rc = bind_state(s, b, rt, ds, srvs);
+    (void)use_rc;
+    /* Culling on the GPU, by the winding the strips were assembled with. Surface
+     * y grows downwards, as in the D3D11 viewport, so NV2A's CW is D3D's CW. */
+    cull = !r->cull_enable ? 0 : (r->cull_face == 0x404 ? 1 : (r->cull_face == 0x405 ? 2 : 0));
+    if (!s_cull_on) cull = 0;
+    ID3D11DeviceContext_RSSetState(s_ctx, s_gv_rs[cull][r->front_face == 0x901 ? 1 : 0]);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_gv_ib, DXGI_FORMAT_R32_UINT, 0);
+    ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+    cbs[0] = s_gv_cb; cbs[1] = s_gv_pcb;
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 2, 2, cbs);
+    ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &s_gv_srv);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, p->index_count, s_gv_ib_off, 0);
+    s_gv_in_off += rows;
+    s_gv_ib_off += p->index_count;
+    rt->dirty = 1;
+    st_draws++; st_gv_draws++; st_tris += p->index_count / 3;
+    s_fr_draws++; s_fr_tris += p->index_count / 3;
+    return 1;
 }
 
 static const Nv2aBackend s_backend = { cs_clear, cs_draw, cs_flip };
@@ -1435,4 +1799,5 @@ void cs_d3d11_init(void)
     }
     cs_now_ms();
     nv2a_backend_register_with_present_sync(&s_backend, cs_present_sync);
+    nv2a_backend_register_program(cs_draw_program);
 }

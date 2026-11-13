@@ -30,6 +30,8 @@ set(GAME_SOURCES
     src/cs_gpu.c
     src/cs_d3d11.c
     src/cs_prof.c
+    src/cs_vsh_hlsl.c
+    src/cs_rc_hlsl.c
     src/cs_kernel.c
     src/cs_launch.c
 )
