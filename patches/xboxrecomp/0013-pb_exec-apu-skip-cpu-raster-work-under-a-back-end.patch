@@ -1,0 +1,90 @@
+From e0ce5e611b7ecc121c16ac0409e0962439eb1425 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 20:00:00 -0800
+Subject: [PATCH] pb_exec/apu: skip CPU-rasteriser work under a back end; read
+ hot env switches once (CounterStrikeXB2 local patch)
+
+With a render back end registered the executor still prepared (decoded) every
+batch's textures for the CPU rasteriser and cleared its CPU depth buffer on
+every Z clear; neither is used. draw_primitive called getenv for
+RECOMP_PB_EXEC_VERBOSE per batch, and the APU MMIO hook called it for
+RECOMP_APU_TRACE on every trapped access. In Counter-Strike's gameplay these
+were ~8%, ~1%, ~5% of the executor thread and ~1.5% of the game thread.
+---
+ src/apu/apu_mmio_hook.c   |  7 ++++++-
+ src/kernel/nv2a_pb_exec.c | 20 +++++++++++++++++---
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index aecce6a..d2d1695 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -103,7 +103,12 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+      * a title that waits on one waits forever, and the only way to work out
+      * what it is waiting for is to see the register traffic that precedes the
+      * wait. */
+-    if (apu_env_on("RECOMP_APU_TRACE")) {
++    /* Read once: this runs on every trapped APU access, and getenv walks the
++     * whole environment (about 1.5% of Counter-Strike's game thread). */
++    static int trace = -1;
++    if (trace < 0)
++        trace = apu_env_on("RECOMP_APU_TRACE");
++    if (trace) {
+         static unsigned n;
+         if (n++ < 400) {
+             /* The value as well as the offset: finding which register carries
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 1073143..431c2e7 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3732,7 +3732,10 @@ static void raster_batch(void)
+         } else if (tc->offset && tc->stride) {
+             stages = 1;
+         }
+-        prepare_textures(stages);
++        /* The prepared images feed the CPU rasteriser only: a back end
++         * decodes what it samples itself (nv2a_backend_decode_texture). */
++        if (!backend_draws())
++            prepare_textures(stages);
+     }
+     if (batch_uses_program() || batch_is_ffp()) {
+         raster_batch_program();
+@@ -3866,6 +3869,17 @@ static void frame_trace_flip(void)
+     }
+ }
+ 
++/* RECOMP_PB_EXEC_VERBOSE, read once: getenv walks the whole environment, and
++ * draw_primitive asked it for every batch (about 5% of the executor thread
++ * in Counter-Strike's gameplay). */
++static int pb_exec_verbose(void)
++{
++    static int v = -1;
++    if (v < 0)
++        v = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
++    return v;
++}
++
+ static void draw_primitive(void)
+ {
+     float v[4];
+@@ -3953,7 +3967,7 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
++    if (pb_exec_verbose()) {
+         static int shown;
+         if (shown++ < 6) {
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+@@ -4689,7 +4703,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
+                     s_gpu.clear_color, 10);
+         clear_surface(param);
+-        if (param & 0x01)                         /* Z */
++        if ((param & 0x01) && !backend_draws())   /* Z; a back end keeps its own */
+             zbuf_clear();
+         break;
+ 
+-- 
+2.51.0.windows.2
+

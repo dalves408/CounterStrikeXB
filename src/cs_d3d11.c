@@ -72,6 +72,7 @@ extern const float *nv2a_vsh_constant(uint32_t index);   /* kernel/nv2a_vsh_inte
 typedef struct {
     uint32_t va, rawva, w, h, bpp, pitch;   /* va: physical offset (match key); rawva: address as the title used it */
     uint32_t dirty, used;
+    int pend;                      /* a copy is queued in stage, for the next present */
     ID3D11Texture2D *tex, *stage;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
@@ -1297,6 +1298,31 @@ static void cs_present_sync(void)
         dumping = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
     }
     s_dump_now = dumping;
+    {
+        /* Normal play: only the display-sized target (what the window shows)
+         * goes back to guest memory, and one flip late: map the copy queued at
+         * the previous flip -- long finished on the GPU -- then queue this
+         * one's. Copying and mapping in one go stalled this thread on the GPU
+         * every flip (10-19 ms in game). Other targets (the 640x960 back
+         * buffer, glow buffers) are sampled on the GPU and never read here.
+         * Dumps, flash capture and RECOMP_CS_RB_ALL=1 keep the synchronous
+         * all-targets path below. */
+        static int rb_all = -1;
+        if (rb_all < 0) { const char *e = getenv("RECOMP_CS_RB_ALL"); rb_all = e && *e == '1'; }
+        if (!dumping && !s_flash_dir && !rb_all) {
+            for (i = 0; i < MAX_RT; i++) {
+                Rt *rt = &s_rt[i];
+                if (!rt->tex) continue;
+                if (rt->pend) { rb_write(rt); rt->pend = 0; readi[nrb] = i; st_rb++; nrb++; }
+                if (rt->dirty && rt->w == 640 && rt->h == 480) {
+                    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)rt->stage, (ID3D11Resource *)rt->tex);
+                    rt->pend = 1;
+                }
+                rt->dirty = 0;
+            }
+            goto done;
+        }
+    }
     for (i = 0; i < MAX_RT; i++) {
         Rt *rt = &s_rt[i];
         if (!rt->tex || !rt->dirty) continue;
@@ -1339,6 +1365,7 @@ static void cs_present_sync(void)
         prev_black = s_sig_black;
     }
     if (s_flash_dir) { s_dlc ^= 1u; s_dln[s_dlc] = 0; }
+done:
     if (s_csv) {
         t1 = cs_now_ms();
         if (s_sig_valid)
