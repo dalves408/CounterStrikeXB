@@ -64,5 +64,6 @@ if gen.exists():
 gen.mkdir(parents=True)
 run("recomp", "tools.recomp", "--all", "--split", "250", "--game-name", "Counter-Strike",
     "--promote-regs",   # register-promotion hooks; inert unless the build defines RECOMP_REG_PROMOTE
+    "--direct-mmio",    # absolute APU register accesses call the model, no host exception
     "--gen-dir", gen)
 print("pipeline complete", flush=True)

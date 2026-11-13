@@ -1,0 +1,178 @@
+From 38d46cf1adde228e1aef073dd584f02c0654ba73 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] recomp: direct APU register access for absolute addresses
+ (--direct-mmio) (CounterStrikeXB2 local patch)
+
+Trapped APU registers are reached by faulting on an unmapped page; each
+access is a host exception and an instruction emulation. Where the translator
+sees a 32-bit load or store whose address is an absolute constant in the APU
+window (0xFE800000-0xFE87FFFF) -- DirectSound's per-voice updates write
+[0xFE820314] and its neighbours -- --direct-mmio emits xbox_MmioRead32 /
+xbox_MmioWrite32 instead. Those call the same mcpx_apu_mmio_* model the fault
+handler reaches when the register is trapped, and do the plain access
+otherwise. Register-relative accesses still trap.
+
+Counter-Strike: all 99 such accesses rewritten; audio capture matches the
+trapping build (same loudness profile, no clipping). The game thread's
+exception share only went from 3.7% to 3.4%: most APU traffic is
+register-relative. Off by default; full test suite passes.
+---
+ src/kernel/xbox_memory_layout.c  | 25 +++++++++++++++++++++++++
+ templates/runtime/recomp_types.h |  5 +++++
+ tools/recomp/__main__.py         |  6 ++++++
+ tools/recomp/test_direct_mmio.py | 21 +++++++++++++++++++++
+ tools/recomp/translator.py       | 26 ++++++++++++++++++++++++++
+ 5 files changed, 83 insertions(+)
+ create mode 100644 tools/recomp/test_direct_mmio.py
+
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 096841f..8bc848d 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1014,6 +1014,31 @@ static void *g_mcpx_regs = NULL;
+  * counter ticking below must leave them alone -- writing through the pointer
+  * faults, and the emulated APU owns those registers anyway. */
+ static int g_apu_mmio_trapped = 0;
++/* The trapped part of the APU window (MemoryLayoutInit; the GP/EP DSP memory
++ * above it stays plain RAM). */
++#define XBOX_APU_TRAP_BYTES 0x00030000u
++
++/* A 32-bit register access the recompiler resolved at translation time
++ * (--direct-mmio: `mov [0xFE82xxxx], reg` with an absolute address). Trapped
++ * APU registers go straight to the model -- the same mcpx_apu_mmio_* the fault
++ * handler would reach, without a host exception per access (DirectSound's
++ * per-voice updates were ~7% of Counter-Strike's game thread in exception
++ * dispatch). Anything else is the plain memory access the instruction was. */
++uint32_t xbox_MmioRead32(uint32_t va)
++{
++    if (g_apu_mmio_trapped && g_apu_state && va - XBOX_MCPX_BASE < XBOX_APU_TRAP_BYTES)
++        return (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - XBOX_MCPX_BASE, 4);
++    return *(volatile uint32_t *)((uintptr_t)va + g_memory_offset);
++}
++
++void xbox_MmioWrite32(uint32_t va, uint32_t v)
++{
++    if (g_apu_mmio_trapped && g_apu_state && va - XBOX_MCPX_BASE < XBOX_APU_TRAP_BYTES) {
++        mcpx_apu_mmio_write(g_apu_state, va - XBOX_MCPX_BASE, v, 4);
++        return;
++    }
++    *(volatile uint32_t *)((uintptr_t)va + g_memory_offset) = v;
++}
+ 
+ /*
+  * GPU completion fences the title waits on in guest memory rather than in the
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 3bbb8e0..92fbb8b 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -583,6 +583,11 @@ uint64_t xbox_ReadTimeStampCounter(void);
+  * the ports titles are known to read (the field pin at 0x80C0) and logs the
+  * first access to any other. */
+ uint32_t xbox_PortIn(uint32_t port, int width);
++/* Hardware registers named by absolute address, resolved at translation time
++ * (--direct-mmio): a trapped APU register reaches the model without a host
++ * exception; anything else is a plain access. kernel/xbox_memory_layout.c. */
++uint32_t xbox_MmioRead32(uint32_t va);
++void     xbox_MmioWrite32(uint32_t va, uint32_t value);
+ void     xbox_PortOut(uint32_t port, uint32_t value, int width);
+ 
+ void recomp_trace_enter(const char *name, uint32_t va);
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index a06b444..bb2ec71 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -293,6 +293,11 @@ def main():
+                              "build defines RECOMP_REG_PROMOTE, so one generated "
+                              "tree builds either way. Off by default: output is "
+                              "unchanged")
++    parser.add_argument("--direct-mmio", action="store_true",
++                        help="Route 32-bit loads/stores to absolute APU register "
++                             "addresses (0xFE800000-0xFE87FFFF) through "
++                             "xbox_MmioRead32/Write32 instead of the trapped "
++                             "page: no host exception per access. Off by default")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -307,6 +312,7 @@ def main():
+                                     if args.exclude_manual else set())
+     from . import lifter as lifter_module
+     translator_module.PROMOTE_REGS = lifter_module.PROMOTE_REGS = args.promote_regs
++    translator_module.DIRECT_MMIO = args.direct_mmio
+ 
+     # Boundary repair is destructive: an interior function start disappears
+     # once it is coalesced into its owner. Load hand-written entry points before
+diff --git a/tools/recomp/test_direct_mmio.py b/tools/recomp/test_direct_mmio.py
+new file mode 100644
+index 0000000..8ee2a66
+--- /dev/null
++++ b/tools/recomp/test_direct_mmio.py
+@@ -0,0 +1,21 @@
++"""--direct-mmio: absolute APU register accesses call the runtime instead of
++touching the trapped page; everything else is left alone."""
++from tools.recomp.translator import _direct_mmio
++
++
++def test_store_and_load_rewritten():
++    out = _direct_mmio([
++        "    MEM32(0xFE820314u) = edi; /* mov [0xfe820314], edi */",
++        "    eax = MEM32(0xFE82036Cu);",
++    ])
++    assert out[0] == "    xbox_MmioWrite32(0xFE820314u, edi); /* mov [0xfe820314], edi */"
++    assert out[1] == "    eax = xbox_MmioRead32(0xFE82036Cu);"
++
++
++def test_constants_and_other_addresses_untouched():
++    src = [
++        "    MEM32(esi + 8) = 0xFE820000u;",
++        "    MEM32(0x00FE8203u) = eax;",
++        "    MEM32(0xFD600800u) = eax;",
++    ]
++    assert _direct_mmio(src) == src
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index f3d5c6f..4a10318 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -232,6 +232,30 @@ def _is_safe_icall(line):
+ # call under a bare `if (...)` stays one statement. Without the define the
+ # macros are no-ops and the output is equivalent to the unpromoted code.
+ PROMOTE_REGS = False      # set by __main__ from --promote-regs
++DIRECT_MMIO = False       # set by __main__ from --direct-mmio
++
++# --direct-mmio: a 32-bit load or store whose address is an absolute constant in
++# the MCPX APU register window (0xFE800000-0xFE87FFFF) calls the runtime instead
++# of touching the trapped page, so it reaches the APU model without a host
++# exception (xbox_MmioRead32/Write32 fall back to a plain access for anything
++# not trapped). Only the plain `MEM32(0xFE8xxxxxu) = v;` and `MEM32(0xFE8xxxxxu)`
++# read forms are rewritten; register-relative accesses still trap.
++_MMIO_STORE = __import__("re").compile(r"MEM32\((0xFE8[0-7][0-9A-Fa-f]{4})u?\) = ([^;]+);")
++_MMIO_LOAD = __import__("re").compile(r"MEM32\((0xFE8[0-7][0-9A-Fa-f]{4})u?\)")
++
++
++def _direct_mmio(lines):
++    out = []
++    for line in lines:
++        if "0xFE8" not in line and "0xfe8" not in line:
++            out.append(line)
++            continue
++        i = line.find("/*")
++        code, comment = (line, "") if i < 0 else (line[:i], line[i:])
++        code = _MMIO_STORE.sub(lambda m: f"xbox_MmioWrite32({m.group(1)}u, {m.group(2)});", code)
++        code = _MMIO_LOAD.sub(lambda m: f"xbox_MmioRead32({m.group(1)}u)", code)
++        out.append(code + comment)
++    return out
+ _PROMOTE_CALL_MACROS = ("RECOMP_ABI_CALL(", "RECOMP_ICALL_SAFE_AT_CC(",
+                         "RECOMP_ICALL_SAFE_AT(", "RECOMP_ICALL_SAFE_CC(",
+                         "RECOMP_ICALL_SAFE(", "RECOMP_ICALL(", "RECOMP_ITAIL(")
+@@ -3577,6 +3601,8 @@ class FunctionTranslator:
+         # the entry load (inert unless RECOMP_REG_PROMOTE is defined).
+         if PROMOTE_REGS:
+             lines = _promote_regs(lines)
++        if DIRECT_MMIO:
++            lines = _direct_mmio(lines)
+ 
+         # Validate: comment out goto targets that reference missing labels
+         # (dead code after unconditional jumps may reference non-existent labels)
+-- 
+2.51.0.windows.2
+

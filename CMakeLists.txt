@@ -36,6 +36,13 @@ set(GAME_SOURCES
     src/cs_launch.c
 )
 
+option(CS_GEN_INLINE "MSVC: /Ob2 /GS- for the generated code (measured: no gain)" OFF)
+if(MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CS_GEN_INLINE)
+    # RelWithDebInfo is /Ob1 (explicit inline only); translated functions are
+    # wall-to-wall small helpers. /GS- drops the per-call stack cookie: the
+    # generated code's own stack is the guest's, in guest memory.
+    set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS /Ob2 /GS-)
+endif()
 # Register promotion in the generated code (pipeline --promote-regs emits the
 # hooks; see RECOMP_REG_PROMOTE in recomp_types.h): translated functions keep
 # the guest registers in locals between calls instead of thread-local memory.
@@ -78,5 +85,5 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
     # type punning that strict aliasing could break. Generated sources only:
     # the hand-written runtime is left with clang-cl's MSVC-like default.
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "/clang:-fstrict-aliasing;/clang:-fno-ms-tls-guards;-Wno-everything")
+        COMPILE_OPTIONS "/clang:-fstrict-aliasing;/clang:-fms-compatibility-version=19.20;-Wno-everything")
 endif()
