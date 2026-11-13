@@ -34,7 +34,8 @@
  *   RECOMP_CS_CULL=0       ignore the title's cull state
  *   RECOMP_CS_NO_ALPHA=1   ignore the title's alpha-test state (debug)
  *   RECOMP_CS_FORCE_A1=1   force combiner output alpha to 1 (debug)
- *   RECOMP_CS_ALPHA_LIFT=0 disable zero-alpha lift (default on; workaround)
+ *   RECOMP_CS_ALPHA_LIFT=1 lift zero vertex alpha to 1 (old workaround; default off: it made
+ *                          hidden glow sprites opaque -- the white/cyan blob)
  *   RECOMP_CS_WORLD_TRACE=1  one in-game frame: log every 3D batch (default off)
  */
 #define COBJMACROS
@@ -53,6 +54,7 @@
 #include "d3d/d3d8_swizzle.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern const float *nv2a_vsh_constant(uint32_t index);   /* kernel/nv2a_vsh_interp.c */
 
 #define MAX_RT   8
 #define MAX_DS   4
@@ -97,6 +99,7 @@ typedef struct {
     uint32_t textured, afunc;
     float aref;
     uint32_t opaque;
+    uint32_t dbg, pad[3];          /* RECOMP_CS_RC_DEBUG (combiner draws only) */
 } Cb;
 
 static const char s_hlsl[] =
@@ -126,12 +129,12 @@ static const char s_hlsl[] =
  * pinned toolkit (checked against nv2a_combiner.c); the same interpreter is
  * used by the other xboxrecomp D3D11 back ends on this PC. */
 static const char s_hlsl_rc[] =
-"cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint opaque; };\n"
+"cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint opaque; uint dbg; uint3 pad; };\n"
 "cbuffer RC : register(b1) {\n"
 "  uint4 hdr;      // control, stage_program, final0, final1\n"
 "  uint4 hdr2;     // final_c0, final_c1, clip-plane mode, clip-plane stage present\n"
 "  float4 fogc;    // fog colour rgb\n"
-"  float4 uvs[4];  // xy: scale from the title's coordinate to normalised uv; z: stage texture valid\n"
+"  float4 uvs[4];  // xy: scale to normalised uv; z: stage texture valid; w: wrap in the shader (both axes WRAP)\n"
 "  uint4 stg[16];  // [2s] colour icw, alpha icw, colour ocw, alpha ocw; [2s+1] factor0, factor1\n"
 "};\n"
 "Texture2D tx0 : register(t0); Texture2D tx1 : register(t1); Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
@@ -169,10 +172,10 @@ static const char s_hlsl_rc[] =
 "  uint n = hdr.x & 255u, flags = hdr.x >> 8, sp = hdr.y, s, k;\n"
 "  float4 out4;\n"
 "  tcs[0] = i.t0; tcs[1] = i.t1; tcs[2] = i.t2; tcs[3] = i.t3;\n"
-"  smp[0] = tx0.Sample(sm0, tcs[0].xy / ((tcs[0].w != 0.0) ? tcs[0].w : 1.0) * uvs[0].xy);\n"
-"  smp[1] = tx1.Sample(sm1, tcs[1].xy / ((tcs[1].w != 0.0) ? tcs[1].w : 1.0) * uvs[1].xy);\n"
-"  smp[2] = tx2.Sample(sm2, tcs[2].xy / ((tcs[2].w != 0.0) ? tcs[2].w : 1.0) * uvs[2].xy);\n"
-"  smp[3] = tx3.Sample(sm3, tcs[3].xy / ((tcs[3].w != 0.0) ? tcs[3].w : 1.0) * uvs[3].xy);\n"
+"  { float2 c = tcs[0].xy / ((tcs[0].w != 0.0) ? tcs[0].w : 1.0) * uvs[0].xy; if (uvs[0].w != 0.0) c = frac(c); smp[0] = tx0.Sample(sm0, c); }\n"
+"  { float2 c = tcs[1].xy / ((tcs[1].w != 0.0) ? tcs[1].w : 1.0) * uvs[1].xy; if (uvs[1].w != 0.0) c = frac(c); smp[1] = tx1.Sample(sm1, c); }\n"
+"  { float2 c = tcs[2].xy / ((tcs[2].w != 0.0) ? tcs[2].w : 1.0) * uvs[2].xy; if (uvs[2].w != 0.0) c = frac(c); smp[2] = tx2.Sample(sm2, c); }\n"
+"  { float2 c = tcs[3].xy / ((tcs[3].w != 0.0) ? tcs[3].w : 1.0) * uvs[3].xy; if (uvs[3].w != 0.0) c = frac(c); smp[3] = tx3.Sample(sm3, c); }\n"
 "  if (n > 8u) n = 8u;\n"
 "  [unroll] for (k = 0u; k < 16u; k++) R[k] = float4(0, 0, 0, 0);\n"
 "  R[3] = float4(fogc.rgb, i.fog); R[4] = i.c; R[5] = i.d1;\n"
@@ -217,6 +220,12 @@ static const char s_hlsl_rc[] =
 "  } else { out4 = R[12]; }\n"
 "  out4 = saturate(out4);\n"
 "  if (opaque != 0u) out4.a = 1.0;\n"
+"  if (dbg != 0u) {   // RECOMP_CS_RC_DEBUG: show one input instead of the result\n"
+"    if (dbg <= 4u) out4 = float4(smp[dbg - 1u].rgb, 1.0); else if (dbg == 5u) out4 = float4(i.c.rgb, 1.0);\n"
+"    else if (dbg == 6u) out4 = float4(i.c.aaa, 1.0); else if (dbg == 7u) out4 = float4(smp[0].aaa, 1.0);\n"
+"    else if (dbg == 8u) out4 = float4(frac(tcs[0].xy / ((tcs[0].w != 0.0) ? tcs[0].w : 1.0) * uvs[0].xy), 0.0, 1.0);\n"
+"    else if (dbg == 9u) out4 = float4(frac(tcs[1].xy / ((tcs[1].w != 0.0) ? tcs[1].w : 1.0) * uvs[1].xy), 0.0, 1.0);\n"
+"    return out4; }\n"
 "  { int a = (int)(out4.a * 255.0 + 0.5); int r = (int)(aref + 0.5); bool ok = true;\n"
 "    if (afunc == 0x200u) ok = false; else if (afunc == 0x201u) ok = a < r; else if (afunc == 0x202u) ok = a == r;\n"
 "    else if (afunc == 0x203u) ok = a <= r; else if (afunc == 0x204u) ok = a > r; else if (afunc == 0x205u) ok = a != r;\n"
@@ -250,6 +259,9 @@ static StateEnt s_bs[96], s_dss[96], s_ss[48];
 static int s_nbs, s_ndss, s_nss;
 
 static uint32_t s_fr_draws, s_fr_tris;   /* this frame, for RECOMP_CS_FRAME_CSV */
+static int s_dump_now;                    /* the RECOMP_CS_DUMP flag was up at the last present */
+static float s_pick_x, s_pick_y;          /* RECOMP_CS_PICK point */
+static int s_pick_hit;                    /* this draw covers it: read the pixel back after drawing */
 /* RECOMP_CS_FLASH=<dir>: every draw of the current and previous frame, kept so
  * that a frame which comes out (almost) all black after a normal one can be
  * explained: both draw lists go to stderr and the frame's targets to <dir>. */
@@ -267,7 +279,7 @@ static const char *s_flash_dir;
 static int s_inited, s_failed;
 static uint32_t s_frame, s_tick;
 static int s_cull_on = 1, s_log, s_world_trace, s_no_alpha, s_force_a1;
-static int s_alpha_lift = 1;
+static int s_alpha_lift = 0;
 static float s_pixofs;
 static unsigned st_draws, st_tris, st_culled, st_clears, st_flips, st_decodes, st_rtsamples,
                 st_bad_tex, st_decode_fail, st_rb, st_vb_drop;
@@ -362,12 +374,12 @@ static int cs_ready(void)
         const char *e;
         s_inited = 1;
         s_log = getenv("RECOMP_CS_D3D11_LOG") != NULL;
-        s_world_trace = getenv("RECOMP_CS_WORLD_TRACE") != NULL;
+        { const char *w = getenv("RECOMP_CS_WORLD_TRACE"); s_world_trace = w ? (atoi(w) > 1 ? atoi(w) : 600) : 0; }   /* value = frame to arm at */
         s_no_alpha = getenv("RECOMP_CS_NO_ALPHA") != NULL;
         s_force_a1 = getenv("RECOMP_CS_FORCE_A1") != NULL;
         /* Workaround for toolkit diffuse.a=0; remove when patch 0005 lands.
-         * Default on; RECOMP_CS_ALPHA_LIFT=0 disables. */
-        if ((e = getenv("RECOMP_CS_ALPHA_LIFT")) && e[0] == '0') s_alpha_lift = 0;
+         * Default off since the toolkit material-alpha fixes; RECOMP_CS_ALPHA_LIFT=1 enables. */
+        if ((e = getenv("RECOMP_CS_ALPHA_LIFT")) && *e) s_alpha_lift = e[0] != '0';
         if ((e = getenv("RECOMP_CS_CULL")) && e[0] == '0') s_cull_on = 0;
         s_pixofs = (e = getenv("RECOMP_CS_PIXOFS")) ? (float)atof(e) : 0.0f;
         if (!cs_d3d11_setup()) { s_failed = 1; fprintf(stderr, "[CS-D3D11] init failed; no GPU drawing\n"); return 0; }
@@ -712,6 +724,39 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
             free(argb);
             return s_white_srv;
         }
+        {   /* RECOMP_CS_TEXDUMP=<dir>: every decoded texture (first 400) as a BMP */
+            static const char *tdir = (const char *)-1;
+            static unsigned tn;
+            if (tdir == (const char *)-1) tdir = getenv("RECOMP_CS_TEXDUMP");
+            if (tdir && tn < 400 && t->width <= 1024 && t->height <= 1024) {
+                char path[MAX_PATH];
+                FILE *f;
+                uint32_t row = (t->width * 3 + 3) & ~3u, sz = 54 + row * t->height, yy, xx;
+                uint8_t hdr[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(1, row);
+                int32_t nh = -(int32_t)t->height;
+                size_t np = (size_t)t->width * t->height, kk, a0 = 0, aff = 0;
+                tn++;
+                for (kk = 0; kk < np; kk++) { if ((argb[kk] >> 24) == 0) a0++; else if ((argb[kk] >> 24) == 0xFF) aff++; }
+                /* name carries the alpha mix: % of texels with alpha 0 and with alpha 255 */
+                snprintf(path, sizeof path, "%s\\tex_%08X_fmt%02X_%ux%u_a0-%u_aff-%u.bmp", tdir, t->offset, t->color, t->width, t->height,
+                         (unsigned)(a0 * 100 / np), (unsigned)(aff * 100 / np));
+                f = fopen(path, "wb");
+                if (f && line) {
+                    memcpy(hdr + 2, &sz, 4); hdr[10] = 54; hdr[14] = 40;
+                    memcpy(hdr + 18, &t->width, 4); memcpy(hdr + 22, &nh, 4); hdr[26] = 1; hdr[28] = 24;
+                    fwrite(hdr, 1, 54, f);
+                    for (yy = 0; yy < t->height; yy++) {
+                        for (xx = 0; xx < t->width; xx++) {
+                            uint32_t c = argb[(size_t)yy * t->width + xx];
+                            line[xx * 3] = (uint8_t)c; line[xx * 3 + 1] = (uint8_t)(c >> 8); line[xx * 3 + 2] = (uint8_t)(c >> 16);
+                        }
+                        fwrite(line, 1, row, f);
+                    }
+                }
+                if (f) fclose(f);
+                free(line);
+            }
+        }
         if (tex_is_opaque_fmt(t->color)) {           /* no alpha channel: alpha is 1 */
             size_t k, np = (size_t)t->width * t->height;
             for (k = 0; k < np; k++) argb[k] |= 0xFF000000u;
@@ -854,6 +899,48 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)vb, 0);
 
+    /* RECOMP_CS_PICK=x,y[,frame]: in one frame (default 700), name every
+     * depth-tested draw with a triangle covering surface pixel (x,y) -- which
+     * draw paints a spot, with its combiner, stage textures and coordinates. */
+    {
+        static int pk = -1;
+        float px, py;
+        static unsigned pframe = 700, plines;
+        if (pk < 0) {
+            const char *e = getenv("RECOMP_CS_PICK");
+            pframe = 0;   /* default: the frames dumped by RECOMP_CS_DUMP (probe -DumpAt) */
+            pk = (e && sscanf(e, "%f,%f,%u", &s_pick_x, &s_pick_y, &pframe) >= 2) ? 1 : 0;
+        }
+        px = s_pick_x; py = s_pick_y;
+        s_pick_hit = 0;
+        if (pk && (pframe ? s_frame == pframe : s_dump_now) && plines < 80) {
+            uint32_t q;
+            for (q = 0; q + 2 < b->count; q += 3) {
+                const Nv2aVertex *a = &b->vertices[q], *bb = &b->vertices[q + 1], *c = &b->vertices[q + 2];
+                float d1 = (bb->x - a->x) * (py - a->y) - (bb->y - a->y) * (px - a->x);
+                float d2 = (c->x - bb->x) * (py - bb->y) - (c->y - bb->y) * (px - bb->x);
+                float d3 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
+                if ((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0)) {
+                    int st;
+                    plines++;
+                    s_pick_hit = 1;
+                    fprintf(stderr, "[PICK] f%u draw n=%u tri#%u rt=%08X z=%.0f c=%08X bl=%u %X/%X at=%u/%X/%u dt=%u/%X/%u rc=%s ctrl=%08X sp=%08X cicw0=%08X tex=%08X fmt=%02X %ux%u\n",
+                            s_frame, b->count, q / 3, s->color_va, a->z, a->diffuse, r->blend_enable, r->blend_src, r->blend_dst,
+                            r->alpha_test_enable, r->alpha_func, r->alpha_ref, r->depth_test_enable, r->depth_func, r->depth_write,
+                            b->combiner ? "yes" : "no", b->combiner ? b->combiner->control : 0, b->combiner ? b->combiner->stage_program : 0,
+                            b->combiner ? b->combiner->color_icw[0] : 0, b->texture ? b->texture->offset : 0,
+                            b->texture ? b->texture->color : 0, b->texture ? b->texture->width : 0, b->texture ? b->texture->height : 0);
+                    for (st = 0; b->stages && st < 3; st++)
+                        fprintf(stderr, "[PICK]    st%d fmt=%02X %ux%u off=%08X addr=%u/%u filt=%08X uv=(%.3f,%.3f)(%.3f,%.3f)(%.3f,%.3f)\n", st,
+                                b->stages[st].color, b->stages[st].width, b->stages[st].height, b->stages[st].offset,
+                                b->stages[st].addr_u, b->stages[st].addr_v, b->stages[st].filter,
+                                a->tex[st][0], a->tex[st][1], bb->tex[st][0], bb->tex[st][1], c->tex[st][0], c->tex[st][1]);
+                    break;
+                }
+            }
+        }
+    }
+
     /* RECOMP_CS_WORLD_TRACE=1: dump every 3D batch for one in-game frame.
      * Arm on the first depth-tested, non-UI (z>1) combiner batch after the
      * loading screen (frame>=600). */
@@ -862,7 +949,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         float xmin = 1e30f, xmax = -1e30f, ymin = 1e30f, ymax = -1e30f;
         float zmin = 1e30f, zmax = -1e30f, rmin = 1e30f, rmax = -1e30f;
         uint32_t j, culled_here = (b->count / 3) - (kept / 3);
-        if (!wt_armed && s_frame >= 600u && r->depth_test_enable && b->vertices[0].z > 1.0f && b->count >= 30u) {
+        if (!wt_armed && s_frame >= (uint32_t)s_world_trace && r->depth_test_enable && b->vertices[0].z > 1.0f && b->count >= 30u) {
             wt_armed = 1; wt_frame = s_frame;
             fprintf(stderr, "[CS-WORLD] armed at frame %u n=%u\n", s_frame, b->count);
         }
@@ -889,6 +976,53 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                     b->stage_valid, b->combiner->control,
                     b->combiner->color_icw[0], b->combiner->color_ocw[0],
                     b->combiner->alpha_icw[0], b->combiner->alpha_ocw[0]);
+            {
+                uint32_t k;
+                for (k = 1; k < (b->combiner->control & 0xFFu) && k < 8; k++)
+                    fprintf(stderr, "[CS-WORLD]   rc%u cicw=%08X cocw=%08X aicw=%08X aocw=%08X k0=%08X k1=%08X\n", k,
+                            b->combiner->color_icw[k], b->combiner->color_ocw[k], b->combiner->alpha_icw[k],
+                            b->combiner->alpha_ocw[k], b->combiner->factor0[k], b->combiner->factor1[k]);
+                {   /* first vertices of a 3-stage (world) batch: screen position, base and lightmap coordinates */
+                    uint32_t q;
+                    if ((b->combiner->control & 0xFFu) >= 3u)
+                        for (q = 0; q < b->count && q < 9; q++)
+                            fprintf(stderr, "[CS-WORLD]     vtx%u xy=(%.1f,%.1f) t0=(%.4f,%.4f,%.3f,%.3f) t1=(%.4f,%.4f) c=%08X\n", q,
+                                    b->vertices[q].x, b->vertices[q].y, b->vertices[q].tex[0][0], b->vertices[q].tex[0][1],
+                                    b->vertices[q].tex[0][2], b->vertices[q].tex[0][3], b->vertices[q].tex[1][0], b->vertices[q].tex[1][1],
+                                    b->vertices[q].diffuse);
+                    if ((b->combiner->control & 0xFFu) >= 3u) {   /* the world program's constants c[96..106] */
+                        uint32_t ci;
+                        {   /* where in guest RAM does c[105]'s value (and c[98]'s) live? */
+                            static int searched;
+                            const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+                            uint32_t which, a, hits;
+                            if (!searched) {
+                                searched = 1;
+                                for (which = 98; which <= 105; which += 7) {
+                                    const float *cv = nv2a_vsh_constant(which);
+                                    hits = 0;
+                                    for (a = 0x10000; a + 16 <= 0x04000000u && hits < 12; a += 4)
+                                        if (!memcmp(gm + a, cv, 16)) {
+                                            fprintf(stderr, "[CS-WORLD]     c[%u] value found in guest RAM at %08X\n", which, a);
+                                            hits++;
+                                        }
+                                    if (!hits) fprintf(stderr, "[CS-WORLD]     c[%u] value not in guest RAM\n", which);
+                                }
+                            }
+                        }
+                        for (ci = 96; ci <= 106; ci++) {
+                            const float *cv = nv2a_vsh_constant(ci);
+                            fprintf(stderr, "[CS-WORLD]     c[%u] = %g %g %g %g  (t2 of vtx0 %g %g)\n", ci, cv[0], cv[1], cv[2], cv[3],
+                                    b->vertices[0].tex[2][0], b->vertices[0].tex[2][1]);
+                        }
+                    }
+                }
+                fprintf(stderr, "[CS-WORLD]   rc0 k0=%08X k1=%08X fc0=%08X fc1=%08X v0=(%g,%g,%g,%g) c=%08X t0=(%g,%g,%g,%g) t1=(%g,%g,%g,%g)\n",
+                        b->combiner->factor0[0], b->combiner->factor1[0], b->combiner->final_c0, b->combiner->final_c1,
+                        b->vertices[0].x, b->vertices[0].y, b->vertices[0].z, b->vertices[0].rhw, b->vertices[0].diffuse,
+                        b->vertices[0].tex[0][0], b->vertices[0].tex[0][1], b->vertices[0].tex[0][2], b->vertices[0].tex[0][3],
+                        b->vertices[0].tex[1][0], b->vertices[0].tex[1][1], b->vertices[0].tex[1][2], b->vertices[0].tex[1][3]);
+            }
             if (b->stages) {
                 int st;
                 for (st = 0; st < 4; st++) {
@@ -916,6 +1050,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
     }
     if (s_force_a1) cb.opaque = 1u;
+    { static int dbg = -1; if (dbg < 0) { const char *e = getenv("RECOMP_CS_RC_DEBUG"); dbg = e ? atoi(e) : 0; } cb.dbg = r->depth_test_enable ? (uint32_t)dbg : 0u; }
     if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
 
     if (b->combiner && b->stages) {            /* 3D path: register combiners */
@@ -941,6 +1076,11 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             srvs[st] = s_white_srv;
             smps[st] = get_sampler(&dflt);
             rcb.uvs[st][0] = rcb.uvs[st][1] = 1.0f;
+            /* WRAP on both axes: wrap the coordinate in the shader (frac), as the
+             * NV2A and the CPU rasteriser do exactly. CS's world detail stage
+             * arrives with coordinates near +-1e6, where GPU texture units keep
+             * no fractional precision and return a constant (dark) texel. */
+            rcb.uvs[st][3] = (t->addr_u == 1 && t->addr_v == 1) ? 1.0f : 0.0f;
             if ((mode == 1 || mode == 2) && (b->stage_valid & (1u << st))) {
                 srvs[st] = get_tex(t, &op);
                 smps[st] = get_sampler(t);
@@ -991,6 +1131,27 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &smp);
     }
     ID3D11DeviceContext_Draw(s_ctx, kept, s_vb_off / (UINT)sizeof(Nv2aVertex));
+    if (s_pick_hit) {   /* RECOMP_CS_PICK: the pixel's value after this draw */
+        static ID3D11Texture2D *one;
+        D3D11_MAPPED_SUBRESOURCE pm;
+        D3D11_BOX box;
+        if (!one) {
+            D3D11_TEXTURE2D_DESC td;
+            memset(&td, 0, sizeof td);
+            td.Width = td.Height = 1; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &one);
+        }
+        box.left = (UINT)s_pick_x; box.top = (UINT)s_pick_y; box.right = box.left + 1; box.bottom = box.top + 1; box.front = 0; box.back = 1;
+        if (one && box.right <= rt->w && box.bottom <= rt->h) {
+            ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)one, 0, 0, 0, 0, (ID3D11Resource *)rt->tex, 0, &box);
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)one, 0, D3D11_MAP_READ, 0, &pm))) {
+                fprintf(stderr, "[PICK]    -> pixel now %08X\n", *(const uint32_t *)pm.pData);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)one, 0);
+            }
+        }
+        s_pick_hit = 0;
+    }
     s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
     rt->dirty = 1;
     st_draws++; st_tris += kept / 3;
@@ -1135,6 +1296,7 @@ static void cs_present_sync(void)
         snprintf(flag, sizeof flag, "%s\\dump.flag", dump_dir);
         dumping = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
     }
+    s_dump_now = dumping;
     for (i = 0; i < MAX_RT; i++) {
         Rt *rt = &s_rt[i];
         if (!rt->tex || !rt->dirty) continue;
