@@ -1,0 +1,86 @@
+From 66f38d1914851faeefa2669b06745c0dff7ef25f Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Thu, 12 Nov 2026 21:00:00 -0800
+Subject: [PATCH] pb_exec: post-transform vertex cache per batch
+ (CounterStrikeXB2 local patch)
+
+An indexed batch names most vertices several times, and each repeat ran the
+whole vertex program (or fixed-function transform) again. Within a batch the
+inputs, constants and program are fixed, so the same index gives the same
+output; a direct-mapped cache keyed by index, emptied per batch by a
+generation tag, reuses it. Skipped while the program may write constants
+(CXT_WRITE). RECOMP_VSH_CACHE=0 turns it off. Counter-Strike's Airstrip goes
+from ~30 to ~35 guest frames per second with identical frames.
+---
+ src/kernel/nv2a_pb_exec.c    | 29 ++++++++++++++++++++++++++---
+ src/kernel/nv2a_vsh_interp.c |  1 +
+ src/kernel/nv2a_vsh_interp.h |  1 +
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 431c2e7..09e4b54 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -3569,9 +3569,32 @@ static void raster_batch_program(void)
+ 
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+-    for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+-            return;                                    /* no program loaded */
++    {
++        /* A post-transform cache, as the GPU has one: an indexed batch names
++         * most vertices several times (a shared vertex once per triangle), and
++         * each repeat ran the whole program again. Within one batch the
++         * inputs, constants and program are fixed, so the same index gives the
++         * same output -- unless the program writes constants (CXT_WRITE),
++         * which then run every time. Direct-mapped by index; a generation tag
++         * empties it per batch. RECOMP_VSH_CACHE=0 turns it off. */
++        static uint32_t key[4096], slot[4096], tag[4096], gen;
++        static int on = -1;
++        if (on < 0) {
++            const char *e = getenv("RECOMP_VSH_CACHE");
++            on = !(e && e[0] == '0');
++        }
++        if (++gen == 0) { memset(tag, 0, sizeof tag); gen = 1; }
++        for (i = 0; i < n; i++) {
++            uint32_t ix = s_gpu.idx[i], h = (ix * 2654435761u) >> 20;
++            if (on && tag[h] == gen && key[h] == ix && !nv2a_vsh_cxt_write()) {
++                s_xf[i] = s_xf[slot[h]];
++                continue;
++            }
++            if (!transform_vertex(ix, &s_xf[i]))
++                return;                                /* no program loaded */
++            key[h] = ix; slot[h] = i; tag[h] = gen;
++        }
++    }
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index bde3f3c..0d52589 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -84,6 +84,7 @@ void nv2a_vsh_set_start_slot(uint32_t slot)
+     }
+ }
+ void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
++uint32_t nv2a_vsh_cxt_write(void) { return s_cxt_write; }
+ 
+ void nv2a_vsh_set_constant_load(uint32_t index)
+ {
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 1aed7a3..0a68f6e 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -43,6 +43,7 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
+ void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
+ uint32_t nv2a_vsh_constant_word(uint32_t word);       /* _CONSTANT(i): written slot */
+ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
++uint32_t nv2a_vsh_cxt_write(void);                    /* programs may write c[] */
+ 
+ /* Run the program from the start slot on one vertex. Inputs are the ten
+  * attribute values as floats. Returns 0 if there is no program to run (no
+-- 
+2.51.0.windows.2
+

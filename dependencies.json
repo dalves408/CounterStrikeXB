@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "e0ce5e611b7ecc121c16ac0409e0962439eb1425",
+                       "commit":  "66f38d1914851faeefa2669b06745c0dff7ef25f",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -17,7 +17,8 @@
                                              "patches/xboxrecomp/0010-nv2a_backend-pass-register-combiners-texture-stages.patch",
                                              "patches/xboxrecomp/0011-nv2a-material-alpha-default-and-sz_r8g8b8a8-twin.patch",
                                              "patches/xboxrecomp/0012-pb_scan-follow-the-jump-when-the-ring-wraps.patch",
-                                             "patches/xboxrecomp/0013-pb_exec-apu-skip-cpu-raster-work-under-a-back-end.patch"
+                                             "patches/xboxrecomp/0013-pb_exec-apu-skip-cpu-raster-work-under-a-back-end.patch",
+                                             "patches/xboxrecomp/0014-pb_exec-post-transform-vertex-cache-per-batch.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",
