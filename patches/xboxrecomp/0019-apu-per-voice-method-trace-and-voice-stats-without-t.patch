@@ -1,0 +1,89 @@
+From 4b100ad12868e52cca91dd6aab551430747aa0ec Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] apu: per-voice method trace and voice stats without the
+ register trace (CounterStrikeXB2 local patch)
+
+RECOMP_APU_VTRACE=<voice> logs every front-end method that touches one voice
+(its handle in the argument, or it is the current voice), its idle traps and
+the voice processor reaching an empty SSL, with the stream's SSL state.
+RECOMP_APU_VSTAT turns on the per-voice [APU-VSTAT] lines alone; until now they
+came only with RECOMP_APU_TRACE, whose log of every APU access changes timing
+enough to hide a race. Both off by default (one compare per method).
+
+Used to follow Counter-Strike's intro-movie stream through an underrun; the
+stream turned out to be a symptom (the movie decoder had stopped first).
+---
+ src/apu/apu_vp.c | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index bbbd2bc..843379e 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -190,10 +190,41 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
+  * Front-End method dispatch
+  * ============================================================ */
+ 
++/* RECOMP_APU_VTRACE=<voice>: every front-end method that touches that voice
++ * (its handle in the argument, or it is the current voice), its idle traps and
++ * the voice processor reaching an empty SSL, with the stream's SSL state --
++ * for a stream that stops after an underrun. Off: one compare per method. */
++static int s_vtrace_voice = -2;
++
++static int vtrace_voice(void)
++{
++    if (s_vtrace_voice == -2) {
++        const char *e = getenv("RECOMP_APU_VTRACE");
++        s_vtrace_voice = (e && *e) ? atoi(e) : -1;
++    }
++    return s_vtrace_voice;
++}
++
++static void vtrace(MCPXAPUState *d, const char *what, uint32_t method, uint32_t argument, uint16_t v)
++{
++    fprintf(stderr, "[APU-VT] %.1f ms %s meth=%04X arg=%08X v=%u active=%u ssl idx=%d seg=%d count=%d/%d\n",
++            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1e6, what, method, argument, (unsigned)v,
++            (unsigned)voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
++            d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg,
++            d->vp.ssl[v].count[0], d->vp.ssl[v].count[1]);
++}
++
+ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ {
+     unsigned int slot;
+ 
++    {
++        int tv = vtrace_voice();
++        if (tv >= 0 && ((d->regs[NV_PAPU_FECV] & 0xFFFF) == (uint32_t)tv
++                        || (argument & 0xFFFF) == (uint32_t)tv))
++            vtrace(d, method == SE2FE_IDLE_VOICE ? "idle-trap" : "method", method, argument, (uint16_t)tv);
++    }
++
+     d->regs[NV_PAPU_FEDECMETH] = method;
+     d->regs[NV_PAPU_FEDECPARAM] = argument;
+     unsigned int selected_handle, list;
+@@ -775,7 +806,10 @@ static unsigned s_vstat_frames, s_vstat_secs;
+ static void vp_stat_init(void)
+ {
+     const char *e;
+-    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
++    /* RECOMP_APU_VSTAT: these per-voice lines alone, without the register
++     * trace RECOMP_APU_TRACE adds (which logs every APU access and changes
++     * timing enough to hide a race). */
++    s_vstat_on = apu_env_on("RECOMP_APU_TRACE") || apu_env_on("RECOMP_APU_VSTAT");
+     e = getenv("RECOMP_APU_VOICE_DUMP");
+     if (e && *e) {
+         const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+@@ -1142,6 +1176,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+         count = d->vp.ssl[v].count[ssl_index];
+ 
+         if (count == 0) {
++            if (vtrace_voice() == (int)v)
++                vtrace(d, persist ? "ssl-empty(persist)" : "ssl-empty->off", 0, 0, (uint16_t)v);
+             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+             d->vp.ssl[v].ssl_seg = 0;
+-- 
+2.51.0.windows.2
+

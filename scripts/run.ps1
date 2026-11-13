@@ -44,6 +44,11 @@ $envs = [ordered]@{
     RECOMP_AC97_READY         = '1'       # AC97 codec reports ready (DSOUND init)
     RECOMP_VBLANK             = 'paced'   # paced 60 Hz vblank interrupts
     RECOMP_DISPATCH_GATE      = '1'       # serialize raised-IRQL guest code and DPCs on one CPU
+    # KEVENTs the title builds itself (XAPI's USB stack puts one on the stack for
+    # each synchronous request). Without it every such wait failed at once, the
+    # request was abandoned still pending, and its completion later wrote into
+    # reused stack -- the intro movie's decoder, which then stalled for 32.7 s.
+    RECOMP_TITLE_KEVENTS      = '1'
 }
 if ($FbDumpEvery -gt 0) {
     $envs['RECOMP_FB_DUMP'] = (Join-Path $dir 'fb.bmp')

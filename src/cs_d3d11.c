@@ -1307,7 +1307,13 @@ double cs_now_ms(void)
 {
     static LARGE_INTEGER f, t0;
     LARGE_INTEGER t;
-    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        /* Absolute QPC ms of t_ms 0, to line up logs on the raw QPC clock
+         * (the APU traces) with frames.csv and samples.csv. */
+        fprintf(stderr, "[CLOCK] t0_qpc_ms=%.1f\n", (double)(t0.QuadPart / f.QuadPart) * 1000.0
+                + (double)(t0.QuadPart % f.QuadPart) * 1000.0 / (double)f.QuadPart);
+    }
     QueryPerformanceCounter(&t);
     return (double)(t.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
 }

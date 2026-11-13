@@ -52,6 +52,14 @@ option(CS_REG_PROMOTE "Keep guest registers in locals in the generated code" ON)
 if(CS_REG_PROMOTE)
     set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS RECOMP_REG_PROMOTE)
 endif()
+# Diagnostic: every direct call in the generated code checks that the callee
+# kept ebx/esi/edi/esp (RECOMP_ABI_CHECK in recomp_types.h); [ABI] lines name
+# the first offenders. Costs a few compares per call.
+option(CS_ABI_CHECK "Check callee-saved registers across generated calls" OFF)
+if(CS_ABI_CHECK)
+    set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+    set_property(SOURCE src/cs_kernel.c APPEND PROPERTY COMPILE_DEFINITIONS CS_ABI_CHECK)
+endif()
 
 add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)

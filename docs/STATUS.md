@@ -456,3 +456,23 @@ The remaining dips were the game's own code (bot collision traces, `SV_Recursive
 - **Toolkit patch 0018 (`--direct-mmio`, pin 38d46cf):** absolute-address APU register accesses (99 in CS, DirectSound's per-voice writes to `[0xFE82xxxx]`) call the APU model directly instead of faulting. Audio capture (`RECOMP_AUDIO_WAV`, `scripts/wavstats.py`) matches the trapping build. Small gain only: game-thread exception share 3.7% -> 3.4%, most APU traffic is register-relative and still traps.
 - **Remaining tail:** steady/round-start p95 17-18 ms, p99 19-21 ms, worst ~21-27 ms; median ~13.9 ms (~72 FPS). The game thread profile is flat; remaining levers are codegen-wide (x87 stack still thread-local and index-addressed) and the APU MMIO traps (~7% of the game thread, host exceptions per DirectSound register write).
 - **Tools:** `scripts/spikes.py` (frame-time distribution and spike list for a window), `scripts/spike_prof.py` (what each thread did inside spike frames vs normal frames), `scripts/hostdis.py` (host disassembly of a translated function from the PDB; `CS_EXE` for another build), `run.ps1 -Exe` / `CS_EXE` to launch another build.
+
+## First-release checklist (agreed 2026-11-13)
+Must-have, in order:
+1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); Valve-intro hitches; slow map load and slow relaunch on map change; rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
+2. Every map loads and plays (only Airstrip verified so far); watch for unimplemented paths (cube maps, water).
+3. Visual correctness: smoke/haze vs xemu, mipmaps (distant shimmer), runway decal.
+4. Multi-hour soak including several map rotations and menu <-> game relaunches.
+5. Input and settings: controller layout, keyboard/mouse, in-game options saved.
+6. Other machines: another GPU vendor, a weaker CPU; windowed/fullscreen; frame pacing.
+7. Packaging: no game-derived code shipped -- users build from their own disc (extract_disc.py -> pipeline.py -> build) with a one-command wrapper and README.
+Later: GPU vertex fetch, x87 stack in the recompiler, system link.
+
+## Intro freeze fixed: title-built KEVENTs (2026-11-13)
+The first intro movie (MGS logo) froze for 32.7 s in about 1 boot in 10 (1 in 4 under profiler load), and the title screen never came within the probe's time.
+- Not audio: the movie's audio stream starving was a consequence. The XMV decoder had stopped first: it lost count of the frames left in a packet (`[decoder+0x3C]`), read past the packet end, and took data as a frame time of 0x7FF9 ms.
+- Why: the frame decoder `sub_00292F5D` returned with its caller's `esi` (the decoder object) changed by 0x80000 (found with the new `CS_ABI_CHECK` build option), so the decrement went to the wrong object.
+- Who: a hardware write watchpoint on that stack slot (both memory views, every thread) caught the USB completion DPC `sub_0031D685` doing `or byte [urb+22h], 8` on a request that lived on the main thread's stack, long after that frame was gone.
+- Root cause: the XAPI input code (`sub_0031B21C`, opening a pad) builds a KEVENT on its stack and waits on it (50 ms, then cancel and wait again). Without `RECOMP_TITLE_KEVENTS` the bridge did not know that event, so both waits failed at once with STATUS_UNSUCCESSFUL; the code returned with the USB request still pending and its completion later wrote into reused stack.
+- Fix: `RECOMP_TITLE_KEVENTS=1` in scripts/run.ps1. Verified: 24 stress boots with the watchpoint armed, 0 freezes and 0 stray writes (was about 1 in 4); on the committed build 0 of 24 normal boots and 0 of 24 under profiler load. Gameplay unchanged (Airstrip ~72 FPS; the 20 s map load is the known one).
+- Kept as tools: `scripts/boot_loop.ps1` (repeated boots, freeze count), `CS_ABI_CHECK` (CMake; callee-saved checks in a separate build), toolkit patch 0019 (`RECOMP_APU_VTRACE=<voice>`, `RECOMP_APU_VSTAT`), io.csv event/APC/bytes columns, `[CLOCK] t0_qpc_ms` (lines up QPC-clock traces with frames.csv).

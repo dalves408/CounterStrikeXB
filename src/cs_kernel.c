@@ -80,22 +80,26 @@ static void cs_NtReadFile(void)
         return;                    /* cannot happen once the table is bridged */
     {
         /* RECOMP_CS_IO_CSV=<file>: one line per read -- start on the frame
-         * logs' clock, duration, handle, length, offset, status, thread. */
+         * logs' clock, duration, handle, length, offset, status, thread,
+         * the completion event and APC routine, and the bytes moved. The
+         * arguments are read before the bridge pops them. */
         static FILE *io = (FILE *)-1;
         double t0 = 0;
         uint32_t handle = MEM32(g_esp + 4), length = MEM32(g_esp + 4 + 6 * 4);
         uint32_t offp = MEM32(g_esp + 4 + 7 * 4), off = offp ? MEM32(offp) : 0xFFFFFFFFu;
+        uint32_t ev = MEM32(g_esp + 4 + 1 * 4), apc = MEM32(g_esp + 4 + 2 * 4);
         if (io == (FILE *)-1) {
             const char *p = getenv("RECOMP_CS_IO_CSV");
             io = p ? fopen(p, "w") : NULL;
-            if (io) fprintf(io, "t_ms,dur_ms,handle,length,offset,status,tid\n");
+            if (io) fprintf(io, "t_ms,dur_ms,handle,length,offset,status,tid,event,apc,info\n");
         }
         if (io) t0 = cs_now_ms();
         bridge();
         if (io) {
-            fprintf(io, "%.2f,%.3f,%08X,%u,%u,%08X,%lu\n", t0, cs_now_ms() - t0, handle, length, off,
-                    g_eax, (unsigned long)GetCurrentThreadId());
-            { static unsigned nio; if ((++nio % 32) == 0) fflush(io); }
+            fprintf(io, "%.2f,%.3f,%08X,%u,%u,%08X,%lu,%08X,%08X,%08X\n", t0, cs_now_ms() - t0, handle,
+                    length, off, g_eax, (unsigned long)GetCurrentThreadId(), ev, apc,
+                    iosb ? MEM32(iosb + 4) : 0);
+            fflush(io);    /* a watchdog _exit must not lose the last reads */
         }
     }
     if (iosb && nt_error(g_eax)) {
@@ -157,6 +161,26 @@ static void cs_KfLowerIrql(void)
 {
     cs_irql_log("lower", recomp_lookup_kernel(s_kflower_va));
 }
+
+#ifdef CS_ABI_CHECK
+/* RECOMP_ABI_CHECK's reporter (CMake option CS_ABI_CHECK, a separate build):
+ * the first report for each callee, with the time and thread. The toolkit's
+ * own reporter is only built into an RECOMP_ABI_CHECK toolkit. This is what
+ * named the intro movie decoder coming back with esi changed. */
+void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0, uint32_t edi0, uint32_t esp0)
+{
+    static uint32_t seen[256];
+    static unsigned n;
+    unsigned i;
+    for (i = 0; i < n; i++)
+        if (seen[i] == va) return;
+    if (n < 256) seen[n++] = va;
+    fprintf(stderr, "[ABI] t=%.1f tid=%lu sub_%08X:%s%s%s%s ebx %08X->%08X esi %08X->%08X edi %08X->%08X esp %08X->%08X\n",
+            cs_now_ms(), (unsigned long)GetCurrentThreadId(), va,
+            g_ebx != ebx0 ? " ebx" : "", g_esi != esi0 ? " esi" : "", g_edi != edi0 ? " edi" : "",
+            g_esp < esp0 + 4 ? " esp" : "", ebx0, g_ebx, esi0, g_esi, edi0, g_edi, esp0, g_esp);
+}
+#endif
 
 recomp_func_t cs_kernel_override(uint32_t xbox_va)
 {
