@@ -427,3 +427,12 @@ Measured with the new per-flip/PVIDEO logs and `scripts/menu_probe.ps1` (reactiv
 - **Menus:** 71 guest FPS sustained, every frame fully drawn (15 draws), D3D11 back end.
 - **Still open:** intro movies at ~24 fps against a 30 fps cadence (the second, Valve, movie has 160-570 ms hitches while every thread is waiting: pacing, not CPU); an intermittent intro freeze (1 run in ~10: APU stops raising interrupts); map loading; gameplay.
 - **Diagnostic tools added:** `RECOMP_CS_FRAME_CSV`, `RECOMP_CS_PVIDEO_CSV`, `RECOMP_CS_FLASH=<dir>` (draw lists + targets of a black frame), `RECOMP_CS_GATE_WATCH=1` (stack of a long gate holder), `RECOMP_CS_PROF=a-b` (sampling profiler), `scripts/analyze_frames.py`, `scripts/menu_probe.ps1`, `scripts/symbolize.py`.
+
+## Gameplay milestone: the BSP world draws (2026-11-12)
+Compared against David's xemu captures of Airstrip (C:\Recomp\tools\XemuRamDump\dumps).
+- **Cause of the grey ground, white streaked "walls" and missing surfaces: the whole precompiled world pushbuffer was skipped.** The ring JUMPs to it (0x81BD5000, ~135 KB) and it JUMPs back to the word after; the segment scan ended every segment at a top-level JUMP. Toolkit patch 0015 follows a JUMP whose target chain comes straight back (pin 7abd611). Before, the ground was never drawn (the 0x4D4D4D clear showed through). Now: textured ground, hangar, crates and fence match the xemu reference (runs/g42_detour vs dump_001/screenshot.png).
+- Ruled out on the way: the detail-texture constant c105 is huge on real hardware too (xemu pushbuffer has the same values); texture memory matches xemu.
+- Gameplay ~21 FPS now that the full world is drawn (was ~35 with most of it missing). Menus unchanged (71.6 FPS, 0 flashes, runs/v4_menu).
+- `RECOMP_STRIP_ALT_WINDING=1` (toolkit) flips odd strip triangles for culling; no visible difference on the world, left off.
+- **Tools:** `RECOMP_CS_DUMP` now also writes `ram.bin` (64 MB physical/contiguous view) and `va_game_00010000.bin`, laid out like xemu's dumps; `scripts/pbfind.py` (vertex-constant uploads in a RAM image), `scripts/ramtex.py` (decode a texture from a RAM image); `RECOMP_PB_DETOUR_LOG=1` lists detours.
+- **Next:** GPU vertex programs (CPU VSH is the cost now), haze/smoke check, map load time.

@@ -1298,6 +1298,27 @@ static void cs_present_sync(void)
         dumping = GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES;
     }
     s_dump_now = dumping;
+    if (dumping) {   /* first dump frame: the whole 64 MB of guest RAM as <dir>\ram.bin, laid out
+                      * like xemu's physical.ram, for scripts/ramtex.py and scripts/pbfind.py */
+        static int ram_done;
+        if (!ram_done) {
+            char path[MAX_PATH];
+            FILE *f;
+            ram_done = 1;
+            snprintf(path, sizeof path, "%s\\ram.bin", dump_dir);
+            if ((f = fopen(path, "wb")) != NULL) {   /* the 0x80000000 (physical) view: what the GPU reads */
+                fwrite((const uint8_t *)xbox_GetMemoryOffset() + 0x80000000u, 1, 0x04000000u, f);
+                fclose(f);
+                fprintf(stderr, "[CS-D3D11] guest RAM written to %s at frame %u\n", path, s_frame);
+            }
+            /* and the title's low virtual range, like xemu's va_game_00010000.bin */
+            snprintf(path, sizeof path, "%s\\va_game_00010000.bin", dump_dir);
+            if ((f = fopen(path, "wb")) != NULL) {
+                fwrite((const uint8_t *)xbox_GetMemoryOffset() + 0x10000u, 1, 0x7D0000u, f);
+                fclose(f);
+            }
+        }
+    }
     {
         /* Normal play: only the display-sized target (what the window shows)
          * goes back to guest memory, and one flip late: map the copy queued at

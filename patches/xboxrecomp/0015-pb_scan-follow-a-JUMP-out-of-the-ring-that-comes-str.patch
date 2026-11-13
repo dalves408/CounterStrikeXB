@@ -1,0 +1,133 @@
+From 7abd61165ebe57cae5a8dbaf79da17998f39f297 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] pb_scan: follow a JUMP out of the ring that comes straight
+ back (CounterStrikeXB2 local patch)
+
+The segment scan ended a top-level segment at any JUMP, taking it for the
+ring's wrap. Counter-Strike draws its whole BSP world from a precompiled
+pushbuffer that the ring JUMPs to and that JUMPs back to the word after:
+everything in it was skipped, so the ground and most walls never drew.
+
+A top-level JUMP is now followed when decoding from its target (through at
+most 8 chained JUMPs) reaches a JUMP back to the word after it; the pieces
+are run and the segment carries on. A wrap's target is the ring's start,
+which never jumps back there, so wraps still end the segment. pb_find_jump
+now stays inside the 64 MB contiguous window. RECOMP_PB_DETOUR_LOG lists the
+first detours; the exit report counts them.
+---
+ src/kernel/nv2a_pb_scan.c | 66 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 58 insertions(+), 8 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5b697fc..b35e65d 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -164,13 +164,15 @@ static const char *nv097_name(uint32_t m)
+     return "";
+ }
+ 
++static uint32_t s_tot_detours;   /* JUMPs out of the ring and back, followed */
++
+ void nv2a_pb_scan_report(void)
+ {
+     int i;
+ 
+     if (s_exec_enabled > 0) {
+         nv2a_pb_exec_report();
+-        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
++        fprintf(stderr, "[PB] %u pushbuffer calls followed, %u jump detours\n", s_tot_calls, s_tot_detours);
+     }
+     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
+         return;
+@@ -469,15 +471,46 @@ int nv2a_pb_dma_walk(void)
+  * its RETURN, then carries on after the CALL. RenderWare on the Xbox compiles
+  * static geometry into pushbuffers and draws it with a CALL, so skipping CALLs
+  * loses whole meshes. The NV2A has one level of subroutine, so a CALL inside a
+- * call is not followed. A JUMP outside a call ends the segment: the ring's
+- * wrap is handled by the caller, which scans the two pieces separately.
+- * Addresses are physical, like PUT's, and reach guest memory through the
+- * contiguous window. */
++ * call is not followed. A JUMP outside a call ends the segment -- the ring's
++ * wrap is handled by the caller, which scans the two pieces separately --
++ * unless it is a detour: a JUMP out of the ring to a pushbuffer that JUMPs
++ * straight back to the word after it. Counter-Strike draws its whole world
++ * that way (an XDK precompiled pushbuffer run by jumping to it and back); ending
++ * the segment there lost every world surface. Addresses are physical, like
++ * PUT's, and reach guest memory through the contiguous window. */
+ /* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+  * hold is only armed at the top level (nv2a_pb_exec.c). */
+ static int s_in_call;
+ int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ 
++static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint32_t *target_va);
++
++#define PB_DETOUR_HOPS 8
++
++/* Whether the JUMP to `target` (contiguous-window VA) comes back to `back`:
++ * decoding only, through at most PB_DETOUR_HOPS chained JUMPs. Fills the
++ * pieces to run, each from its start up to (not including) its JUMP. A ring
++ * wrap's JUMP lands on the ring's start, whose next JUMP does not return to the
++ * word after the wrap, so a wrap is never taken for a detour. */
++static int pb_detour(uint32_t target, uint32_t back, uint32_t *from, uint32_t *to, int *n)
++{
++    uint32_t cur = target, jat, t;
++    int hop;
++
++    for (hop = 0; hop < PB_DETOUR_HOPS; hop++) {
++        if (!pb_find_jump(cur, cur + 0x400000u, &jat, &t))
++            return 0;
++        from[hop] = cur;
++        to[hop] = jat;
++        if (t == back) {
++            *n = hop + 1;
++            return 1;
++        }
++        cur = t;
++    }
++    return 0;
++}
++
+ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+                                 uint32_t *jumps, uint32_t *unknown)
+ {
+@@ -493,8 +526,19 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+             (*jumps)++;
+-            if (!in_call)
+-                break;                        /* the ring: a jump ends it */
++            if (!in_call) {
++                uint32_t from[PB_DETOUR_HOPS], to[PB_DETOUR_HOPS];
++                int n, k;
++                if (!pb_detour(0x80000000u | (target & 0x0FFFFFFFu), va, from, to, &n))
++                    break;                    /* the ring: a jump ends it */
++                s_tot_detours++;
++                if (s_tot_detours < 60 && getenv("RECOMP_PB_DETOUR_LOG"))
++                    fprintf(stderr, "[PB] detour %u: JUMP at %08X -> %08X, %d piece(s), first %08X-%08X, back %08X\n",
++                            s_tot_detours, va - 4, 0x80000000u | (target & 0x0FFFFFFFu), n, from[0], to[0], va);
++                for (k = 0; k < n; k++)      /* run it, then carry on after the JUMP */
++                    words += pb_walk_segment(from[k], to[k], 0, jumps, unknown);
++                continue;
++            }
+             va = 0x80000000u | (target & 0x0FFFFFFFu);
+             end_va = va + 0x400000u;
+             continue;
+@@ -545,7 +589,13 @@ static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint3
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     uint32_t unknown = 0;
+ 
+-    while (va < limit_va) {
++    /* Only inside the contiguous window (64 MB of RAM): a stray target -- a
++     * guessed detour, or the dwords past a wrap -- must not read beyond it. */
++    if (va < 0x80000000u || va >= 0x84000000u)
++        return 0;
++    if (limit_va > 0x84000000u)
++        limit_va = 0x84000000u;
++    while (va + 4u <= limit_va) {
+         uint32_t w = *(const uint32_t *)(mem + va);
+         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+             uint32_t t = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
+-- 
+2.51.0.windows.2
+
