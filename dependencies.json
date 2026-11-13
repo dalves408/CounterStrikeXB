@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "e8b14ae8cda73c5cacc56681f77be88bb5697dd2",
+                       "commit":  "1ab5820518e6a8d132e08bf1855d9c4bd282d4f5",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -20,7 +20,8 @@
                                              "patches/xboxrecomp/0013-pb_exec-apu-skip-cpu-raster-work-under-a-back-end.patch",
                                              "patches/xboxrecomp/0014-pb_exec-post-transform-vertex-cache-per-batch.patch",
                                              "patches/xboxrecomp/0015-pb_scan-follow-a-JUMP-out-of-the-ring-that-comes-str.patch",
-                                             "patches/xboxrecomp/0016-nv2a-vertex-programs-to-the-back-end-answer-kickoffs.patch"
+                                             "patches/xboxrecomp/0016-nv2a-vertex-programs-to-the-back-end-answer-kickoffs.patch",
+                                             "patches/xboxrecomp/0017-recomp-register-promotion-promote-regs.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

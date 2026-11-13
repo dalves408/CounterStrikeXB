@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
+#include <timeapi.h>   /* timeBeginPeriod (winmm); not in WIN32_LEAN_AND_MEAN's windows.h */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

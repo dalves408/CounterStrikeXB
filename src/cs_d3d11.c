@@ -1792,9 +1792,14 @@ void cs_d3d11_init(void)
     {
         const char *csv = getenv("RECOMP_CS_FRAME_CSV");
         s_flash_dir = getenv("RECOMP_CS_FLASH");
-        if (csv && (s_csv = fopen(csv, "w")) != NULL) {
+        /* Append: the title relaunches itself (menus -> game, and on every map
+         * change), and a "w" here erased everything the previous process
+         * logged. The header goes in once, into an empty file. */
+        if (csv && (s_csv = fopen(csv, "a")) != NULL) {
             setvbuf(s_csv, NULL, _IOFBF, 1 << 16);
-            fprintf(s_csv, "t_ms,frame,dt_ms,draws,tris,readbacks,rb_ms,luma,black_pct,hash\n");
+            fseek(s_csv, 0, SEEK_END);
+            if (ftell(s_csv) == 0)
+                fprintf(s_csv, "t_ms,frame,dt_ms,draws,tris,readbacks,rb_ms,luma,black_pct,hash\n");
         }
     }
     cs_now_ms();

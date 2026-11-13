@@ -41,6 +41,8 @@
 
 #include "cs_gpu.h"
 #include "cs_d3d11.h"
+/* nv2a/nv2a_mmio_hook.h: the PVIDEO register snapshot (returns bool) */
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4], uint64_t *stop_generation);
 
 /* kernel/xbox_memory_layout.h (pinned toolkit f0f8a46) */
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va, uint32_t put_off, uint32_t get_ptr_off);

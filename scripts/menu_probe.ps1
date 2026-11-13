@@ -21,6 +21,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $dir = Join-Path $root "runs\$Label"
 New-Item -ItemType Directory -Force $dir | Out-Null
 $frames = Join-Path $dir 'frames.csv'; $pv = Join-Path $dir 'pvideo.csv'; $ev = Join-Path $dir 'events.csv'
+Remove-Item -LiteralPath $frames -ErrorAction SilentlyContinue   # the game appends (relaunches keep one log)
 "wall_s,game_ms,event" | Set-Content $ev
 $envs = @("RECOMP_CS_FRAME_CSV=$frames", "RECOMP_CS_PVIDEO_CSV=$pv", "RECOMP_CS_D3D11_LOG=1") + $ExtraEnv
 $p = @(& (Join-Path $PSScriptRoot 'run.ps1') -Label $Label -ExtraEnv ($envs -join ';') -PassThru) | Where-Object { $_ -is [Diagnostics.Process] } | Select-Object -Last 1

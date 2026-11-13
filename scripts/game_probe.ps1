@@ -26,6 +26,7 @@ $pagePath = if ([IO.Path]::IsPathRooted($Page)) { $Page } else { Join-Path $root
 if (-not (Test-Path $pagePath)) { throw "no launch page $pagePath" }
 $copy = Join-Path $dir 'launch_page.bin'; Copy-Item $pagePath $copy -Force
 $frames = Join-Path $dir 'frames.csv'; $ev = Join-Path $dir 'events.csv'
+Remove-Item -LiteralPath $frames -ErrorAction SilentlyContinue   # the game appends (relaunches keep one log)
 "wall_s,event" | Set-Content $ev
 $envs = @("CS_LAUNCH_PAGE=$copy", "RECOMP_CS_FRAME_CSV=$frames", "RECOMP_CS_D3D11_LOG=1", "RECOMP_CS_DUMP=$dir") + $ExtraEnv
 $p = @(& (Join-Path $PSScriptRoot 'run.ps1') -Label $Label -ExtraEnv ($envs -join ';') -PassThru) | Where-Object { $_ -is [Diagnostics.Process] } | Select-Object -Last 1

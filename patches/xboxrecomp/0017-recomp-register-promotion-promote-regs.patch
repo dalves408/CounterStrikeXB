@@ -1,0 +1,460 @@
+From 1ab5820518e6a8d132e08bf1855d9c4bd282d4f5 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] recomp: register promotion (--promote-regs) (CounterStrikeXB2
+ local patch)
+
+The guest registers are thread-local globals (g_eax ...), so every register
+access in a translated function was a memory access, and because guest memory
+is reached through volatile pointers MSVC also reloaded the thread-local block
+after every guest store: Counter-Strike's collision trace (sub_000B7E80) did
+245 thread-local loads and 2414 memory operands in 3751 instructions.
+
+With --promote-regs each translated function loads the registers into locals
+on entry (RECOMP_REGS_DECL), writes them back immediately before every transfer
+out -- direct and indirect calls, indirect tail jumps, direct tail and
+fall-through calls, a guest longjmp, and return (RECOMP_REGS_SPILL) -- and reads
+them back after each call (RECOMP_REGS_FILL). The write-back sits between the
+return-address push and the call, and each insertion is braced so a call under
+a bare if stays one statement. The runtime header defines the hooks only under
+RECOMP_REG_PROMOTE; otherwise they are no-ops and eax is g_eax, so one
+generated tree builds either way. Kernel bridges, interrupts at their safe
+points and the ICALL failure paths only run inside a call, where the globals
+are current; the ICALL failure paths now write g_eax so the read-back after
+the call keeps their 0. A setjmp that returns through a guest longjmp reads
+the registers back before taking the return value.
+
+Without the option the output is unchanged (full test suite passes). Same
+function after promotion: 8 thread-local loads, 1455 memory operands, 2709
+instructions. Counter-Strike: round-start dips gone (worst frame 35 ms, was
+30-42 ms bursts), steady 14 ms frames.
+---
+ templates/runtime/recomp_types.h           |  57 ++++++++--
+ tools/recomp/__main__.py                   |  10 ++
+ tools/recomp/lifter.py                     |   7 +-
+ tools/recomp/test_icall_guarded_runtime.py |   1 +
+ tools/recomp/test_promote_regs.py          |  52 +++++++++
+ tools/recomp/translator.py                 | 124 ++++++++++++++++++++-
+ 6 files changed, 239 insertions(+), 12 deletions(-)
+ create mode 100644 tools/recomp/test_promote_regs.py
+
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 47491e5..3bbb8e0 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -1402,7 +1402,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     /* Skip garbage VAs outside code section + kernel thunk range */ \
+     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+         recomp_icall_not_code_log(_va); \
+-        g_esp += 4; eax = 0; break; \
++        g_esp += 4; g_eax = 0; break; \
+     } \
+     recomp_func_t _fn = recomp_lookup_manual(_va); \
+     if (!_fn) _fn = recomp_lookup(_va); \
+@@ -1410,7 +1410,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+                RECOMP_ABI_CALL(_va, _fn); } \
+     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
++           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+ } while(0)
+ 
+ /**
+@@ -1428,7 +1428,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     g_icall_count++; \
+     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+         recomp_icall_not_code_log(_va); \
+-        g_esp = (saved_esp); eax = 0; break; \
++        g_esp = (saved_esp); g_eax = 0; break; \
+     } \
+     recomp_func_t _fn = recomp_lookup_manual(_va); \
+     if (!_fn) _fn = recomp_lookup(_va); \
+@@ -1436,7 +1436,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+                RECOMP_ABI_CALL(_va, _fn); } \
+     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
++           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
+ } while(0)
+ 
+ /* Caller cleanup: a failed call pops only its return address. */
+@@ -1448,7 +1448,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     g_icall_count++; \
+     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+         recomp_icall_not_code_log(_va); \
+-        g_esp += 4; eax = 0; break; \
++        g_esp += 4; g_eax = 0; break; \
+     } \
+     recomp_func_t _fn = recomp_lookup_manual(_va); \
+     if (!_fn) _fn = recomp_lookup(_va); \
+@@ -1456,7 +1456,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+                RECOMP_ABI_CALL(_va, _fn); } \
+     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
++           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+ } while(0)
+ 
+ /**
+@@ -1474,7 +1474,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     g_icall_count++; \
+     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+         recomp_icall_not_code_log(_va); \
+-        g_esp = (saved_esp); eax = 0; break; \
++        g_esp = (saved_esp); g_eax = 0; break; \
+     } \
+     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+     recomp_func_t _fn = recomp_lookup_manual(_va); \
+@@ -1483,7 +1483,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+                RECOMP_ABI_CALL(_va, _fn); } \
+     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+-           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
++           recomp_icall_fail_log(_va); g_esp = (saved_esp); g_eax = 0; } \
+ } while(0)
+ 
+ /* Caller cleanup: a failed call pops only its return address. */
+@@ -1495,7 +1495,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     g_icall_count++; \
+     if (!RECOMP_ICALL_IS_CODE(_va)) { \
+         recomp_icall_not_code_log(_va); \
+-        g_esp += 4; eax = 0; break; \
++        g_esp += 4; g_eax = 0; break; \
+     } \
+     RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+     recomp_func_t _fn = recomp_lookup_manual(_va); \
+@@ -1504,7 +1504,7 @@ void xbox_GuestCpuPreempt(uint32_t va);
+     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+                RECOMP_ABI_CALL(_va, _fn); } \
+     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+-           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
++           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+ } while(0)
+ 
+ /**
+@@ -1538,6 +1538,37 @@ void xbox_GuestCpuPreempt(uint32_t va);
+  * ================================================================ */
+ 
+ #ifdef RECOMP_GENERATED_CODE
++/* Register promotion (RECOMP_REG_PROMOTE). The architectural registers are
++ * thread-local globals, so every eax/esi/esp access in a translated function
++ * was a memory access -- and with guest memory reached through volatile
++ * pointers, the host compiler also reloaded the thread-local block after
++ * every guest store. Promoted, each translated function works on locals
++ * (l_eax ...), loaded on entry (RECOMP_REGS_DECL); the translator writes them
++ * back to the globals immediately before every transfer out of the function
++ * -- each call, indirect call, tail call and return (RECOMP_REGS_SPILL) -- and
++ * reads them back right after each call (RECOMP_REGS_FILL). Everything outside
++ * a translated function (kernel bridges, interrupts at their safe points, the
++ * ICALL failure paths, the debugger) still sees the globals, current at every
++ * point where it can run. Off, the three macros are no-ops and eax is g_eax
++ * as before, so the same generated source builds either way. */
++#ifdef RECOMP_REG_PROMOTE
++#define eax l_eax
++#define ecx l_ecx
++#define edx l_edx
++#define esp l_esp
++#define ebx l_ebx
++#define esi l_esi
++#define edi l_edi
++#define RECOMP_REGS_DECL \
++    uint32_t l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, \
++             l_esi = g_esi, l_edi = g_edi, l_esp = g_esp
++#define RECOMP_REGS_SPILL \
++    (g_eax = l_eax, g_ecx = l_ecx, g_edx = l_edx, g_ebx = l_ebx, \
++     g_esi = l_esi, g_edi = l_edi, g_esp = l_esp)
++#define RECOMP_REGS_FILL \
++    (l_eax = g_eax, l_ecx = g_ecx, l_edx = g_edx, l_ebx = g_ebx, \
++     l_esi = g_esi, l_edi = g_edi, l_esp = g_esp)
++#else
+ #define eax g_eax
+ #define ecx g_ecx
+ #define edx g_edx
+@@ -1545,6 +1576,12 @@ void xbox_GuestCpuPreempt(uint32_t va);
+ #define ebx g_ebx
+ #define esi g_esi
+ #define edi g_edi
++#ifndef RECOMP_REGS_DECL
++#define RECOMP_REGS_DECL  (void)0
++#define RECOMP_REGS_SPILL (void)0
++#define RECOMP_REGS_FILL  (void)0
++#endif
++#endif
+ 
+ /* ================================================================
+  * MMX register file
+diff --git a/tools/recomp/__main__.py b/tools/recomp/__main__.py
+index 62df65c..a06b444 100644
+--- a/tools/recomp/__main__.py
++++ b/tools/recomp/__main__.py
+@@ -285,6 +285,14 @@ def main():
+                              "a loop that makes no kernel call; it costs a "
+                              "load and a branch per edge when the lock is "
+                              "off. Off by default: edges stay bare")
++    parser.add_argument("--promote-regs", action="store_true",
++                        help="Emit the register-promotion hooks: each function "
++                             "loads the guest registers into locals on entry and "
++                             "writes them back around every call and return "
++                             "(RECOMP_REGS_DECL/SPILL/FILL). Inert unless the "
++                             "build defines RECOMP_REG_PROMOTE, so one generated "
++                             "tree builds either way. Off by default: output is "
++                             "unchanged")
+     parser.add_argument("--seh-prolog", metavar="ADDR",
+                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
+     parser.add_argument("--seh-epilog", metavar="ADDR",
+@@ -297,6 +305,8 @@ def main():
+     from .manual_scan import entry_hooks
+     translator_module.ENTRY_HOOKS = (entry_hooks(args.exclude_manual)
+                                     if args.exclude_manual else set())
++    from . import lifter as lifter_module
++    translator_module.PROMOTE_REGS = lifter_module.PROMOTE_REGS = args.promote_regs
+ 
+     # Boundary repair is destructive: an interior function start disappears
+     # once it is coalesced into its owner. Load hand-written entry points before
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 4174bca..7024781 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -1436,6 +1436,9 @@ def normalise_zero_test(mnemonic, ops):
+     return mnemonic, ops
+ 
+ 
++# Register promotion hooks (--promote-regs; see translator.PROMOTE_REGS).
++PROMOTE_REGS = False
++
+ class Lifter:
+     """Translates x86 instructions to C statements."""
+ 
+@@ -2642,7 +2645,9 @@ class Lifter:
+             if insn.call_target == self.SETJMP_FN:
+                 lines.append(
+                     "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
+-                    " if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; }"
++                    " if (_sjv) { ebp = g_seh_ebp; "
++                    + ("RECOMP_REGS_FILL; " if PROMOTE_REGS else "")
++                    + "eax = (uint32_t)_sjv; }"
+                     f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }} }}"
+                     f" /* setjmp 0x{insn.call_target:08X} */")
+             elif insn.call_target == self.LONGJMP_FN:
+diff --git a/tools/recomp/test_icall_guarded_runtime.py b/tools/recomp/test_icall_guarded_runtime.py
+index a5fff58..3cdf104 100644
+--- a/tools/recomp/test_icall_guarded_runtime.py
++++ b/tools/recomp/test_icall_guarded_runtime.py
+@@ -77,6 +77,7 @@ volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_trace_idx;
+ volatile uint64_t g_icall_count;
+ uint32_t g_xbox_code_lo = 0x00010000u, g_xbox_code_hi = 0x00020000u;
+ uint32_t g_esp, eax, g_ebp, g_seh_ebp;
++#define g_eax eax   /* the ICALL failure paths write the architectural eax */
+ #define esp g_esp
+ #define PUSH32(sp, v) do { (sp) -= 4; } while (0)
+ #define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+diff --git a/tools/recomp/test_promote_regs.py b/tools/recomp/test_promote_regs.py
+new file mode 100644
+index 0000000..9c6ed16
+--- /dev/null
++++ b/tools/recomp/test_promote_regs.py
+@@ -0,0 +1,52 @@
++"""Register promotion (--promote-regs): every transfer out of a translated
++function is bracketed by write-back/read-back, at the right place.
++
++The write-back has to sit between the return-address push and the call (the
++callee reads esp), a call under a bare `if` must stay one statement, comments
++are left alone, and the entry load comes after the opening brace and any entry
++hook.
++"""
++from tools.recomp.translator import _promote_regs
++
++
++def test_direct_call_bracketed_after_the_push():
++    out = _promote_regs(["{", "    PUSH32(esp, 0x10u); RECOMP_ABI_CALL(0x20u, sub_00000020); /* call */"])
++    assert out[1] == "    RECOMP_REGS_DECL;"
++    assert out[2] == ("    PUSH32(esp, 0x10u); { RECOMP_REGS_SPILL; "
++                      "RECOMP_ABI_CALL(0x20u, sub_00000020); RECOMP_REGS_FILL; } /* call */")
++
++
++def test_return_writes_back_first():
++    out = _promote_regs(["{", "    esp += 4; return; /* ret */"])
++    assert out[2] == "    esp += 4; { RECOMP_REGS_SPILL; return; } /* ret */"
++
++
++def test_tail_call_and_fallthrough():
++    out = _promote_regs(["{", "    g_seh_ebp = ebp; sub_0022C3D4(); return; /* tail jmp */"])
++    assert out[2] == ("    g_seh_ebp = ebp; { RECOMP_REGS_SPILL; sub_0022C3D4(); RECOMP_REGS_FILL; }"
++                      " { RECOMP_REGS_SPILL; return; } /* tail jmp */")
++
++
++def test_guarded_indirect_call_brackets_each_arm():
++    line = ("    { uint32_t _icall_target = MEM32(eax); PUSH32(esp, 0x5u); if (_icall_target == 0x9u)"
++            " { RECOMP_ICALL_GUARD_HIT(); RECOMP_ABI_CALL(0x9u, sub_00000009); } else"
++            " { RECOMP_ICALL_GUARD_MISS(); RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, 0x4u); } }")
++    out = _promote_regs(["{", line])[2]
++    assert out.count("RECOMP_REGS_SPILL;") == 2 and out.count("RECOMP_REGS_FILL;") == 2
++    assert "{ RECOMP_REGS_SPILL; RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, 0x4u); RECOMP_REGS_FILL; }" in out
++
++
++def test_comments_and_helpers_untouched():
++    src = ["{", "    /* nothing here return; */", "    fp_pop(); /* return; in a comment */"]
++    out = _promote_regs(src)
++    assert out[2:] == src[1:]
++
++
++def test_entry_load_after_the_hook():
++    out = _promote_regs(["{", "    extern void sub_00010000_enter(void);", "    sub_00010000_enter();", "    eax = 1;"])
++    assert out[3] == "    RECOMP_REGS_DECL;"
++
++
++def test_longjmp_writes_back_before_the_statement():
++    out = _promote_regs(["{", "    if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4))) { PUSH32(esp, 0x1u); sub_00000002(); }"])
++    assert out[2].startswith("    RECOMP_REGS_SPILL; if (!recomp_guest_longjmp(")
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 21600d3..f3d5c6f 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -220,6 +220,120 @@ def _is_safe_icall(line):
+         "RECOMP_ICALL_SAFE_CC", "RECOMP_ICALL_SAFE_AT_CC"))
+ 
+ 
++# Register promotion (see RECOMP_REG_PROMOTE in templates/runtime/recomp_types.h).
++# Every point where control leaves a translated function gets the registers
++# written back to the globals immediately before it (RECOMP_REGS_SPILL) and,
++# where control comes back, read back right after (RECOMP_REGS_FILL). The
++# transfers are exactly these: the call macros (direct calls through
++# RECOMP_ABI_CALL, indirect calls, indirect tail jumps), direct tail and
++# fall-through calls `sub_XXXXXXXX();`, a guest longjmp, and `return;`. The
++# write-back goes right before the call -- not before the statement -- because
++# the statement pushes the return address first. Each insertion is braced so a
++# call under a bare `if (...)` stays one statement. Without the define the
++# macros are no-ops and the output is equivalent to the unpromoted code.
++PROMOTE_REGS = False      # set by __main__ from --promote-regs
++_PROMOTE_CALL_MACROS = ("RECOMP_ABI_CALL(", "RECOMP_ICALL_SAFE_AT_CC(",
++                        "RECOMP_ICALL_SAFE_AT(", "RECOMP_ICALL_SAFE_CC(",
++                        "RECOMP_ICALL_SAFE(", "RECOMP_ICALL(", "RECOMP_ITAIL(")
++_PROMOTE_DIRECT = __import__("re").compile(r"\bsub_[0-9A-F]{8}\(\)\s*;")
++_PROMOTE_RETURN = __import__("re").compile(r"(?<![\w])return\s*;")
++
++
++def _promote_split_comment(line):
++    """Code part and trailing comment of a generated line ("/*" never occurs
++    inside a string literal in generated code)."""
++    i = line.find("/*")
++    return (line, "") if i < 0 else (line[:i], line[i:])
++
++
++def _promote_call_end(code, open_idx):
++    """Index just past the ';' closing the call whose '(' is at open_idx."""
++    depth = 0
++    for k in range(open_idx, len(code)):
++        ch = code[k]
++        if ch == "(":
++            depth += 1
++        elif ch == ")":
++            depth -= 1
++            if depth == 0:
++                rest = code[k + 1:]
++                semi = len(rest) - len(rest.lstrip())
++                if rest[semi:semi + 1] == ";":
++                    return k + 1 + semi + 1
++                return None
++    return None
++
++
++def _promote_line(code):
++    out = []
++    i = 0
++    n = len(code)
++    while i < n:
++        # Earliest transfer at or after i.
++        best = None
++        for m in _PROMOTE_CALL_MACROS:
++            j = code.find(m, i)
++            # A longer macro name ending in this one (RECOMP_ICALL_SAFE_AT vs
++            # RECOMP_ICALL) must not be split: require a non-identifier before.
++            while j >= 0 and j > 0 and (code[j - 1].isalnum() or code[j - 1] == "_"):
++                j = code.find(m, j + 1)
++            if j >= 0 and (best is None or j < best[0]):
++                best = (j, "macro", m)
++        dm = _PROMOTE_DIRECT.search(code, i)
++        if dm and (best is None or dm.start() < best[0]):
++            best = (dm.start(), "direct", None)
++        rm = _PROMOTE_RETURN.search(code, i)
++        if rm and (best is None or rm.start() < best[0]):
++            best = (rm.start(), "return", None)
++        if best is None:
++            out.append(code[i:])
++            break
++        j, kind, m = best
++        out.append(code[i:j])
++        if kind == "return":
++            out.append("{ RECOMP_REGS_SPILL; " + rm.group(0) + " }")
++            i = rm.end()
++        elif kind == "direct":
++            out.append("{ RECOMP_REGS_SPILL; " + dm.group(0) + " RECOMP_REGS_FILL; }")
++            i = dm.end()
++        else:
++            end = _promote_call_end(code, j + len(m) - 1)
++            if end is None:            # not a statement-level call: leave it
++                out.append(code[j:j + len(m)])
++                i = j + len(m)
++                continue
++            out.append("{ RECOMP_REGS_SPILL; " + code[j:end] + " RECOMP_REGS_FILL; }")
++            i = end
++    return "".join(out)
++
++
++def _promote_regs(lines):
++    result = []
++    for line in lines:
++        s = line.lstrip()
++        if s.startswith("#") or s.startswith("/*") or s.startswith("*"):
++            result.append(line)
++            continue
++        code, comment = _promote_split_comment(line)
++        if "recomp_guest_longjmp(" in code:
++            # A guest longjmp that succeeds never comes back; its fallback is a
++            # direct call, promoted below like any other.
++            ind = code[:len(code) - len(code.lstrip())]
++            code = ind + "RECOMP_REGS_SPILL; " + code.lstrip()
++        result.append(_promote_line(code) + comment)
++    # Load the registers on entry: after the opening brace and any entry hook.
++    for k, line in enumerate(result):
++        if line == "{":
++            at = k + 1
++            while at < len(result) and (result[at].startswith("    extern void sub_")
++                                        or result[at].rstrip().endswith("_enter();")
++                                        or "_enter(); RECOMP_REGS_FILL; }" in result[at]):
++                at += 1
++            result.insert(at, "    RECOMP_REGS_DECL;")
++            break
++    return result
++
++
+ def _fixup_icall_esp_save(lines):
+     """
+     Post-process generated C lines to insert _icall_esp save points.
+@@ -317,7 +431,10 @@ def _fixup_icall_esp_save(lines):
+         if i in insert_before:
+             # Determine indentation from the current line
+             indent = line[:len(line) - len(line.lstrip())]
+-            result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
++            # Under register promotion the current esp is the function's local
++            # (esp); otherwise esp is g_esp and the text stays as it was.
++            src = "esp" if PROMOTE_REGS else "g_esp"
++            result.append(f"{indent}{{ uint32_t _icall_esp = {src};")
+         result.append(line)
+         if _is_safe_icall(line):
+             indent = line[:len(line) - len(line.lstrip())]
+@@ -3456,6 +3573,11 @@ class FunctionTranslator:
+         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
+         lines = _fixup_icall_esp_save(lines)
+ 
++        # Register promotion: write-back/read-back around every transfer, and
++        # the entry load (inert unless RECOMP_REG_PROMOTE is defined).
++        if PROMOTE_REGS:
++            lines = _promote_regs(lines)
++
+         # Validate: comment out goto targets that reference missing labels
+         # (dead code after unconditional jumps may reference non-existent labels)
+         import re
+-- 
+2.51.0.windows.2
+

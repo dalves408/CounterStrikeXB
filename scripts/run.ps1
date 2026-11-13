@@ -13,11 +13,13 @@ param(
     [int]$FbDumpEvery = 0,           # >0: dump the guest framebuffer every N frames to runs\<label>\fb.bmp
     [switch]$PadLive,                # diagnostics: also feed pad 0 from runs\<label>\pad_live.txt (toolkit RECOMP_PAD_LIVE, same XID report path)
     [string[]]$ExtraEnv = @(),       # NAME=VALUE pairs for experiments (';'-separated ok)
-    [switch]$PassThru
+    [switch]$PassThru,
+    [string]$Exe = ''                # another build's exe (e.g. build-clang\RelWithDebInfo\cs2_xbox_recomp.exe)
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$exe = Join-Path $root 'build\RelWithDebInfo\cs2_xbox_recomp.exe'
+if (-not $Exe -and $env:CS_EXE) { $Exe = $env:CS_EXE }   # probes pass it through the environment
+$exe = if ($Exe) { if ([IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path $root $Exe } } else { Join-Path $root 'build\RelWithDebInfo\cs2_xbox_recomp.exe' }
 if (-not (Test-Path -LiteralPath $exe)) { throw "missing $exe; run scripts\build.ps1" }
 if ($Label -notmatch '^[A-Za-z0-9_\-]+$') { throw 'label: letters, digits, - and _ only' }
 $dir = Join-Path $root "runs\$Label"

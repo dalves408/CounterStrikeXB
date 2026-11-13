@@ -445,6 +445,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      *
      * Optional by design: if the allocation fails the search still works,
      * so a failure is worth one line and not a fatal error. */
+    extern int recomp_dispatch_init(void);   /* recomp_dispatch.c; its prototype in
+                                              * recomp_types.h is skipped once
+                                              * recomp_dispatch.h is included */
     if (!recomp_dispatch_init())
         fprintf(stderr, "[BOOT] flat dispatch unavailable; "
                         "indirect calls will use the binary search\n");

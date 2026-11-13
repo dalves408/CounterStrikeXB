@@ -36,6 +36,16 @@ set(GAME_SOURCES
     src/cs_launch.c
 )
 
+# Register promotion in the generated code (pipeline --promote-regs emits the
+# hooks; see RECOMP_REG_PROMOTE in recomp_types.h): translated functions keep
+# the guest registers in locals between calls instead of thread-local memory.
+# Generated sources only -- hand-written replacements use the register names
+# against the globals.
+option(CS_REG_PROMOTE "Keep guest registers in locals in the generated code" ON)
+if(CS_REG_PROMOTE)
+    set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS RECOMP_REG_PROMOTE)
+endif()
+
 add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -56,4 +66,17 @@ if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
     # /FS: parallel cl.exe instances share one PDB.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /FS)
+endif()
+if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    # clang-cl (configure with -T ClangCL). The generated code keeps guest
+    # registers and the x87 stack in thread-local globals and reaches guest
+    # memory through volatile pointers; MSVC assumes every such store may
+    # alias them and reloads the TLS block and memory base after each one.
+    # Type-based aliasing lets clang keep those in host registers. Guest
+    # memory is only ever touched through the volatile MEM* accessors, which
+    # are never reordered against each other, so the generated code does no
+    # type punning that strict aliasing could break. Generated sources only:
+    # the hand-written runtime is left with clang-cl's MSVC-like default.
+    set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "/clang:-fstrict-aliasing;/clang:-fno-ms-tls-guards;-Wno-everything")
 endif()

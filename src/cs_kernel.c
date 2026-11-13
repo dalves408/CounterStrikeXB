@@ -168,9 +168,14 @@ recomp_func_t cs_kernel_override(uint32_t xbox_va)
         return cs_NtReadFile;
     if (!s_kflower_va)
         s_kflower_va = MEM32(CS_THUNK_KFLOWERIRQL);
-    if (xbox_va == s_keraise_va && getenv("CS_IRQL_DIAG"))
-        return cs_KeRaiseIrqlToDpcLevel;
-    if (xbox_va == s_kflower_va && getenv("CS_IRQL_DIAG"))
-        return cs_KfLowerIrql;
+    {   /* read once: these two are called thousands of times a frame, and a
+         * getenv per call (an environment scan) was ~15% of the game thread */
+        static int diag = -1;
+        if (diag < 0) diag = getenv("CS_IRQL_DIAG") != NULL;
+        if (diag && xbox_va == s_keraise_va)
+            return cs_KeRaiseIrqlToDpcLevel;
+        if (diag && xbox_va == s_kflower_va)
+            return cs_KfLowerIrql;
+    }
     return (recomp_func_t)0;
 }

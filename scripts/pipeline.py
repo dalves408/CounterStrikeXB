@@ -1,4 +1,4 @@
-﻿"""Regenerate src/recomp/gen from the original default.xbe with the pinned toolkit.
+"""Regenerate src/recomp/gen from the original default.xbe with the pinned toolkit.
 
 The generated tree is pure pipeline output: this script wipes it first and
 nothing in it is ever edited by hand. Game-specific code lives in src/.
@@ -63,5 +63,6 @@ if gen.exists():
     shutil.rmtree(gen)
 gen.mkdir(parents=True)
 run("recomp", "tools.recomp", "--all", "--split", "250", "--game-name", "Counter-Strike",
+    "--promote-regs",   # register-promotion hooks; inert unless the build defines RECOMP_REG_PROMOTE
     "--gen-dir", gen)
 print("pipeline complete", flush=True)
