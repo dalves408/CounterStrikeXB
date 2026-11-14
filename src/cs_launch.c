@@ -48,6 +48,7 @@ extern uint32_t g_xbox_region_base;
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 #define CS_KDATA_LAUNCH_DATA_PAGE (g_xbox_region_base + 0x00040000u + 0x030u)
 #include "cs_launch.h"
+#include "cs_diag.h"
 
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 
@@ -91,25 +92,57 @@ static void cs_log_launch_data(uint32_t page)
     fprintf(stderr, "\n");
 }
 
+static int cs_relaunch_with(const uint8_t *buf);
+
 static int cs_relaunch_self(uint32_t page)
+{
+    uint8_t buf[CS_LAUNCH_PAGE_SIZE];
+    uint32_t i;
+    for (i = 0; i < CS_LAUNCH_PAGE_SIZE; i++)
+        buf[i] = MEM8(page + i);
+    return cs_relaunch_with(buf);
+}
+
+/* The title asked for the Dashboard (LDT_LAUNCH_DASHBOARD): Xbox Live's "New
+ * Account" and account management live there, not in the game, and there is no
+ * Dashboard here -- the request used to end in the toolkit's exit, and the game
+ * closed. Answered as a Dashboard does when the player backs out: it boots the
+ * title again with LDT_FROM_DASHBOARD and the title's own context (LD_FROM_DASHBOARD
+ * .dwContext <- LD_LAUNCH_DASHBOARD.dwContext). Through the same relaunch as a map
+ * change, so it stays in the frame window. */
+#define CS_LDT_LAUNCH_DASHBOARD 1u
+#define CS_LDT_FROM_DASHBOARD   2u
+
+static int cs_back_from_dashboard(uint32_t page)
+{
+    static const char self_path[] = "\\Device\\CdRom0;default.xbe";
+    uint8_t buf[CS_LAUNCH_PAGE_SIZE];
+    uint32_t reason = MEM32(page + 0x400), context = MEM32(page + 0x404);
+
+    memset(buf, 0, sizeof buf);
+    *(uint32_t *)(buf + 0) = CS_LDT_FROM_DASHBOARD;
+    *(uint32_t *)(buf + 4) = MEM32(page + 4);              /* the title */
+    memcpy(buf + 8, self_path, sizeof self_path);
+    *(uint32_t *)(buf + 0x400) = context;                  /* LD_FROM_DASHBOARD.dwContext */
+    fprintf(stderr, "[CS2-LAUNCH] Dashboard requested (reason %u, context 0x%08X): there is none here;"
+                    " back to the game as from the Dashboard\n", reason, context);
+    return cs_relaunch_with(buf);
+}
+
+static int cs_relaunch_with(const uint8_t *buf)
 {
     char tmp[MAX_PATH], file[MAX_PATH], exe[MAX_PATH], pid[16];
     FILE *f;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-    uint8_t buf[CS_LAUNCH_PAGE_SIZE];
-    uint32_t i;
     BOOL ok;
-
-    for (i = 0; i < CS_LAUNCH_PAGE_SIZE; i++)
-        buf[i] = MEM8(page + i);
     if (!GetTempPathA(sizeof(tmp), tmp)) return 0;
     _snprintf(file, sizeof(file), "%scs2_launch_%lu.bin", tmp,
               (unsigned long)GetCurrentProcessId());
     file[sizeof(file) - 1] = 0;
     f = fopen(file, "wb");
     if (!f) return 0;
-    ok = fwrite(buf, 1, sizeof(buf), f) == sizeof(buf);
+    ok = fwrite(buf, 1, CS_LAUNCH_PAGE_SIZE, f) == CS_LAUNCH_PAGE_SIZE;
     fclose(f);
     if (!ok) return 0;
     {   /* Diagnostics: CS_LAUNCH_SAVE=<file> keeps a copy, so a later run can
@@ -169,7 +202,22 @@ static void cs_HalReturnToFirmware(void)
         cs_log_launch_data(page);
         if (!cs_relaunch_self(page))
             fprintf(stderr, "[CS2-LAUNCH] relaunch failed; exiting as before\n");
+    } else if (routine == 2 && page && MEM32(page) == CS_LDT_LAUNCH_DASHBOARD && MEM32(page + 4) == 0x4D530036u) {
+        if (!cs_back_from_dashboard(page))
+            fprintf(stderr, "[CS2-LAUNCH] relaunch failed; exiting as before\n");
+    } else if (page) {
+        char path[521];
+        uint32_t i;
+        for (i = 0; i < 520; i++) {
+            path[i] = (char)MEM8(page + 8 + i);
+            if (!path[i]) break;
+        }
+        path[i] = 0;
+        fprintf(stderr, "[CS2-LAUNCH] firmware return %u to another image: type %u title 0x%08X path '%s'\n",
+                routine, MEM32(page), MEM32(page + 4), path);
+        cs_log_launch_data(page);
     }
+    cs_diag_flush();       /* the bridge's ExitProcess would cut the log's last lines */
     if (bridge)
         bridge();          /* toolkit: logs, dumps, ExitProcess */
 }

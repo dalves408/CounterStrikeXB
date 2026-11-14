@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "5ee1b3c1969d181dcc105216eab5fe7b4169f4a4",
+                       "commit":  "d2bef2138211795cee254d8cd1f41e1ce3352d7d",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -29,7 +29,8 @@
                                              "patches/xboxrecomp/0022-video-RECOMP_FB_PARENT-makes-the-window-a-child-of-a.patch",
                                              "patches/xboxrecomp/0023-kernel-nv2a-deliver-D3D-s-software-method-5-rescue-a.patch",
                                              "patches/xboxrecomp/0024-pb_scan-run-a-recorded-pushbuffer-whose-JUMP-back-wa.patch",
-                                             "patches/xboxrecomp/0025-pb_scan-on-a-ring-wrap-walk-on-to-the-JUMP-that-ends.patch"
+                                             "patches/xboxrecomp/0025-pb_scan-on-a-ring-wrap-walk-on-to-the-JUMP-that-ends.patch",
+                                             "patches/xboxrecomp/0026-nv2a-backend-pass-the-polygon-offset-in-the-render-s.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

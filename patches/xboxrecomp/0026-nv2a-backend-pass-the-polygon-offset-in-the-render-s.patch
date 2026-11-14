@@ -1,0 +1,46 @@
+From d2bef2138211795cee254d8cd1f41e1ce3352d7d Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nv2a backend: pass the polygon offset in the render state
+ (CounterStrikeXB2 local patch)
+
+SET_POLY_OFFSET_FILL_ENABLE (0x338) and SET_POLYGON_OFFSET_SCALE_FACTOR/_BIAS (0x384/0x388) join Nv2aRenderState, so a back end can apply D3D's ZBIAS. Counter-Strike draws its wall decals in the wall's plane with it; without it they z-fight and flicker.
+---
+ src/kernel/nv2a_backend.h | 6 ++++++
+ src/kernel/nv2a_pb_exec.c | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 024479d..71d1df0 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -88,6 +88,12 @@ typedef struct {
+      * that ignores these draws that pass over the whole surface. */
+     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
+     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
++    /* SET_POLY_OFFSET_FILL_ENABLE and SET_POLYGON_OFFSET_SCALE_FACTOR/_BIAS:
++     * depth offset of filled polygons, as glPolygonOffset (factor * slope +
++     * bias units of depth resolution). D3D's ZBIAS: decals drawn onto a wall
++     * pull themselves in front of it; without it they z-fight. */
++    uint32_t poly_offset_fill;
++    float    poly_offset_factor, poly_offset_units;
+ } Nv2aRenderState;
+ 
+ typedef struct {
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 2271d7b..a7a0027 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -881,6 +881,9 @@ static void current_render_state(Nv2aRenderState *r)
+     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
+     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
+     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
++    r->poly_offset_fill  = s_reg[0x0338 / 4];        /* SET_POLY_OFFSET_FILL_ENABLE */
++    r->poly_offset_factor = reg_f(0x0384);           /* SET_POLYGON_OFFSET_SCALE_FACTOR */
++    r->poly_offset_units = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
+ }
+ 
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+-- 
+2.51.0.windows.2
+

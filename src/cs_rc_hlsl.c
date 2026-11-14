@@ -88,6 +88,8 @@ static const char k_head[] =
 "float4 tsample(Texture2D t, SamplerState s, float4 tc, float4 u) {\n"
 "  float2 c = tc.xy / ((tc.w != 0.0) ? tc.w : 1.0) * u.xy; if (u.w != 0.0) c = frac(c);\n"
 "  return (u.z == 0.0) ? float4(1, 1, 1, 1) : t.Sample(s, c); }\n"
+"float4 dsample(Texture2D t, SamplerState s, float2 c, float4 u) {\n"
+"  if (u.w != 0.0) c = frac(c); return (u.z == 0.0) ? float4(1, 1, 1, 1) : t.Sample(s, c); }\n"
 "float4 main(VO i) : SV_Target {\n"
 "  float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0, R8 = 0, R9 = 0, R10 = 0, R11 = 0, R12 = 0, R13 = 0, R14 = 0, R15 = 0;\n"
 "  float4 out4; bool mux_cd;\n"
@@ -157,6 +159,12 @@ size_t cs_rc_to_hlsl(const Nv2aCombiner *rc, char *buf, size_t n)
         else if (mode == 1u || mode == 2u) put(&o, "  R%u = tsample(%s, uvs[%u]);\n", 8u + k, tx[k], k);
         else if (mode == 3u) put(&o, "  R%u = float4(1, 1, 1, 1);\n", 8u + k);
         else if (mode == 4u) put(&o, "  R%u = saturate(%s);\n", 8u + k, tc[k]);
+        /* DEPENDENT_AR / _GB (D3D texreg2ar / texreg2gb): this stage's texture
+         * at coordinates taken from stage 0's colour, (alpha, red) or (green,
+         * blue). The input-stage register is not tracked; stage 0 is the one
+         * D3D's shaders use. CS's buy menu wedges look their colours up so. */
+        else if ((mode == 15u || mode == 16u) && k > 0u)
+            put(&o, "  R%u = dsample(tx%u, sm%u, R8.%s, uvs[%u]);\n", 8u + k, k, k, mode == 15u ? "ar" : "gb", k);
         else put(&o, "  R%u = float4(0, 0, 0, 0);\n", 8u + k);
     }
     put(&o, "  R12.a = %s;\n", (sp & 31u) ? "R8.a" : "1.0");

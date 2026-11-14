@@ -262,6 +262,7 @@ static ID3D11VertexShader *s_vs, *s_vs_rc;
 static ID3D11PixelShader *s_ps, *s_ps_rc;
 static ID3D11InputLayout *s_il;
 static ID3D11RasterizerState *s_rs;
+static ID3D11RasterizerState *rs_offset(ID3D11RasterizerState *base, int cull, int ccw, const Nv2aRenderState *r);
 static ID3D11Texture2D *s_white;
 static ID3D11ShaderResourceView *s_white_srv;
 static ID3D11Buffer *s_vbr[VB_RING], *s_cbr[CB_RING], *s_rcr[CB_RING];
@@ -671,7 +672,7 @@ static uint32_t tex_bytes(const Nv2aTexture *t)
     case 0x0C: return px / 2 < 8 ? 8 : px / 2;                 /* DXT1 */
     case 0x0E: case 0x0F: return px < 16 ? 16 : px;            /* DXT3/5 */
     case 0x00: case 0x01: case 0x0B: case 0x19: return px;
-    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1A: case 0x1B: return px * 2;
+    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1A: case 0x1B: case 0x28: return px * 2;
     }
     return px * 4;
 }
@@ -802,17 +803,30 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
         TexEnt *ne = &s_tx[free_i];
         memset(ne, 0, sizeof *ne);
         if (!argb) return s_white_srv;
-        if (!nv2a_backend_decode_texture(t, argb)) {
+        if (t->color == 0x28) {
+            /* SZ_G8B8 (the toolkit's decoder has no case for it): two bytes a
+             * texel, sampled as (R, G, B, A) = (lo, hi, lo, hi) -- xemu's
+             * swizzle for this format. CS's buy menu wedges look their colours
+             * up in one (dependent reads, cs_rc_hlsl.c). */
+            const uint8_t *src = mem + t->offset;
+            uint32_t mx, my, x, y;
+            xbox_swizzle_masks(t->width, t->height, &mx, &my);
+            for (y = 0; y < t->height; y++)
+                for (x = 0; x < t->width; x++) {
+                    const uint8_t *q = src + 2u * (swizzle_deposit(x, mx) | swizzle_deposit(y, my));
+                    argb[(size_t)y * t->width + x] = ((uint32_t)q[1] << 24) | ((uint32_t)q[0] << 16) | ((uint32_t)q[1] << 8) | q[0];
+                }
+        } else if (!nv2a_backend_decode_texture(t, argb)) {
             if (st_decode_fail++ < 30)
                 fprintf(stderr, "[CS-D3D11] texture decode failed fmt=%02X %ux%u offset=%08X\n", t->color, t->width, t->height, t->offset);
             free(argb);
             return s_white_srv;
         }
-        {   /* RECOMP_CS_TEXDUMP=<dir>: every decoded texture (first 400) as a BMP */
+        {   /* RECOMP_CS_TEXDUMP=<dir>: every decoded texture (first 4000) as a BMP */
             static const char *tdir = (const char *)-1;
             static unsigned tn;
             if (tdir == (const char *)-1) tdir = getenv("RECOMP_CS_TEXDUMP");
-            if (tdir && tn < 400 && t->width <= 1024 && t->height <= 1024) {
+            if (tdir && tn < 4000 && t->width <= 1024 && t->height <= 1024) {
                 char path[MAX_PATH];
                 FILE *f;
                 uint32_t row = (t->width * 3 + 3) & ~3u, sz = 54 + row * t->height, yy, xx;
@@ -933,6 +947,22 @@ static ID3D11PixelShader *rc_shader(const Nv2aCombiner *rc)
     e->key = key; e->ps = NULL;
     n = cs_rc_to_hlsl(rc, src, sizeof src);
     st_rc_compiles++;
+    {   /* RECOMP_CS_RC_SRC=<dir>: keep each specialised shader's source, words first */
+        const char *dir = getenv("RECOMP_CS_RC_SRC");
+        if (dir && n) {
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s\\rc_%016llX.hlsl", dir, (unsigned long long)key);
+            if ((f = fopen(path, "w")) != NULL) {
+                uint32_t k;
+                fprintf(f, "// control %08X program %08X final %08X %08X\n", rc->control, rc->stage_program, rc->final0, rc->final1);
+                for (k = 0; k < 8; k++)
+                    fprintf(f, "// stage %u icw %08X %08X ocw %08X %08X\n", k, rc->color_icw[k], rc->alpha_icw[k], rc->color_ocw[k], rc->alpha_ocw[k]);
+                fwrite(src, 1, n, f);
+                fclose(f);
+            }
+        }
+    }
     if (n && SUCCEEDED(D3DCompile(src, n, "nv2a_rc", NULL, NULL, "main", "ps_5_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err)))
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), NULL, &e->ps);
@@ -1010,7 +1040,14 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
              * arrives with coordinates near +-1e6, where GPU texture units keep
              * no fractional precision and return a constant (dark) texel. */
             rcb.uvs[st][3] = (t->addr_u == 1 && t->addr_v == 1) ? 1.0f : 0.0f;
-            if ((mode == 1 || mode == 2) && (b->stage_valid & (1u << st))) {
+            if ((mode == 15 || mode == 16) && getenv("RECOMP_CS_DEPLOG")) {
+                static unsigned nlog;
+                if (nlog++ < 40)
+                    fprintf(stderr, "[CS-DEP] stage %d mode %u valid %u tex %08X %ux%u fmt %02X pitch %u addr %u/%u filt %08X | t0 %08X %ux%u fmt %02X\n",
+                            st, mode, (b->stage_valid >> st) & 1u, t->offset, t->width, t->height, t->color, t->pitch,
+                            t->addr_u, t->addr_v, t->filter, b->stages[0].offset, b->stages[0].width, b->stages[0].height, b->stages[0].color);
+            }
+            if ((mode == 1 || mode == 2 || ((mode == 15 || mode == 16) && st > 0)) && (b->stage_valid & (1u << st))) {
                 srvs[st] = get_tex(t, &op);
                 smps[st] = get_sampler(t);
                 rcb.uvs[st][2] = (srvs[st] != s_white_srv) ? 1.0f : 0.0f;
@@ -1356,7 +1393,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     if (!kept) { s_dl_none_kept++; return; }
 
     use_rc = bind_state(s, b, rt, ds, srvs);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_RSSetState(s_ctx, rs_offset(s_rs, 0, 0, b->state));
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_il);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &vb, &stride, &off);
@@ -1748,6 +1785,41 @@ static unsigned s_gv_n;
 static ID3D11Buffer *s_gv_in, *s_gv_ib, *s_gv_cb, *s_gv_pcb;
 static ID3D11ShaderResourceView *s_gv_srv;
 static ID3D11RasterizerState *s_gv_rs[3][2];    /* none/front/back x front-CCW */
+
+/* The rasterizer state for a draw: base (culling, winding) plus the title's
+ * polygon offset when it enables one. CS draws its wall decals (the A/B site
+ * marks, sprays, bullet holes) in the wall's plane with D3D's ZBIAS; without
+ * the offset they z-fight with the wall and flicker as the view moves. NV2A's
+ * bias is in units of depth resolution and the depth buffer is 24-bit unorm,
+ * so it maps onto DepthBias one to one; the scale factor onto the slope. */
+static ID3D11RasterizerState *rs_offset(ID3D11RasterizerState *base, int cull, int ccw, const Nv2aRenderState *r)
+{
+    typedef struct { ID3D11RasterizerState *rs; int cull, ccw; float factor, units; } RsEnt;
+    static RsEnt cache[32];
+    static unsigned n, nlog;
+    D3D11_RASTERIZER_DESC rd;
+    unsigned i;
+    static int off = -1;
+    if (off < 0) { const char *v = getenv("RECOMP_CS_ZBIAS"); off = v && v[0] == '0'; }   /* =0: ignore it */
+    if (off || !r->poly_offset_fill || (r->poly_offset_factor == 0.0f && r->poly_offset_units == 0.0f))
+        return base;
+    for (i = 0; i < n; i++)
+        if (cache[i].cull == cull && cache[i].ccw == ccw && cache[i].factor == r->poly_offset_factor &&
+            cache[i].units == r->poly_offset_units)
+            return cache[i].rs;
+    if (n == 32) return base;
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID; rd.DepthClipEnable = TRUE;
+    rd.CullMode = cull == 0 ? D3D11_CULL_NONE : (cull == 1 ? D3D11_CULL_FRONT : D3D11_CULL_BACK);
+    rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
+    rd.DepthBias = (INT)floorf(r->poly_offset_units + 0.5f);
+    rd.SlopeScaledDepthBias = r->poly_offset_factor;
+    if (nlog++ < 8)
+        fprintf(stderr, "[CS-D3D11] polygon offset factor %g units %g\n", r->poly_offset_factor, r->poly_offset_units);
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &cache[n].rs))) return base;
+    cache[n].cull = cull; cache[n].ccw = ccw; cache[n].factor = r->poly_offset_factor; cache[n].units = r->poly_offset_units;
+    return cache[n++].rs;
+}
 static uint32_t s_gv_in_off, s_gv_ib_off;       /* ring positions (rows, indices) */
 static int s_gv_ready = -1;
 
@@ -1907,7 +1979,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
      * y grows downwards, as in the D3D11 viewport, so NV2A's CW is D3D's CW. */
     cull = !r->cull_enable ? 0 : (r->cull_face == 0x404 ? 1 : (r->cull_face == 0x405 ? 2 : 0));
     if (!s_cull_on) cull = 0;
-    ID3D11DeviceContext_RSSetState(s_ctx, s_gv_rs[cull][r->front_face == 0x901 ? 1 : 0]);
+    ID3D11DeviceContext_RSSetState(s_ctx, rs_offset(s_gv_rs[cull][r->front_face == 0x901 ? 1 : 0], cull, r->front_face == 0x901, r));
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_gv_ib, DXGI_FORMAT_R32_UINT, 0);
