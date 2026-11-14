@@ -8,7 +8,7 @@
  *   fullscreen        0/1       borderless fullscreen at start (F11 / Alt+Enter toggle)
  *   stretch           0/1       fill the window instead of keeping 4:3
  *   vsync             0/1
- *   frame_rate        30, 60, 120, 144, 240, 0 = uncapped
+ *   frame_rate        30, 60 (default), 120, 144, 240, 0 = uncapped
  *   msaa              1, 2, 4, 8 samples
  *   anisotropy        1, 2, 4, 8, 16
  * %LOCALAPPDATA%\CounterStrikeXB\keymap.ini, [keys]: the keyboard, one line

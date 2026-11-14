@@ -24,7 +24,7 @@ void cs_settings_defaults(CsSettings *s)
     s->fullscreen = 0;
     s->stretch = 0;
     s->vsync = 0;
-    s->frame_rate = 0;      /* uncapped: what the recompilation has always done */
+    s->frame_rate = 60;
     s->msaa = 1;
     s->aniso = 1;
 }

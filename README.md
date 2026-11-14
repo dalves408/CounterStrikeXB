@@ -141,7 +141,7 @@ game. The F1 menu changes these as you play, and saves them as you go:
 | Fullscreen | borderless, on the window's monitor |
 | Stretch image | fill the window instead of keeping 4:3 |
 | VSync | on / off |
-| Frame rate cap | 30, 60, 120, 144, 240, uncapped (default) |
+| Frame rate cap | 30, 60 (default), 120, 144, 240, uncapped |
 | Anti-aliasing | off, 2x, 4x, 8x MSAA |
 | Anisotropic filtering | off, 2x to 16x |
 
