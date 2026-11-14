@@ -460,7 +460,7 @@ The remaining dips were the game's own code (bot collision traces, `SV_Recursive
 ## First-release checklist (agreed 2026-11-13)
 Must-have, in order:
 1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); ~~Valve-intro hitches~~ (not a bug: the movie's own frame times hold the logo, below); ~~slow map load~~ (fixed 2026-11-13, 28 s -> 8 s, below); relaunch on map change (likely the same wait, not yet re-measured); rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
-2. Every map loads and plays (only Airstrip verified so far); watch for unimplemented paths (cube maps, water).
+2. Every map loads and plays (Airstrip and Dust verified; 18 to go); watch for unimplemented paths (cube maps, water).
 3. Visual correctness: smoke/haze vs xemu, mipmaps (distant shimmer), runway decal.
 4. Multi-hour soak including several map rotations and menu <-> game relaunches.
 5. Input and settings: controller layout, keyboard/mouse, in-game options saved.
@@ -489,3 +489,10 @@ The overlay video pauses for 100-570 ms several times between ~15 and ~20.6 s of
 - The XMV frame times in Valve_Logo.xmv have those gaps: after the first second the deltas include 166, 200, 300, 367, 468, 767 and 968 ms where the logo holds still (read live from the decoder's next-frame time, `[decoder+0xF8]`).
 - Playback follows them to within a vblank, the main thread is asleep in the movie loop 89% of the time (`sub_000C6D40`, 10 ms sleeps while no frame is due), and the game loop keeps flipping at 60 Hz throughout. Nothing to fix.
 - Real stalls left around the intros: ~0.3-0.4 s as the MGS movie starts (zlib inflate on the main thread, `sub_002422F1`; a console spends at least as long) and ~0.15 s at the title transition.
+
+## Dust loads and plays (2026-11-13)
+- Menu path (probe keys from boot): 25 s Return (title), Down (Single Player), A, A (Beginner), then the Map Selection list is alphabetical -- Airstrip, Aztec, Chateau, Cobble, Corruption, Dust, ... -- so Down x5 for Dust, then A on each screen. Terrorist Briefing "Dust" loading screen, in the match ~15 s after picking the map (relaunch included).
+- Saved launch page: `CS_LAUNCH_SAVE=runs\launch_page_dust.bin`; `scripts/game_probe.ps1 -Page runs\launch_page_dust.bin` goes straight in.
+- From the page: scene at 7.4 s; 64.3 FPS over 142 s (median 14.5 ms, p95 20.7, p99 31.7; worst in-match frame 257 ms at round start). About 1,700 draws per frame against Airstrip's ~1,000.
+- Visuals: geometry, textures, sky, HUD, radar, team-join message and tutorial hint all render; rounds play out (money $6,000 -> $9,250). Frames: docs/evidence/dust_ingame_2026-11-13.png.
+- Probe note: A (Z) also opens the buy wheel in the match, so repeated A presses leave it open.
