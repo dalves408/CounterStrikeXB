@@ -555,3 +555,11 @@ David's report on 0.9.5: buy menu dark or missing, team select not right, the A/
 - Xbox Live > New Account: the game asks to launch the Dashboard (LDT_LAUNCH_DASHBOARD, reason 7, sign-up) and there is none. src/cs_launch.c now relaunches the game as if returning from the Dashboard (LDT_FROM_DASHBOARD with the context); it lands on the title screen in the same window. The Xbox Live menu stays for future online support.
 - Diagnostics: RECOMP_CS_RC_SRC=<dir> keeps each specialised combiner shader with its words; RECOMP_CS_DEPLOG logs dependent-read stages.
 - Test build 0.9.6.
+
+## System link: an Ethernet controller model (2026-11-14)
+- Counter-Strike links XNet and drives the MCPX NIC (0xFEF00000) itself: register writes, TX/RX descriptor rings in contiguous memory, packet buffers in the pool, an ISR (connected on vector 0 here; HalGetInterruptVector's thunk route answers 0).
+- Toolkit patch 0027 (pin 43c7a5c, reproduced): nvnet.c models the controller (trapped MMIO as OHCI; xemu's nvnet register map and descriptor format), nvnet_link.c carries each frame in a UDP datagram (port 30740) to every interface's directed broadcast and to `RECOMP_NET_PEERS`. A pool address from MmGetPhysicalAddress is resolved as RAM (xbox_PhysRamNamedAt), not the contiguous window -- the first frames went out with garbage headers until that.
+- XNet's DHCP is answered by the NIC itself (169.254.x.y/16 from the MAC, no gateway), so map loads do not wait out the 20 s DHCP timeout that patch 0020's `RECOMP_PHY_LINK=0` avoided; the link is now up and `RECOMP_NET=1` is a game default. Dust still reaches team select in ~25 s.
+- XC_FACTORY_ETHERNET_ADDR answers the NIC's MAC: 00:50:F2 plus a hash of the computer name (`RECOMP_XBOX_MAC` overrides).
+- settings.ini `[network] peers=host,...` for partners on another subnet or over a VPN (Tailscale).
+- Verified on champ: driver bring-up, DHCP/ARP frames, TX interrupts acknowledged by the title's ISR. Not yet verified: two consoles finding each other (champ + hpvictus over Tailscale), test build 0.9.7.

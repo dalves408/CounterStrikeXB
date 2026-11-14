@@ -108,6 +108,17 @@ void cs_settings_startup(void)
     if (!getenv("RECOMP_KEYMAP") && cs_settings_path("keymap.ini", path, sizeof path, 0)
         && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
         _putenv_s("RECOMP_KEYMAP", path);
+    /* [network] peers=host[,host...]: system link partners the LAN broadcast
+     * does not reach (another subnet, a VPN such as Tailscale). The toolkit's
+     * NIC link sends each frame to them too (nvnet_link.c). */
+    if (!getenv("RECOMP_NET_PEERS") && cs_settings_path("settings.ini", path, sizeof path, 0)) {
+        char peers[512];
+        GetPrivateProfileStringA("network", "peers", "", peers, sizeof peers, path);
+        if (peers[0]) {
+            _putenv_s("RECOMP_NET_PEERS", peers);
+            fprintf(stderr, "[CS-SET] system link peers: %s\n", peers);
+        }
+    }
     fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d\n",
             g_cs_settings.scale, g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
             g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso);

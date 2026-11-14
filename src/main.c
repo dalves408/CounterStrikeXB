@@ -48,6 +48,7 @@
 #include "cs_overlay.h"
 #include "cs_diag.h"
 #include "cs_frame.h"
+#include "kernel/nvnet.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -399,7 +400,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_USB", "1" }, { "RECOMP_KEYBOARD", "1" }, { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_D3D_PRESENT", "1" }, { "RECOMP_PB_EXEC", "1" }, { "RECOMP_CONTIG_AVOID_IMAGE", "1" },
             { "RECOMP_AC97_READY", "1" }, { "RECOMP_VBLANK", "paced" }, { "RECOMP_DISPATCH_GATE", "1" },
-            { "RECOMP_TITLE_KEVENTS", "1" }, { "RECOMP_PHY_LINK", "0" },
+            { "RECOMP_TITLE_KEVENTS", "1" }, { "RECOMP_NET", "1" },
         };
         int di;
         for (di = 0; di < (int)(sizeof defs / sizeof defs[0]); di++)
@@ -476,6 +477,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * so host XInput / keyboard state arrives as real 20-byte XID reports on
      * the interrupt endpoint -- no guest-memory writes. */
     xbox_OhciInit();
+    /* The Ethernet controller (system link), on with RECOMP_NET=1. */
+    xbox_NvnetInit();
 
     /* CS2: D3D8LTCG completion fence (src/cs_gpu.c). */
     cs_gpu_init();

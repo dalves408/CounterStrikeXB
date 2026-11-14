@@ -50,9 +50,9 @@ $envs = [ordered]@{
     # request was abandoned still pending, and its completion later wrote into
     # reused stack -- the intro movie's decoder, which then stalled for 32.7 s.
     RECOMP_TITLE_KEVENTS      = '1'
-    # No network adapter is modelled: report the cable unplugged, or every map
-    # load waits out XNet's 20 s DHCP timeout before the local server starts.
-    RECOMP_PHY_LINK           = '0'
+    # The NIC model (toolkit nvnet.c): system link. It answers XNet's DHCP
+    # itself, so map loads do not wait out the 20 s DHCP timeout.
+    RECOMP_NET                = '1'
 }
 if ($FbDumpEvery -gt 0) {
     $envs['RECOMP_FB_DUMP'] = (Join-Path $dir 'fb.bmp')

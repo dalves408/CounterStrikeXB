@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "d2bef2138211795cee254d8cd1f41e1ce3352d7d",
+                       "commit":  "43c7a5c129734ab0b1a5c2d1c421e0f7651e110b",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -30,7 +30,8 @@
                                              "patches/xboxrecomp/0023-kernel-nv2a-deliver-D3D-s-software-method-5-rescue-a.patch",
                                              "patches/xboxrecomp/0024-pb_scan-run-a-recorded-pushbuffer-whose-JUMP-back-wa.patch",
                                              "patches/xboxrecomp/0025-pb_scan-on-a-ring-wrap-walk-on-to-the-JUMP-that-ends.patch",
-                                             "patches/xboxrecomp/0026-nv2a-backend-pass-the-polygon-offset-in-the-render-s.patch"
+                                             "patches/xboxrecomp/0026-nv2a-backend-pass-the-polygon-offset-in-the-render-s.patch",
+                                             "patches/xboxrecomp/0027-kernel-model-the-MCPX-Ethernet-controller-frames-ove.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",
