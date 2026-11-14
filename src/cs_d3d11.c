@@ -312,6 +312,8 @@ static HRESULT map_w(ID3D11Resource *r, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE
     return hr;
 }
 #define MAP_W(res, type, m) map_w((ID3D11Resource *)(res), (type), (m), __LINE__)
+static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uint32_t count, uint32_t kept,
+                    uint32_t vkey);
 
 /* ---- init ---------------------------------------------------------------- */
 
@@ -869,7 +871,9 @@ static void cs_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
 {
     Rt *rt;
     Ds *ds;
+    (void)rs;
     if (!cs_ready()) return;
+    drawlog(2, s, NULL, flags, argb, zst);
     rt = get_rt(s);
     if (!rt) return;
     if (flags & 0xF0) {
@@ -1070,6 +1074,46 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &smp);
     }
     return use_rc;
+}
+
+/* RECOMP_CS_DRAWLOG=<file>: one 64-byte record per draw, clear and flip, every frame, so a frame that comes out
+ * wrong can be set against its neighbours draw by draw (scripts/drawlog.py). kind: 0 CPU-path draw, 1 vertex-program
+ * draw, 2 clear, 3 flip. */
+typedef struct {
+    uint32_t frame, kind, rt, rt_wh, zeta, tex, tex_fmt_wh, comb;   /* comb: combiner control ^ color_ocw[0] */
+    uint32_t blend, alpha, depth, cull, cmask, count, kept, vkey;   /* packed state, see drawlog() */
+} DrawLogRec;
+static FILE *s_dlog;
+
+static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uint32_t count, uint32_t kept,
+                    uint32_t vkey)
+{
+    DrawLogRec d;
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_CS_DRAWLOG");
+        init = 1;
+        if (e && *e && (s_dlog = fopen(e, "wb")) != NULL) setvbuf(s_dlog, NULL, _IOFBF, 1 << 20);
+    }
+    if (!s_dlog) return;
+    memset(&d, 0, sizeof d);
+    d.frame = s_frame; d.kind = kind; d.count = count; d.kept = kept; d.vkey = vkey;
+    if (s) { d.rt = s->color_va; d.rt_wh = (s->width << 16) | (s->height & 0xFFFF); }
+    if (b) {
+        const Nv2aRenderState *r = b->state;
+        const Nv2aTexture *t = b->stages && (b->stage_valid & 1) ? &b->stages[0] : b->texture;
+        d.zeta = r->zeta_va;
+        if (t) { d.tex = t->offset; d.tex_fmt_wh = (t->color << 24) | ((t->width & 0xFFF) << 12) | (t->height & 0xFFF); }
+        if (b->combiner) d.comb = b->combiner->control ^ b->combiner->color_ocw[0] ^ (b->combiner->final0 << 1);
+        d.blend = (r->blend_enable ? 0x80000000u : 0) | ((r->blend_src & 0x7FFF) << 16) | (r->blend_dst & 0xFFFF);
+        d.alpha = (r->alpha_test_enable ? 0x80000000u : 0) | ((r->alpha_func & 0xFFF) << 8) | (r->alpha_ref & 0xFF);
+        d.depth = (r->depth_test_enable ? 0x80000000u : 0) | (r->depth_write ? 0x40000000u : 0) | ((r->depth_func & 0xFFF) << 16)
+                | (r->stencil_enable ? 0x8000u : 0) | ((uint32_t)(r->depth_max * 255.0f) & 0xFF) | (((uint32_t)(r->depth_min * 255.0f) & 0x7F) << 8);
+        d.cull = (r->cull_enable ? 0x80000000u : 0) | ((r->cull_face & 0xFFFF) << 8) | (r->front_face & 0xFF);
+        d.cmask = r->color_mask;
+    }
+    fwrite(&d, sizeof d, 1, s_dlog);
+    if (kind == 3 && (s_frame % 30) == 0) fflush(s_dlog);
 }
 
 static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -1329,6 +1373,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     rt->dirty = 1; rt->unresolved = 1;
     st_draws++; st_tris += kept / 3;
     s_fr_draws++; s_fr_tris += kept / 3;
+    drawlog(0, s, b, b->count, kept, 0);
     if (s_flash_dir && s_dln[s_dlc] < DL_MAX) {
         DrawRec *d = &s_dl[s_dlc][s_dln[s_dlc]++];
         const Nv2aVertex *v = &b->vertices[0];
@@ -1654,6 +1699,7 @@ static void cs_flip(void)
     DWORD now;
     if (!s_inited || s_failed) return;
     if (s_log) gpu_timer_flip();
+    drawlog(3, NULL, NULL, 0, 0, 0);
     s_frame++; s_tick++; st_flips++;
     if (s_csv && (s_frame % 30) == 0) fflush(s_csv);   /* runs are often ended by killing the process */
     now = GetTickCount();
@@ -1859,6 +1905,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     rt->dirty = 1; rt->unresolved = 1;
     st_draws++; st_gv_draws++; st_tris += p->index_count / 3;
     s_fr_draws++; s_fr_tris += p->index_count / 3;
+    drawlog(1, s, b, p->index_count, p->vertex_count, (uint32_t)gv_key(p));
     return 1;
 }
 
@@ -2104,6 +2151,30 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
         ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps_a, NULL, 0);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_ov_srv);
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    }
+    if (s_dlog) {   /* RECOMP_CS_DRAWLOG: the frame number as 16 squares top left (white = 1), to match screen grabs */
+        static ID3D11ShaderResourceView *black;
+        int bit;
+        if (!black) {
+            D3D11_TEXTURE2D_DESC td; D3D11_SUBRESOURCE_DATA sd; ID3D11Texture2D *t = NULL; uint32_t px = 0xFF000000u;
+            memset(&td, 0, sizeof td); td.Width = td.Height = 1; td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE; sd.pSysMem = &px; sd.SysMemPitch = 4; sd.SysMemSlicePitch = 0;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t))) {
+                ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &black);
+                t->lpVtbl->Release(t);
+            }
+        }
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+        for (bit = 0; bit < 16 && black; bit++) {
+            D3D11_VIEWPORT q;
+            q.TopLeftX = vp.TopLeftX + 4.0f + bit * 12.0f; q.TopLeftY = vp.TopLeftY + 4.0f; q.Width = q.Height = 10.0f;
+            q.MinDepth = 0; q.MaxDepth = 1;
+            ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &q);
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, ((s_frame >> bit) & 1) ? &s_white_srv : &black);
+            ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        }
     }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     sync = g_cs_settings.vsync ? 1u : 0u;

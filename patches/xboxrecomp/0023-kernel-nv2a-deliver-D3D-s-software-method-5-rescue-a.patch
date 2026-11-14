@@ -1,0 +1,361 @@
+From 95c1e5e51f78634c96ffe6f062184fbdf551ea96 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel, nv2a: deliver D3D's software method 5; rescue a
+ BlockOnTime the executor outran (CounterStrikeXB2 local patch)
+
+XDK D3D's BlockOnTime clears a title-built event, rewrites a fence slot in the
+pushbuffer to NO_OPERATION(5) and waits on the event with no timeout; the
+GPU's PGRAPH interrupt for that software method runs D3D's handler
+(CMiniport::ServiceGrInterrupt), which sets it. The executor treated every
+software method as a no-op (only the swap's interval was used), and with the
+segment scan's late GET it could already have passed the slot D3D rewrote.
+Counter-Strike froze in a match whenever the host fell behind: every run on
+WARP, about one in three on a laptop with the frame window throttled.
+
+- nv2a_pb_exec: xbox_Nv2aRaiseSoftwareMethod raises the PGRAPH error
+  interrupt as the console does (TRAPPED_ADDR/DATA, NSOURCE, PGRAPH_INTR,
+  PMC_INTR_0), waits for the handler (PGRAPH_FIFO preset 2, the handler
+  writes 1 on exit; 250 ms at most) and drops it. The walk raises the methods
+  RECOMP_PB_SW_INTR selects (default 5 only: 8, 9 and 13 come several times a
+  frame and cost 9.6 -> 80 ms frames delivered; "all", a hex mask, or 0).
+- kernel_bridge: a new IRQ line (XBOX_IRQ_PGRAPH) raised on the timer thread
+  at once, under the gate as the vblank is; xbox_memory_layout keeps the
+  raiser's PGRAPH/PMC bits out of the ack pass while it is in flight.
+- KeWaitForSingleObject on a title event with no timeout waits in 100 ms
+  slices: the guest word set without KeSetEvent ends it; with the GPU idle
+  (DMA PUT = GET, no flip held) for 100 ms, software method 5 is raised, as
+  the GPU would have on passing D3D's slot (RECOMP_PB_SW_RESCUE=0: off); after
+  5 s the stuck state is logged (PUT, GET, flip hold).
+Measured: WARP 3/3 runs without a freeze (6/6 froze before); RTX 3070 match
+frame times unchanged (median 9.2 ms, p99 11.3 vs 11.6 ms).
+---
+ src/kernel/kernel.h             |   1 +
+ src/kernel/kernel_bridge.c      | 125 ++++++++++++++++++++++++++++++++
+ src/kernel/kernel_hal.c         |   2 +-
+ src/kernel/nv2a_pb_exec.c       |  97 ++++++++++++++++++++++++-
+ src/kernel/xbox_memory_layout.c |  11 +++
+ 5 files changed, 233 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 0030a67..033a385 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -908,6 +908,7 @@ enum {
+     XBOX_IRQ_VBLANK,
+     XBOX_IRQ_APU,
+     XBOX_IRQ_OHCI,
++    XBOX_IRQ_PGRAPH,    /* a software method trapped to D3D's handler (nv2a_pb_exec.c) */
+     XBOX_IRQ_LINES
+ };
+ /* What xbox_IrqPost tells the device model to do. */
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 9476517..0e7bd22 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -2049,6 +2049,82 @@ static void bridge_KeWaitForSingleObject(void)
+          * writing 0 there -- so bring the host event in line first. */
+         int type;
+         HANDLE ge = ke_guest_event_prepare(object, &type);
++        if (ge && !timeout_ptr) {
++            /* An infinite wait wakes every 250 ms and trusts the guest word. Code
++             * that sets SignalState without KeSetEvent (an interrupt routine
++             * writing it, say) never signals the host event, and the waiter
++             * slept for ever -- a match freezing, mostly when the host is slow.
++             * Each such catch is logged (the first 20), with the guest caller. */
++            DWORD r;
++            ULONGLONG t0 = GetTickCount64(), last_rescue = 0;
++            int stuck_logged = 0;
++            for (;;) {
++                r = WaitForSingleObjectEx(ge, 100, (BOOL)alertable);
++                if (r != WAIT_TIMEOUT)
++                    break;
++                {   /* XDK D3D's BlockOnTime sleeps on a title event that its
++                     * handler for software method 5 sets when the GPU reaches a
++                     * point in the pushbuffer. If the executor had already passed
++                     * that point when D3D chose it, nothing would ever raise the
++                     * method: with the GPU idle (everything submitted executed)
++                     * the point has been reached, so raise it now, as the GPU
++                     * would have -- D3D's own handler sets the event. At most
++                     * once a second per wait; RECOMP_PB_SW_RESCUE=0 turns it off. */
++                    extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
++                    extern int nv2a_pb_exec_flip_poll(void);
++                    extern int xbox_Nv2aRaiseSoftwareMethod(uint32_t param);
++                    static int rescue_on = -1;
++                    volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u), *get = xbox_Nv2aRegPtr(0x800044u);
++                    ULONGLONG now = GetTickCount64();
++                    if (rescue_on < 0) {
++                        const char *e = getenv("RECOMP_PB_SW_RESCUE");
++                        rescue_on = !(e && *e == '0');
++                    }
++                    if (rescue_on && put && get && *put == *get && now - t0 >= 100 && now - last_rescue >= 1000
++                            && BRIDGE_MEM32(object + 4) == 0 && !nv2a_pb_exec_flip_poll()) {
++                        static volatile LONG rescues;
++                        last_rescue = now;
++                        if (InterlockedIncrement(&rescues) <= 20)
++                            fprintf(stderr, "  [KEWAIT] guest event %08X: GPU idle (PUT=GET %08X) after %llu ms;"
++                                    " raising software method 5 (caller %08X)\n",
++                                    object, *get, now - t0, BRIDGE_MEM32(g_esp - 4));
++                        xbox_Nv2aRaiseSoftwareMethod(5u);
++                        continue;
++                    }
++                }
++                if (BRIDGE_MEM32(object + 4) != 0) {
++                    static volatile LONG caught;
++                    if (InterlockedIncrement(&caught) <= 20)
++                        fprintf(stderr, "  [KEWAIT] guest event %08X set without KeSetEvent; waiter woken after %llu ms"
++                                " (caller %08X)\n", object, GetTickCount64() - t0, BRIDGE_MEM32(g_esp - 4));
++                    r = WAIT_OBJECT_0;
++                    break;
++                }
++                if (!stuck_logged && GetTickCount64() - t0 > 5000) {
++                    extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
++                    extern int nv2a_pb_exec_flip_poll(void);
++                    volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u), *get = xbox_Nv2aRegPtr(0x800044u);
++                    stuck_logged = 1;
++                    fprintf(stderr, "  [KEWAIT] guest event %08X (type %d) still not set after 5 s (caller %08X);"
++                            " DMA PUT %08X GET %08X, flip held %d\n", object, type, BRIDGE_MEM32(g_esp - 4),
++                            put ? *put : 0, get ? *get : 0, nv2a_pb_exec_flip_poll());
++                    if (get) {   /* where D3D patched WAIT_FOR_IDLE + NO_OPERATION(5), if it did */
++                        uint32_t g = 0x80000000u | (*get & 0x0FFFFFFFu), a, lo = g - 0x100000u, hi = g + 0x100000u;
++                        int shown = 0;
++                        for (a = lo; a < hi && shown < 4; a += 4)
++                            if (BRIDGE_MEM32(a + 8) == 0x00040100u && BRIDGE_MEM32(a + 12) == 5u) {
++                                fprintf(stderr, "  [KEWAIT]   NO_OPERATION(5) patched at %08X (GET %+d bytes)\n",
++                                        a + 12, (int)(a + 12 - g));
++                                shown++;
++                            }
++                    }
++                }
++            }
++            g_eax = r == WAIT_OBJECT_0 ? 0u : (r == WAIT_IO_COMPLETION ? 0xC0u : 0xC0000001u);
++            if (g_eax == 0 && type == 1)               /* synchronization: consumed */
++                BRIDGE_MEM32(object + 4) = 0;
++            return;
++        }
+         if (ge) {
+             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                 ge, wait_reason, wait_mode,
+@@ -3124,6 +3200,54 @@ static void kernel_vblank_deliver(void)
+     }
+ }
+ 
++/* A PGRAPH interrupt for a trapped software method (nv2a_pb_exec.c
++ * sw_method_interrupt), raised on the timer thread as soon as the executor
++ * asks rather than with the next vblank: D3D's handler for software method 9
++ * keeps its GPU-progress time, and method 5 ends a BlockOnTime. The PGRAPH and
++ * PMC_INTR_0 bits are the executor's; this only runs the ISR (which queues the
++ * DPC that services them) under the gate, as the vblank does. With the line
++ * masked (the ISR's DPC is pending), that DPC services PGRAPH when it runs. */
++static volatile LONG g_pgraph_pending;
++
++static void kernel_pgraph_deliver(void)
++{
++    (void)kernel_call_isr(NV2A_VECTOR);
++}
++
++void xbox_Nv2aPgraphInterrupt(void)
++{
++    InterlockedExchange(&g_pgraph_pending, 1);
++    xbox_HostTimerWake();
++}
++
++static void kernel_pgraph_raise(void)
++{
++    if (!InterlockedExchange(&g_pgraph_pending, 0))
++        return;
++    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
++        return;
++    xbox_IrqSetHandler(XBOX_IRQ_PGRAPH, kernel_pgraph_deliver);
++    if (!InterlockedCompareExchange((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_EN_0), 0, 0))
++        return;
++    switch (xbox_IrqSafePointsOn() ? xbox_IrqPost(XBOX_IRQ_PGRAPH) : XBOX_IRQ_UNGATED) {
++    case XBOX_IRQ_GATED:
++        kernel_pgraph_deliver();
++        xbox_DispatchGateLeave();
++        break;
++    case XBOX_IRQ_UNGATED: {
++        int gated = xbox_DispatchGateTryEnter();
++        if (!gated)
++            xbox_IrqNoteUngated(XBOX_IRQ_PGRAPH);
++        kernel_pgraph_deliver();
++        if (gated)
++            xbox_DispatchGateLeave();
++        break;
++    }
++    default:
++        break;                          /* the holder runs it */
++    }
++}
++
+ /* The holder's run of a posted vblank: kernel_hal.c has put it on a worker
+  * stack at the device IRQL. */
+ static void kernel_vblank_on_holder(void)
+@@ -3713,6 +3837,7 @@ static void kernel_timer_loop_ns(void)
+          * drains at a raise runs now rather than at the next edge. */
+         xbox_HostTimerSleepNs(wait);
+         kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
++        kernel_pgraph_raise();
+         busy = kernel_drain_dpcs(&ran);   /* deferred work, before due timers */
+         now_ms = kernel_timer_clock_ms();
+         kernel_fire_timers(now_ms, &timer_due);
+diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
+index 45d548c..38aeeaf 100644
+--- a/src/kernel/kernel_hal.c
++++ b/src/kernel/kernel_hal.c
+@@ -350,7 +350,7 @@ static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
+ static XBOX_THREAD_LOCAL int t_guest_thread;
+ static XBOX_THREAD_LOCAL int t_in_dpc;
+ static uint64_t s_irq_wait_ns;
+-static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
++static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci", "pgraph" };
+ 
+ static struct {
+     volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a779870..92304bd 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -4640,6 +4640,97 @@ static int transform_context_method(uint32_t method, uint32_t param)
+     return 1;
+ }
+ 
++/* A D3D software method other than the swap: NO_OPERATION with a value, which
++ * the console's GPU traps to D3D's interrupt handler as a PGRAPH error
++ * interrupt with the method and value latched in TRAPPED_ADDR / TRAPPED_DATA,
++ * PGRAPH stalled until the handler has run (xemu does the same).
++ *
++ * XDK D3D uses one when it finds the GPU far behind: it clears an event,
++ * queues WAIT_FOR_IDLE and NO_OPERATION(5), kicks off, and waits on the event
++ * with no timeout -- the handler for software method 5 sets it. Treated as a
++ * no-op that wait never ended: Counter-Strike froze in a match whenever the
++ * host fell behind (a slow GPU, WARP, a throttled process).
++ *
++ * Raised for the vblank's ISR and DPC to find: D3D's DPC services PGRAPH
++ * whenever PGRAPH_INTR is non-zero, and its handler (CMiniport::
++ * ServiceGrInterrupt) writes PGRAPH_FIFO 0 on entry and 1 on exit. So
++ * PGRAPH_FIFO is preset to 2 and the walk waits here -- the stall -- until it
++ * reads 1, then drops the interrupt (the register is plain memory here, not
++ * write-1-to-clear). 250 ms without the handler: the interrupt is dropped
++ * anyway and the walk goes on, logged once. RECOMP_PB_SW_INTR=0: the old
++ * no-op. Returns 1 when it raised the interrupt. */
++int xbox_Nv2aRaiseSoftwareMethod(uint32_t param)
++{
++    static SRWLOCK lock = SRWLOCK_INIT;
++    extern volatile LONG g_nv2a_sw_intr_inflight;
++    static unsigned raised, timeouts;
++    volatile uint32_t *intr, *nsource, *taddr, *tdata, *fifo, *pmc;
++    LARGE_INTEGER f, t0, now;
++
++    intr = xbox_Nv2aRegPtr(0x400100);   nsource = xbox_Nv2aRegPtr(0x400108);
++    taddr = xbox_Nv2aRegPtr(0x400704);  tdata = xbox_Nv2aRegPtr(0x400708);
++    fifo = xbox_Nv2aRegPtr(0x400720);   pmc = xbox_Nv2aRegPtr(0x000100);
++    if (!intr || !nsource || !taddr || !tdata || !fifo || !pmc)
++        return 0;
++    AcquireSRWLockExclusive(&lock);      /* one trapped method at a time */
++    InterlockedIncrement(&g_nv2a_sw_intr_inflight);
++    *taddr = NV097_NO_OPERATION;        /* the method; subchannel and channel 0 */
++    *tdata = param;
++    *nsource = 1u;                      /* NSOURCE_NOTIFICATION */
++    *fifo = 2u;
++    InterlockedOr((volatile LONG *)intr, 0x00100000);   /* PGRAPH_INTR_ERROR */
++    InterlockedOr((volatile LONG *)pmc, 0x00001000);    /* PMC_INTR_0: PGRAPH */
++    raised++;
++    {   /* now, not at the next vblank (kernel_bridge.c) */
++        extern void xbox_Nv2aPgraphInterrupt(void);
++        xbox_Nv2aPgraphInterrupt();
++    }
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&t0);
++    for (;;) {
++        if (*fifo == 1u)
++            break;
++        QueryPerformanceCounter(&now);
++        if ((now.QuadPart - t0.QuadPart) * 1000 / f.QuadPart >= 250) {
++            if (timeouts++ < 5)
++                fprintf(stderr, "  [NV2A] software method %u (0x%08X): no handler after 250 ms, dropped\n",
++                        param & 0x1Fu, param);
++            break;
++        }
++        Sleep(1);
++    }
++    InterlockedAnd((volatile LONG *)intr, ~0x00100000);
++    *nsource = 0;
++    InterlockedAnd((volatile LONG *)pmc, ~0x00001000);
++    InterlockedDecrement(&g_nv2a_sw_intr_inflight);
++    ReleaseSRWLockExclusive(&lock);
++    if (raised <= 3 || (raised & (raised - 1)) == 0)
++        fprintf(stderr, "  [NV2A] software method %u (0x%08X) raised (%u so far, %u unanswered)\n",
++                param & 0x1Fu, param, raised, timeouts);
++    return 1;
++}
++
++/* The executor's part: the methods RECOMP_PB_SW_INTR selects, when the walk
++ * reaches them. */
++static int sw_method_interrupt(uint32_t param)
++{
++    static int on = -1;
++    static uint32_t ids;                /* bit n: software method n is delivered */
++    if (on < 0) {
++        /* RECOMP_PB_SW_INTR: 0 none; "all"; or a hex mask of method numbers.
++         * Default: 5 only -- the one D3D sleeps on (BlockOnTime). Delivering
++         * every method (8, 9 and 13 come several times a frame) took a match
++         * from 9.6 ms frames to 80 ms; as no-ops they cost nothing visible. */
++        const char *e = getenv("RECOMP_PB_SW_INTR");
++        on = !(e && *e == '0');
++        ids = (e && !strcmp(e, "all")) ? 0xFFFFFFFFu
++            : (e && *e && *e != '0') ? (uint32_t)strtoul(e, NULL, 16) : (1u << 5);
++    }
++    if (!on || !(ids & (1u << (param & 0x1Fu))))
++        return 0;
++    return xbox_Nv2aRaiseSoftwareMethod(param);
++}
++
+ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+ {
+     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
+@@ -4930,8 +5021,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         break;
+     case NV097_NO_OPERATION:
+         /* Non-zero, it is one of D3D's software methods, which the GPU traps
+-         * to D3D's interrupt handler on the console. Only the swap's interval
+-         * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
++         * to D3D's interrupt handler on the console. The swap (method 1) is
++         * paced here (nv2a_flip_hold.h); the others go to the handler. */
++        if (param && (param & 0x1Fu) != 1u && sw_method_interrupt(param))
++            return;
+         if (!nv2a_pb_exec_flip_pacing()) {
+             if (!imm_vertex_method(method, param))
+                 note_unhandled(method, param);   /* as before the hold */
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index 8bc848d..6aeedc3 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1428,6 +1428,11 @@ static void framebuffer_probe_tick(void)
+  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
+  * from inside the walk answers the kickoff within a few hundred commands,
+  * without a thread of its own spinning on a host core. */
++/* A software-method interrupt being delivered (nv2a_pb_exec.c
++ * xbox_Nv2aRaiseSoftwareMethod): its PGRAPH_INTR and PMC_INTR_0 bits belong to
++ * the raiser until D3D's handler has run, as the vblank's do. */
++volatile LONG g_nv2a_sw_intr_inflight;
++
+ static void nv2a_ack_busy_bits(int flip_held)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+@@ -1452,6 +1457,12 @@ static void nv2a_ack_busy_bits(int flip_held)
+             else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
+                 mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
+         }
++        if (g_nv2a_sw_intr_inflight) {
++            if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
++                mask &= ~0x00001000u;               /* PMC: PGRAPH */
++            else if (NV2A_ACK[i].offset == 0x400100u)
++                mask &= ~0x00100000u;               /* PGRAPH_INTR_ERROR */
++        }
+         /* Interlocked: the vblank-ack thread and the guest change other
+          * bits of the same word meanwhile. */
+         if (*r & mask)
+-- 
+2.51.0.windows.2
+
