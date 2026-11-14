@@ -459,7 +459,7 @@ The remaining dips were the game's own code (bot collision traces, `SV_Recursive
 
 ## First-release checklist (agreed 2026-11-13)
 Must-have, in order:
-1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); Valve-intro hitches; ~~slow map load~~ (fixed 2026-11-13, 28 s -> 8 s, below); relaunch on map change (likely the same wait, not yet re-measured); rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
+1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); ~~Valve-intro hitches~~ (not a bug: the movie's own frame times hold the logo, below); ~~slow map load~~ (fixed 2026-11-13, 28 s -> 8 s, below); relaunch on map change (likely the same wait, not yet re-measured); rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
 2. Every map loads and plays (only Airstrip verified so far); watch for unimplemented paths (cube maps, water).
 3. Visual correctness: smoke/haze vs xemu, mipmaps (distant shimmer), runway decal.
 4. Multi-hour soak including several map rotations and menu <-> game relaunches.
@@ -483,3 +483,9 @@ Every map load (game_probe: relaunch into Airstrip) sat 20 s on one blank frame 
 - Our `PhyGetLinkState` always reported link-up with no network adapter behind it, so XNet ran DHCP against nothing and waited out its timeout (polling the link ~200,000 times a second).
 - Fix: toolkit patch 0020, `RECOMP_PHY_LINK=0` (cable unplugged, as on a console with none), set in scripts/run.ps1. Scene now starts at 8.1 s instead of 28.7 s; 12/12 boots to the menu; Airstrip 71.3 FPS over 2 min.
 - Also: the profiler CSV (`RECOMP_CS_PROF_CSV`) has a `chain` column, every translated function on the sampled stack.
+
+## Valve intro "hitches" are in the movie (2026-11-13)
+The overlay video pauses for 100-570 ms several times between ~15 and ~20.6 s of a boot, the same in every run.
+- The XMV frame times in Valve_Logo.xmv have those gaps: after the first second the deltas include 166, 200, 300, 367, 468, 767 and 968 ms where the logo holds still (read live from the decoder's next-frame time, `[decoder+0xF8]`).
+- Playback follows them to within a vblank, the main thread is asleep in the movie loop 89% of the time (`sub_000C6D40`, 10 ms sleeps while no frame is due), and the game loop keeps flipping at 60 Hz throughout. Nothing to fix.
+- Real stalls left around the intros: ~0.3-0.4 s as the MGS movie starts (zlib inflate on the main thread, `sub_002422F1`; a console spends at least as long) and ~0.15 s at the title transition.
