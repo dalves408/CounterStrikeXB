@@ -180,8 +180,10 @@ static void emit(const char *line, size_t n)
     DWORD w;
     size_t m;
 
-    /* The long per-texture and per-method tables say nothing a report needs and are most of the bytes. */
-    if (starts(line, n, "  [TEXUSE]") || starts(line, n, "  [GPU]   0x"))
+    /* The long per-texture and per-method tables say nothing a report needs and are most of the bytes. So is the
+     * toolkit's draw counter (one line per 200 draws, three quarters of a match's log, which then reached the 20 MB
+     * cap in about 12 minutes); a stalled picture is a [FREEZE] report, with every thread's stack. */
+    if (starts(line, n, "  [TEXUSE]") || starts(line, n, "  [GPU]   0x") || starts(line, n, "  [GPU] draw #"))
         return;
     m = scrub(line, n, clean, sizeof clean);
     if (s_orig && !WriteFile(s_orig, clean, (DWORD)m, &w, NULL))
