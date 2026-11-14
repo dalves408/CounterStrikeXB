@@ -1,0 +1,60 @@
+From c265ce368b9502d299158d1b5077532746258e17 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel: RECOMP_PHY_LINK=0 reports the Ethernet cable
+ unplugged (CounterStrikeXB2 local patch)
+
+PhyGetLinkState always said link-up, with no network adapter modelled
+behind it. A title whose network stack starts on its own then looks for an
+address that never comes: Counter-Strike starts XNet for every game, single
+player included, and each map load waited out the 20 s DHCP timeout (polling
+PhyGetLinkState ~200,000 times a second) before giving up and starting its
+local server. RECOMP_PHY_LINK=0 reports no link, as a console with no cable
+does, and the load takes 8 s instead of 28. Default unchanged (link-up).
+---
+ src/kernel/kernel_xbox.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index 1243f1a..9da4db3 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include "kernel.h"
++#include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ 
+@@ -360,11 +361,25 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(
+  * NIC. For PC, we report link-up since we'll handle networking differently.
+  * ============================================================================ */
+ 
++/* RECOMP_PHY_LINK=0: report the Ethernet cable as unplugged.
++ *
++ * Link-up is the default, but no network adapter is modelled behind it, so a
++ * title whose network stack starts on its own goes looking for an address
++ * that never comes. Counter-Strike starts one for every game, single player
++ * included (its local server binds through XNet): with the link up, XNet ran
++ * DHCP against no NIC and the map load waited out its 20 s timeout before the
++ * game gave up ("Could not get TCP/IP address, TCP/IP disabled") and went on
++ * -- polling this 200,000 times a second meanwhile. With the link down XNet
++ * gives up at once, as on a console with no cable. */
+ ULONG __stdcall xbox_PhyGetLinkState(BOOLEAN Verify)
+ {
++    static int link = -1;
+     (void)Verify;
+-    /* Return link up, 100 Mbps, full duplex */
+-    return 0x01; /* XNET_ETHERNET_LINK_ACTIVE */
++    if (link < 0) {
++        const char *e = getenv("RECOMP_PHY_LINK");
++        link = !(e && *e == '0');
++    }
++    return link ? 0x01u : 0u;   /* XNET_ETHERNET_LINK_ACTIVE, or nothing */
+ }
+ 
+ NTSTATUS __stdcall xbox_PhyInitialize(BOOLEAN ForceReset, PVOID Param2)
+-- 
+2.51.0.windows.2
+

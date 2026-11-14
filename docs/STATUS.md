@@ -459,7 +459,7 @@ The remaining dips were the game's own code (bot collision traces, `SV_Recursive
 
 ## First-release checklist (agreed 2026-11-13)
 Must-have, in order:
-1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); Valve-intro hitches; slow map load and slow relaunch on map change; rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
+1. Known bugs: ~~intermittent intro freeze~~ (fixed 2026-11-13, below); Valve-intro hitches; ~~slow map load~~ (fixed 2026-11-13, 28 s -> 8 s, below); relaunch on map change (likely the same wait, not yet re-measured); rare boot stall (a thread at raised IRQL spins up to ~7 s with an APU interrupt pending; seen in about 1 boot in 50).
 2. Every map loads and plays (only Airstrip verified so far); watch for unimplemented paths (cube maps, water).
 3. Visual correctness: smoke/haze vs xemu, mipmaps (distant shimmer), runway decal.
 4. Multi-hour soak including several map rotations and menu <-> game relaunches.
@@ -476,3 +476,10 @@ The first intro movie (MGS logo) froze for 32.7 s in about 1 boot in 10 (1 in 4 
 - Root cause: the XAPI input code (`sub_0031B21C`, opening a pad) builds a KEVENT on its stack and waits on it (50 ms, then cancel and wait again). Without `RECOMP_TITLE_KEVENTS` the bridge did not know that event, so both waits failed at once with STATUS_UNSUCCESSFUL; the code returned with the USB request still pending and its completion later wrote into reused stack.
 - Fix: `RECOMP_TITLE_KEVENTS=1` in scripts/run.ps1. Verified: 24 stress boots with the watchpoint armed, 0 freezes and 0 stray writes (was about 1 in 4); on the committed build 0 of 24 normal boots and 0 of 24 under profiler load. Gameplay unchanged (Airstrip ~72 FPS; the 20 s map load is the known one).
 - Kept as tools: `scripts/boot_loop.ps1` (repeated boots, freeze count), `CS_ABI_CHECK` (CMake; callee-saved checks in a separate build), toolkit patch 0019 (`RECOMP_APU_VTRACE=<voice>`, `RECOMP_APU_VSTAT`), io.csv event/APC/bytes columns, `[CLOCK] t0_qpc_ms` (lines up QPC-clock traces with frames.csv).
+
+## Map load 28 s -> 8 s: no Ethernet link (2026-11-13)
+Every map load (game_probe: relaunch into Airstrip) sat 20 s on one blank frame with all threads idle.
+- The main thread looped in `sub_0006D150`: `XNetGetTitleXnAddr` (`sub_0026304B`) then Sleep(10) until it stopped answering "pending", then "Could not get TCP/IP address, TCP/IP disabled". Counter-Strike starts its network stack for every game, single player included (the local server binds through XNet).
+- Our `PhyGetLinkState` always reported link-up with no network adapter behind it, so XNet ran DHCP against nothing and waited out its timeout (polling the link ~200,000 times a second).
+- Fix: toolkit patch 0020, `RECOMP_PHY_LINK=0` (cable unplugged, as on a console with none), set in scripts/run.ps1. Scene now starts at 8.1 s instead of 28.7 s; 12/12 boots to the menu; Airstrip 71.3 FPS over 2 min.
+- Also: the profiler CSV (`RECOMP_CS_PROF_CSV`) has a `chain` column, every translated function on the sampled stack.

@@ -301,9 +301,10 @@ static DWORD WINAPI prof_thread(LPVOID p)
         FILE *f = path ? fopen(path, "w") : NULL;
         size_t i;
         if (f) {
-            fprintf(f, "t_ms,tid,guest,guest_caller,leaf\n");
+            fprintf(f, "t_ms,tid,guest,guest_caller,leaf,chain\n");
             for (i = 0; i < ns; i++) {
-                char leaf[200], g[200] = "", gc[200] = "", nm[200];
+                char leaf[200], g[200] = "", gc[200] = "", nm[200], chain[1200] = "";
+                size_t cl = 0;
                 int d;
                 if (s[i].tid == self) continue;
                 sym_func(s[i].pc[0], leaf, sizeof leaf);
@@ -315,7 +316,13 @@ static DWORD WINAPI prof_thread(LPVOID p)
                         break;
                     }
                 }
-                fprintf(f, "%.1f,%lu,%s,%s,%s\n", s[i].t_ms, s[i].tid, g, gc, leaf);
+                /* every translated function on the stack, innermost first */
+                for (d = 0; d < s[i].n && cl + 16 < sizeof chain; d++) {
+                    sym_func(s[i].pc[d], nm, sizeof nm);
+                    if (!strncmp(nm, "sub_", 4))
+                        cl += (size_t)snprintf(chain + cl, sizeof chain - cl, "%s%s", cl ? "<" : "", nm + 4);
+                }
+                fprintf(f, "%.1f,%lu,%s,%s,%s,%s\n", s[i].t_ms, s[i].tid, g, gc, leaf, chain);
             }
             fclose(f);
             fprintf(stderr, "[PROF] samples written to %s\n", path);
