@@ -4,4 +4,6 @@
 void cs_d3d11_init(void);
 /* Milliseconds since cs_d3d11_init (QueryPerformanceCounter); shared clock for the timing logs. */
 double cs_now_ms(void);
+/* The F1 menu changed a setting (g_cs_settings): apply it between frames. */
+void cs_d3d11_settings_changed(void);
 #endif

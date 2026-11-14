@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "c265ce368b9502d299158d1b5077532746258e17",
+                       "commit":  "0b1d31e34a09cfee9edafb894a8515270122a805",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -24,7 +24,8 @@
                                              "patches/xboxrecomp/0017-recomp-register-promotion-promote-regs.patch",
                                              "patches/xboxrecomp/0018-recomp-direct-APU-register-access-direct-mmio.patch",
                                              "patches/xboxrecomp/0019-apu-per-voice-method-trace-and-voice-stats-without-t.patch",
-                                             "patches/xboxrecomp/0020-kernel-RECOMP_PHY_LINK-0-reports-the-Ethernet-cable-.patch"
+                                             "patches/xboxrecomp/0020-kernel-RECOMP_PHY_LINK-0-reports-the-Ethernet-cable-.patch",
+                                             "patches/xboxrecomp/0021-video-input-hooks-for-a-title-s-own-presenter-and-ho.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

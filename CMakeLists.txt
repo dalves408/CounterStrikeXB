@@ -34,6 +34,8 @@ set(GAME_SOURCES
     src/cs_rc_hlsl.c
     src/cs_kernel.c
     src/cs_launch.c
+    src/cs_settings.c
+    src/cs_overlay.c
 )
 
 option(CS_GEN_INLINE "MSVC: /Ob2 /GS- for the generated code (measured: no gain)" OFF)
@@ -95,3 +97,19 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
         COMPILE_OPTIONS "/clang:-fstrict-aliasing;/clang:-fms-compatibility-version=19.20;-Wno-everything")
 endif()
+
+# config.exe: the player's settings program (Video and Controls), next to the
+# game. Shares settings.ini with the game (src/cs_settings.c) and writes the
+# keymap.ini the toolkit's keyboard reads, with the toolkit's own key names.
+add_executable(config WIN32
+    config/config.c
+    src/cs_settings.c
+    ${XBOXRECOMP_DIR}/src/input/input_map.c
+    ${XBOXRECOMP_DIR}/src/input/keyboard.c
+)
+target_include_directories(config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${XBOXRECOMP_DIR}/src/input
+    ${XBOXRECOMP_DIR}/src
+)
+target_link_libraries(config PRIVATE comctl32)

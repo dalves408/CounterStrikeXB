@@ -42,6 +42,8 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <math.h>
 #include <stdint.h>
@@ -50,6 +52,8 @@
 #include <string.h>
 
 #include "cs_d3d11.h"
+#include "cs_settings.h"
+#include "video/video_player.h"
 #include "nv2a_backend.h"
 #include "cs_vsh_hlsl.h"
 #include "cs_rc_hlsl.h"
@@ -71,11 +75,16 @@ extern const float *nv2a_vsh_constant(uint32_t index);   /* kernel/nv2a_vsh_inte
  * 0x80xxxxxx contiguous): compare them as physical offsets. */
 #define PHYS(va) ((va) & 0x03FFFFFFu)
 
+/* Targets are made at the player's render scale (F1 / config.exe): w and h
+ * stay the title's sizes, everything on the GPU is s_scale times larger. With
+ * MSAA the drawing goes to `ms` (rtv is its view) and is resolved into `tex`
+ * (what srv samples and the presenter shows) before anything reads it. */
 typedef struct {
     uint32_t va, rawva, w, h, bpp, pitch;   /* va: physical offset (match key); rawva: address as the title used it */
     uint32_t dirty, used;
     int pend;                      /* a copy is queued in stage, for the next present */
-    ID3D11Texture2D *tex, *stage;
+    int unresolved;                /* MSAA: drawn since the last resolve */
+    ID3D11Texture2D *tex, *stage, *ms;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
 } Rt;
@@ -85,6 +94,10 @@ typedef struct {
     ID3D11Texture2D *tex;
     ID3D11DepthStencilView *dsv;
 } Ds;
+
+static int s_scale = 1, s_msaa = 1, s_aniso = 1;   /* what the targets and samplers are made with now */
+static int s_presenting;                           /* our presenter draws the window (cs_window_present) */
+static void settings_apply(int first);
 
 typedef struct {
     uint32_t offset, w, h, color, pitch, used;
@@ -386,6 +399,7 @@ static int cs_ready(void)
         if ((e = getenv("RECOMP_CS_CULL")) && e[0] == '0') s_cull_on = 0;
         s_pixofs = (e = getenv("RECOMP_CS_PIXOFS")) ? (float)atof(e) : 0.0f;
         if (!cs_d3d11_setup()) { s_failed = 1; fprintf(stderr, "[CS-D3D11] init failed; no GPU drawing\n"); return 0; }
+        settings_apply(1);
     }
     return 1;
 }
@@ -394,8 +408,18 @@ static int cs_ready(void)
 
 static void rt_release(Rt *r)
 {
-    SAFE_REL(r->rtv); SAFE_REL(r->srv); SAFE_REL(r->tex); SAFE_REL(r->stage);
+    SAFE_REL(r->rtv); SAFE_REL(r->srv); SAFE_REL(r->tex); SAFE_REL(r->stage); SAFE_REL(r->ms);
     memset(r, 0, sizeof *r);
+}
+
+/* MSAA: the samples drawn since the last resolve, into the texture that is sampled and shown. */
+static void rt_resolve(Rt *r)
+{
+    if (r->ms && r->unresolved) {
+        ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)r->tex, 0, (ID3D11Resource *)r->ms, 0,
+                                               DXGI_FORMAT_B8G8R8A8_UNORM);
+        r->unresolved = 0;
+    }
 }
 
 static Rt *get_rt(const Nv2aSurface *s)
@@ -415,17 +439,25 @@ static Rt *get_rt(const Nv2aSurface *s)
     if (free_i < 0) { free_i = lru; rt_release(&s_rt[free_i]); }
     r = &s_rt[free_i];
     memset(&td, 0, sizeof td);
-    td.Width = s->width; td.Height = s->height; td.MipLevels = td.ArraySize = 1;
+    td.Width = s->width * (UINT)s_scale; td.Height = s->height * (UINT)s_scale; td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->tex))) { rt_release(r); return NULL; }
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)r->tex, NULL, &r->srv);
-    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->tex, NULL, &r->rtv);
-    td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->stage);
+    if (s_msaa > 1) {
+        td.SampleDesc.Count = (UINT)s_msaa; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->ms))) { rt_release(r); return NULL; }
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->ms, NULL, &r->rtv);
+        td.SampleDesc.Count = 1;
+    } else
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->tex, NULL, &r->rtv);
+    if (s_scale == 1) {   /* the copy back to guest memory is at the title's size */
+        td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->stage);
+    }
     r->va = PHYS(s->color_va); r->rawva = s->color_va; r->w = s->width; r->h = s->height;
-    r->pitch = s->pitch; r->bpp = s->bytes_per_pixel; r->used = s_tick; r->dirty = 0;
-    if (!r->srv || !r->rtv || !r->stage) { rt_release(r); return NULL; }
+    r->pitch = s->pitch; r->bpp = s->bytes_per_pixel; r->used = s_tick; r->dirty = 0; r->unresolved = 0;
+    if (!r->srv || !r->rtv || (s_scale == 1 && !r->stage)) { rt_release(r); return NULL; }
     if (s_log)
         fprintf(stderr, "[CS-D3D11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n",
                 s->color_va, s->width, s->height, s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy);
@@ -442,8 +474,8 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     for (i = 0; i < MAX_DS; i++) if (!s_ds[i].tex) { slot = i; break; }
     if (slot < 0) { slot = (int)(s_tick % MAX_DS); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
-    td.Width = s->width; td.Height = s->height; td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.Width = s->width * (UINT)s_scale; td.Height = s->height * (UINT)s_scale; td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = (UINT)s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
@@ -582,7 +614,7 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
     /* SET_TEXTURE_FILTER: MIN in bits 16-23, MAG in 24-27; 1 = nearest. */
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
-    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v };
+    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v, (uint32_t)s_aniso };
     ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(s_ss, s_nss, key);
     D3D11_SAMPLER_DESC d;
     if (s) return s;
@@ -591,8 +623,13 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
     else if (key[0]) d.Filter = D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR;
     else if (key[1]) d.Filter = D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
     else d.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    d.MaxAnisotropy = 1;
+    if (s_aniso > 1 && !key[0]) {   /* anisotropic filtering (F1): textures the title filters linearly */
+        d.Filter = D3D11_FILTER_ANISOTROPIC;
+        d.MaxAnisotropy = (UINT)s_aniso;
+    }
     d.AddressU = addr_mode(t->addr_u); d.AddressV = addr_mode(t->addr_v); d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.MaxLOD = 0.0f; d.MaxAnisotropy = 1; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    d.MaxLOD = 0.0f; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s))) return NULL;
     if (s_nss < 48) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
     return s;
@@ -691,6 +728,7 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].va == PHYS(t->offset) && s_rt[i].w == t->width && s_rt[i].h == t->height) {
             st_rtsamples++;
+            rt_resolve(&s_rt[i]);
             return s_rt[i].srv;
         }
 
@@ -814,7 +852,7 @@ static void cs_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
         c[0] = ((argb >> 16) & 255) / 255.0f; c[1] = ((argb >> 8) & 255) / 255.0f;
         c[2] = (argb & 255) / 255.0f; c[3] = ((argb >> 24) & 255) / 255.0f;
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
-        rt->dirty = 1;
+        rt->dirty = 1; rt->unresolved = 1;
     }
     if ((flags & 3) && (ds = get_ds(s, rs->zeta_va)) != NULL) {
         UINT f = 0;
@@ -991,8 +1029,9 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, ds ? ds->dsv : NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
-    vp.TopLeftX = vp.TopLeftY = s_pixofs;
-    vp.Width = (float)s->width; vp.Height = (float)s->height; vp.MinDepth = 0; vp.MaxDepth = 1;
+    vp.TopLeftX = vp.TopLeftY = s_pixofs * (float)s_scale;
+    vp.Width = (float)(s->width * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale);
+    vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_PSSetShader(s_ctx, !use_rc ? s_ps : (cb.dbg ? s_ps_rc : rc_shader(b->combiner)), NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
@@ -1253,7 +1292,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &one);
         }
         box.left = (UINT)s_pick_x; box.top = (UINT)s_pick_y; box.right = box.left + 1; box.bottom = box.top + 1; box.front = 0; box.back = 1;
-        if (one && box.right <= rt->w && box.bottom <= rt->h) {
+        if (one && s_scale == 1 && s_msaa == 1 && box.right <= rt->w && box.bottom <= rt->h) {
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)one, 0, 0, 0, 0, (ID3D11Resource *)rt->tex, 0, &box);
             if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)one, 0, D3D11_MAP_READ, 0, &pm))) {
                 fprintf(stderr, "[PICK]    -> pixel now %08X\n", *(const uint32_t *)pm.pData);
@@ -1263,7 +1302,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         s_pick_hit = 0;
     }
     s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
-    rt->dirty = 1;
+    rt->dirty = 1; rt->unresolved = 1;
     st_draws++; st_tris += kept / 3;
     s_fr_draws++; s_fr_tris += kept / 3;
     if (s_flash_dir && s_dln[s_dlc] < DL_MAX) {
@@ -1443,14 +1482,23 @@ static void cs_present_sync(void)
          * buffer, glow buffers) are sampled on the GPU and never read here.
          * Dumps, flash capture and RECOMP_CS_RB_ALL=1 keep the synchronous
          * all-targets path below. */
-        static int rb_all = -1;
+        static int rb_all = -1, fb_dump = -1;
         if (rb_all < 0) { const char *e = getenv("RECOMP_CS_RB_ALL"); rb_all = e && *e == '1'; }
+        if (fb_dump < 0) fb_dump = getenv("RECOMP_FB_DUMP") != NULL;
+        if (s_presenting && !dumping && !s_flash_dir && !rb_all && !fb_dump) {
+            /* Our presenter shows the frame straight from the GPU: nothing
+             * needs it in guest memory. */
+            for (i = 0; i < MAX_RT; i++) s_rt[i].dirty = 0;
+            ID3D11DeviceContext_Flush(s_ctx);
+            goto done;
+        }
         if (!dumping && !s_flash_dir && !rb_all) {
             for (i = 0; i < MAX_RT; i++) {
                 Rt *rt = &s_rt[i];
                 if (!rt->tex) continue;
                 if (rt->pend) { rb_write(rt); rt->pend = 0; readi[nrb] = i; st_rb++; nrb++; }
-                if (rt->dirty && rt->w == 640 && rt->h == 480) {
+                if (rt->dirty && rt->stage && rt->w == 640 && rt->h == 480) {
+                    rt_resolve(rt);
                     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)rt->stage, (ID3D11Resource *)rt->tex);
                     rt->pend = 1;
                 }
@@ -1465,7 +1513,8 @@ static void cs_present_sync(void)
     }
     for (i = 0; i < MAX_RT; i++) {
         Rt *rt = &s_rt[i];
-        if (!rt->tex || !rt->dirty) continue;
+        if (!rt->tex || !rt->dirty || !rt->stage) continue;   /* no stage: scaled, no copy back */
+        rt_resolve(rt);
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)rt->stage, (ID3D11Resource *)rt->tex);
         if (dumping) dump_rt_bmp(rt, dump_dir);
         rb_write(rt);
@@ -1780,10 +1829,282 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     ID3D11DeviceContext_DrawIndexed(s_ctx, p->index_count, s_gv_ib_off, 0);
     s_gv_in_off += rows;
     s_gv_ib_off += p->index_count;
-    rt->dirty = 1;
+    rt->dirty = 1; rt->unresolved = 1;
     st_draws++; st_gv_draws++; st_tris += p->index_count / 3;
     s_fr_draws++; s_fr_tris += p->index_count / 3;
     return 1;
+}
+
+/* ---- presenting to the window, and the player's settings ------------------
+ *
+ * The toolkit's window used to show the frame from guest memory (a 640x480
+ * copy read back from the GPU every flip). Now this device presents the
+ * title's front buffer straight into a swap chain on that window at each flip
+ * (xbox_FramebufferSetPresenter), so the picture keeps the render scale and
+ * anti-aliasing it was drawn with, and nothing is read back. On top goes the
+ * video overlay (the intro movies), composited by the toolkit into a 640x480
+ * frame and drawn with its alpha.
+ *
+ * Settings (F1 menu, config.exe; cs_settings.h): render scale and MSAA remake
+ * every target between frames; anisotropy remakes the samplers; stretch, vsync
+ * and the frame-rate cap are read here at each present. The ESC/F1 menus are
+ * a separate window over this one (cs_overlay.c): the game keeps drawing. */
+static IDXGISwapChain1 *s_sc;
+static ID3D11RenderTargetView *s_bb_rtv;
+static UINT s_bb_w, s_bb_h;
+static int s_tearing;
+static ID3D11VertexShader *s_blit_vs;
+static ID3D11PixelShader *s_blit_ps, *s_blit_ps_a;
+static ID3D11SamplerState *s_blit_smp;
+static ID3D11BlendState *s_blit_alpha;
+static ID3D11Texture2D *s_ov_tex;
+static ID3D11ShaderResourceView *s_ov_srv;
+static uint32_t *s_ov_buf;
+static int s_ov_valid;                  /* the overlay texture holds a frame to draw */
+static volatile LONG s_settings_dirty;
+
+static const char s_blit_hlsl[] =
+"Texture2D t : register(t0); SamplerState s : register(s0);\n"
+"struct VO { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+"VO vs(uint i : SV_VertexID) { VO o; float2 uv = float2((i << 1) & 2, i & 2); o.uv = uv;\n"
+"  o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+"float4 ps(VO i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n"
+"float4 ps_a(VO i) : SV_Target { return t.Sample(s, i.uv); }\n";
+
+void cs_d3d11_settings_changed(void) { InterlockedExchange(&s_settings_dirty, 1); }
+
+/* The most samples, up to `want`, the card has for both the colour and the depth format. */
+static int msaa_supported(int want)
+{
+    int n;
+    for (n = want > 8 ? 8 : want; n > 1; n >>= 1) {
+        UINT qc = 0, qd = 0;
+        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, (UINT)n, &qc);
+        ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D24_UNORM_S8_UINT, (UINT)n, &qd);
+        if (qc > 0 && qd > 0) return n;
+    }
+    return 1;
+}
+
+/* Between frames, on the executor thread: make the targets and samplers match the settings. */
+static void settings_apply(int first)
+{
+    int scale = g_cs_settings.scale < 1 ? 1 : g_cs_settings.scale > CS_SET_SCALES ? CS_SET_SCALES : g_cs_settings.scale;
+    int msaa = msaa_supported(g_cs_settings.msaa), aniso = g_cs_settings.aniso, i;
+    if (aniso < 1) aniso = 1;
+    if (aniso > 16) aniso = 16;
+    if (scale != s_scale || msaa != s_msaa) {
+        for (i = 0; i < MAX_RT; i++) if (s_rt[i].tex || s_rt[i].ms) rt_release(&s_rt[i]);
+        for (i = 0; i < MAX_DS; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); memset(&s_ds[i], 0, sizeof s_ds[i]); }
+        s_scale = scale; s_msaa = msaa;
+    }
+    if (aniso != s_aniso) {
+        for (i = 0; i < s_nss; i++) { ID3D11SamplerState *o = (ID3D11SamplerState *)s_ss[i].obj; SAFE_REL(o); }
+        s_nss = 0;
+        s_aniso = aniso;
+    }
+    if (first || s_log)
+        fprintf(stderr, "[CS-D3D11] render scale %dx (%ux%u), msaa %d%s, anisotropy %d\n", s_scale,
+                640u * (unsigned)s_scale, 480u * (unsigned)s_scale, s_msaa,
+                msaa != g_cs_settings.msaa ? " (the most this card has)" : "", s_aniso);
+}
+
+static int blit_init(void)
+{
+    static int done, ok;
+    ID3DBlob *b = NULL, *err = NULL;
+    D3D11_SAMPLER_DESC sd;
+    D3D11_BLEND_DESC bd;
+    D3D11_TEXTURE2D_DESC td;
+    if (done) return ok;
+    done = 1;
+    if (SUCCEEDED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL, "vs", "vs_4_0", 0, 0, &b, &err))) {
+        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_blit_vs);
+        SAFE_REL(b);
+    }
+    if (SUCCEEDED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL, "ps", "ps_4_0", 0, 0, &b, &err))) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_blit_ps);
+        SAFE_REL(b);
+    }
+    if (SUCCEEDED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, "blit", NULL, NULL, "ps_a", "ps_4_0", 0, 0, &b, &err))) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_blit_ps_a);
+        SAFE_REL(b);
+    }
+    SAFE_REL(err);
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX; sd.MaxAnisotropy = 1; sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    ID3D11Device_CreateSamplerState(s_dev, &sd, &s_blit_smp);
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ID3D11Device_CreateBlendState(s_dev, &bd, &s_blit_alpha);
+    memset(&td, 0, sizeof td);
+    td.Width = 640; td.Height = 480; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ov_tex)))
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ov_tex, NULL, &s_ov_srv);
+    s_ov_buf = (uint32_t *)malloc(640u * 480u * 4u);
+    ok = s_blit_vs && s_blit_ps && s_blit_ps_a && s_blit_smp && s_blit_alpha && s_ov_srv && s_ov_buf;
+    if (!ok) fprintf(stderr, "[CS-D3D11] presenter shaders failed; the window keeps the old path\n");
+    return ok;
+}
+
+/* A swap chain on the window, its back buffer the window's client size. */
+static int swapchain_ensure(HWND h)
+{
+    RECT cr;
+    UINT w, hh;
+    if (!s_sc) {
+        IDXGIDevice *dd = NULL; IDXGIAdapter *ad = NULL; IDXGIFactory2 *f = NULL;
+        DXGI_SWAP_CHAIN_DESC1 d;
+        HRESULT hr = E_FAIL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dd)) &&
+            SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad)) &&
+            SUCCEEDED(IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&f))) {
+            IDXGIFactory5 *f5 = NULL;
+            BOOL tear = FALSE;
+            if (SUCCEEDED(IDXGIFactory2_QueryInterface(f, &IID_IDXGIFactory5, (void **)&f5))) {
+                if (FAILED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tear, sizeof tear)))
+                    tear = FALSE;
+                SAFE_REL(f5);
+            }
+            s_tearing = tear ? 1 : 0;
+            memset(&d, 0, sizeof d);
+            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+            d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = 2;
+            d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; d.Scaling = DXGI_SCALING_STRETCH;
+            d.Flags = s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+            hr = IDXGIFactory2_CreateSwapChainForHwnd(f, (IUnknown *)s_dev, h, &d, NULL, NULL, &s_sc);
+            if (SUCCEEDED(hr))
+                IDXGIFactory2_MakeWindowAssociation(f, h, DXGI_MWA_NO_ALT_ENTER);   /* F11 / Alt+Enter are the window's */
+        }
+        SAFE_REL(f); SAFE_REL(ad); SAFE_REL(dd);
+        if (FAILED(hr)) {
+            fprintf(stderr, "[CS-D3D11] swap chain on the window failed 0x%08lX\n", (unsigned long)hr);
+            return 0;
+        }
+        fprintf(stderr, "[CS-D3D11] presenting to the window (tearing %s)\n", s_tearing ? "available" : "not available");
+    }
+    GetClientRect(h, &cr);
+    w = (UINT)(cr.right > 0 ? cr.right : 1); hh = (UINT)(cr.bottom > 0 ? cr.bottom : 1);
+    if (!s_bb_rtv || w != s_bb_w || hh != s_bb_h) {
+        ID3D11Texture2D *bb = NULL;
+        SAFE_REL(s_bb_rtv);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_sc, 0, w, hh, DXGI_FORMAT_UNKNOWN,
+                                                 s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0)))
+            return 0;
+        if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_sc, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
+            ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_bb_rtv);
+            SAFE_REL(bb);
+        }
+        s_bb_w = w; s_bb_h = hh;
+    }
+    return s_bb_rtv != NULL;
+}
+
+/* The title's front buffer (and the video overlay) on the window. `fresh`:
+ * compose the video overlay again (else the last one is drawn). */
+static void present_frame(HWND h, uint32_t fb_va, int fresh)
+{
+    Rt *rt = NULL;
+    D3D11_VIEWPORT vp;
+    float black[4] = { 0, 0, 0, 1 };
+    int i;
+    UINT sync, flags;
+    ID3D11ShaderResourceView *none = NULL;
+
+    if (!swapchain_ensure(h)) return;
+    for (i = 0; i < MAX_RT; i++)
+        if (s_rt[i].tex && s_rt[i].va == PHYS(fb_va) && (!rt || s_rt[i].w == 640)) rt = &s_rt[i];
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_bb_rtv, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
+    {   /* the picture: 4:3 in the middle, or the whole window with Stretch */
+        float aw = (float)s_bb_w, ah = (float)s_bb_h;
+        float fw = rt ? (float)rt->w : 640.0f, fh = rt ? (float)rt->h : 480.0f;
+        vp.MinDepth = 0; vp.MaxDepth = 1;
+        if (g_cs_settings.stretch) { vp.TopLeftX = vp.TopLeftY = 0; vp.Width = aw; vp.Height = ah; }
+        else if (aw * fh > ah * fw) { vp.Height = ah; vp.Width = ah * fw / fh; vp.TopLeftX = (aw - vp.Width) * 0.5f; vp.TopLeftY = 0; }
+        else { vp.Width = aw; vp.Height = aw * fh / fw; vp.TopLeftX = 0; vp.TopLeftY = (ah - vp.Height) * 0.5f; }
+    }
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+    if (rt) {
+        rt_resolve(rt);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    }
+    if (fresh) {   /* the movie overlay, composed by the toolkit: drawn pixels opaque, the rest clear */
+        const uint32_t key = 0x00010203u;
+        uint32_t n;
+        for (n = 0; n < 640u * 480u; n++) s_ov_buf[n] = key;
+        s_ov_valid = xbox_FramebufferComposeOverlay(s_ov_buf);
+        if (s_ov_valid) {
+            for (n = 0; n < 640u * 480u; n++)
+                s_ov_buf[n] = s_ov_buf[n] == key ? 0u : (s_ov_buf[n] | 0xFF000000u);
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_ov_tex, 0, NULL, s_ov_buf, 640u * 4u, 0);
+        }
+    }
+    if (s_ov_valid) {
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blit_alpha, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps_a, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_ov_srv);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    }
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    sync = g_cs_settings.vsync ? 1u : 0u;
+    flags = (!sync && s_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    IDXGISwapChain1_Present(s_sc, sync, flags);
+}
+
+/* The frame-rate cap (settings: 30..240, 0 = none): wait out the rest of the frame. */
+static void frame_cap(void)
+{
+    static LARGE_INTEGER f, next;
+    static int timer_res;
+    LARGE_INTEGER now;
+    LONGLONG period;
+    int hz = g_cs_settings.frame_rate;
+    if (hz <= 0) { next.QuadPart = 0; return; }
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    if (!timer_res) { timer_res = 1; timeBeginPeriod(1); }
+    period = f.QuadPart / hz;
+    QueryPerformanceCounter(&now);
+    if (!next.QuadPart || now.QuadPart - next.QuadPart > period * 2) next.QuadPart = now.QuadPart;
+    next.QuadPart += period;
+    for (;;) {
+        LONGLONG left;
+        QueryPerformanceCounter(&now);
+        left = next.QuadPart - now.QuadPart;
+        if (left <= 0) break;
+        if (left * 1000 / f.QuadPart >= 2) Sleep((DWORD)(left * 1000 / f.QuadPart - 1));
+        else YieldProcessor();
+    }
+}
+
+/* The flip (xbox_FramebufferSetPresenter), on the executor thread. */
+static void cs_window_present(uint32_t fb_va, uint32_t pitch)
+{
+    HWND h = (HWND)xbox_FramebufferWindowHwnd();
+    (void)pitch;
+    if (!s_inited || s_failed || !h || !blit_init()) return;
+    s_presenting = 1;
+    present_frame(h, fb_va, 1);
+    if (InterlockedExchange(&s_settings_dirty, 0)) settings_apply(0);
+    frame_cap();
 }
 
 static const Nv2aBackend s_backend = { cs_clear, cs_draw, cs_flip };
@@ -1809,6 +2130,11 @@ void cs_d3d11_init(void)
         }
     }
     cs_now_ms();
+    {   /* RECOMP_CS_PRESENT=0: leave the window to the toolkit (guest-memory copy, 1x only) */
+        const char *p = getenv("RECOMP_CS_PRESENT");
+        if (getenv("RECOMP_FB_WINDOW") && !(p && *p == '0'))
+            xbox_FramebufferSetPresenter(cs_window_present);
+    }
     nv2a_backend_register_with_present_sync(&s_backend, cs_present_sync);
     nv2a_backend_register_program(cs_draw_program);
 }

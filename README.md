@@ -82,6 +82,36 @@ Keyboard controls:
 
 A connected XInput controller is also passed through.
 
+These are the default keys; `config.exe` (next to the game, in
+`build\RelWithDebInfo\`) changes them.
+
+### In-game menus and settings
+
+| Key | |
+| --- | --- |
+| Esc | "Quit Counter-Strike?" prompt (Esc again or No to go back) |
+| F1 | Settings menu |
+| F11 or Alt+Enter | Fullscreen on/off |
+
+Both menus are drawn over the game, which keeps running underneath. While a
+menu is open its keys (and controller 1, which also drives it) do not reach the
+game. The F1 menu changes these as you play, and saves them as you go:
+
+| Setting | Choices |
+| --- | --- |
+| Render scale | 1x (640x480, the Xbox's own) up to 4x (2560x1920) |
+| Fullscreen | borderless, on the window's monitor |
+| Stretch image | fill the window instead of keeping 4:3 |
+| VSync | on / off |
+| Frame rate cap | 30, 60, 120, 144, 240, uncapped (default) |
+| Anti-aliasing | off, 2x, 4x, 8x MSAA |
+| Anisotropic filtering | off, 2x to 16x |
+
+`config.exe` has the same options on its Video tab, for before the game starts,
+and a Controls tab that sets a key and an alternate key for every Xbox control
+(Esc, F1 and F11 are kept for the menus). Settings are stored in
+`%LOCALAPPDATA%\CounterStrikeXB\settings.ini` and `keymap.ini`.
+
 ## Toolkit pin and local patches
 
 `dependencies.json` pins xboxrecomp to tag v0.17.0 (`343b6d8`) plus nine local

@@ -44,6 +44,8 @@
 #include "cs_gpu.h"
 #include "cs_prof.h"
 #include "cs_launch.h"
+#include "cs_settings.h"
+#include "cs_overlay.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -337,6 +339,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     printf("=== Counter-Strike (Xbox) - Static Recompilation ===\n");
+    /* The player's settings (settings.ini / keymap.ini: F1 menu, config.exe),
+     * before the window and the keyboard read theirs; then the ESC/F1 menus. */
+    cs_settings_startup();
+    cs_overlay_init();
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
