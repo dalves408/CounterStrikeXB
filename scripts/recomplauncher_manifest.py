@@ -2,13 +2,12 @@
 
     python scripts/recomplauncher_manifest.py --version 1.0.0 [--build build_release/RelWithDebInfo] [--out installer/Output]
 
-writes CounterStrike-v<version>-Windows-x64.zip (game, launcher start program, importer, settings program,
-recomplauncher.json) and its .sha256. Level 3 of the RecompLauncher guide (https://recomplauncher.com/sdk):
+writes CounterStrike-v<version>-Windows-x64.zip (game, importer, settings program, recomplauncher.json) and its .sha256. Level 3 of the RecompLauncher guide (https://recomplauncher.com/sdk):
 prepare (headless cs_import --prepare) and game.dumps (Redump). The Inno Setup installer stays the choice for players
 who do not use the launcher.
 
-The game relaunches itself for every map change (src/cs_launch.c), so the launcher starts cs_play.exe, which runs the
-game and waits for the last of its relaunches: the launcher sees one session, and its exit code.
+The game relaunches itself for every map change (src/cs_launch.c), inside the window of the process the launcher
+started (src/cs_frame.c), which waits for the last relaunch: the launcher sees one session, and its exit code.
 """
 import argparse
 import hashlib
@@ -61,7 +60,7 @@ def manifest():
             'check': {'file': 'default.xbe', 'xdvdfs': 'default.xbe'},
             'dumps': DUMPS,
         },
-        'start': {'program': ['cs_play.exe']},
+        'start': {'program': ['cs2_xbox_recomp.exe']},
         'prepare': {
             'program': ['cs_import.exe'],
             'args': ['--prepare', '{game}', '{install}/game_files'],
@@ -116,7 +115,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f'CounterStrike-v{args.version}-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
-        for name in ('cs2_xbox_recomp.exe', 'cs_play.exe', 'cs_import.exe', 'config.exe'):
+        for name in ('cs2_xbox_recomp.exe', 'cs_import.exe', 'config.exe'):
             package.write(args.build / name, name)
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

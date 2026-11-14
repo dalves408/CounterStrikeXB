@@ -2104,7 +2104,9 @@ static void cs_window_present(uint32_t fb_va, uint32_t pitch)
     static HWND s_icon_for;
     HWND h = (HWND)xbox_FramebufferWindowHwnd();
     (void)pitch;
-    if (h && h != s_icon_for) {     /* the toolkit's window has no icon: give it the game's (resources/cs.rc) */
+    if (h && h != s_icon_for && !(GetWindowLongPtrA(h, GWL_STYLE) & WS_CHILD)) {
+        /* the toolkit's window has no icon: give it the game's (resources/cs.rc); inside the frame
+         * (src/cs_frame.c) it is a child and the frame has the icon */
         HINSTANCE self = GetModuleHandleA(NULL);
         HANDLE big = LoadImageA(self, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
                                 GetSystemMetrics(SM_CYICON), 0);

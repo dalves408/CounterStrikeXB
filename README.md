@@ -42,8 +42,7 @@ Two ways, the same as the Marvel vs. Capcom 2 recompilation's:
   the program files (no disc needed); the same version offers Repair. Silent install:
   `CounterStrike-Setup-<version>.exe /VERYSILENT /SOURCE=<image or folder> /DIR=<folder>`.
 - **RecompLauncher:** add the GitHub release (`CounterStrike-v<version>-Windows-x64.zip`). The launcher asks for the
-  disc, checks it against Redump, runs the same import (`cs_import.exe --prepare`), and starts the game through
-  `cs_play.exe`, which keeps the game's relaunches on a map change as one session.
+  disc, checks it against Redump, runs the same import (`cs_import.exe --prepare`), and starts the game.
 
 Your settings, key map, saves and logs are in `%LOCALAPPDATA%\CounterStrikeXB`.
 

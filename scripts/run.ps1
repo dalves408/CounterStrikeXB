@@ -34,6 +34,7 @@ $envs = [ordered]@{
     RECOMP_USB         = '1'   # OHCI + USB gamepad model (XAPI's real input path)
     RECOMP_KEYBOARD    = '1'   # keyboard -> pad 0 (toolkit map: arrows=D-pad, Enter=START, Backspace=BACK, Z/X/C/V=A/B/X/Y, WASD=left stick)
     RECOMP_FB_WINDOW   = '1'
+    CS_NO_FRAME        = '1'   # one window per process, as the probes expect (src/cs_frame.c)
     RECOMP_D3D_PRESENT = '1'
     CS_SAVE_ROOT       = (Join-Path $root 'SaveData')   # partition images / cache (src/main.c)
     RECOMP_SAVE_DIR    = (Join-Path $root 'SaveData')   # TDATA/UDATA (profiles, saves)

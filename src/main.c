@@ -47,6 +47,7 @@
 #include "cs_settings.h"
 #include "cs_overlay.h"
 #include "cs_diag.h"
+#include "cs_frame.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -363,9 +364,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    {   /* The program the player starts is the window; the game runs in a copy
+         * of it inside that window (src/cs_frame.c). */
+        int code;
+        if (cs_frame_main(&code))
+            return code;
+    }
 #ifdef CS_RELEASE
     player_setup();
 #endif
+    {   /* Inside the frame: the toolkit's window is a child of it (toolkit patch 0022). */
+        char fh[32];
+        if (GetEnvironmentVariableA("CS_FRAME_HWND", fh, sizeof fh))
+            _putenv_s("RECOMP_FB_PARENT", fh);
+    }
     /* What this title needs to run (scripts/run.ps1 sets the same for
      * development runs); an explicit environment value wins. */
     {

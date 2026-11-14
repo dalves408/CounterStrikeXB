@@ -1,0 +1,110 @@
+From 6c29fb403c238674db6829673035a54657580e9f Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] video: RECOMP_FB_PARENT makes the window a child of a host
+ frame (CounterStrikeXB2 local patch)
+
+For a title that restarts its own process (a quick reboot into another XBE
+modelled as a host relaunch): the host keeps one frame window on screen and
+each new process draws into it, so the player keeps one window.
+
+- RECOMP_FB_PARENT=<window handle, decimal>: the framebuffer window is created
+  as WS_CHILD filling that window's client area (focused if the parent is in
+  front); a value that is not a window keeps the top-level window.
+- Fullscreen requests (F11, Alt+Enter, xbox_FramebufferToggleFullscreen) are
+  posted to the parent as the same WM_APP + 0x46; xbox_FramebufferIsFullscreen
+  reads the parent's style; RECOMP_FULLSCREEN is left to the parent.
+- A click focuses the child (children are not focused by being clicked).
+---
+ src/video/fb_present.c | 43 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index b2123b0..a3beba7 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -190,11 +190,25 @@ static xbox_FramebufferKeyFilterFn s_key_filter;
+ static volatile HWND s_fb_hwnd;
+ static volatile LONG s_fb_full;        /* borderless fullscreen now */
+ #define WM_FB_TOGGLE_FULLSCREEN (WM_APP + 0x46)
++/* RECOMP_FB_PARENT=<window handle, decimal>: the window is a child filling
++ * that window's client area instead of a top-level window. For a title that
++ * restarts its own process (a quick reboot into another XBE modelled as a host
++ * relaunch): the host's own frame window stays on screen and each new process
++ * draws into it, so the player keeps one window. The parent owns the frame:
++ * fullscreen requests are posted to it (the same WM_APP + 0x46) and the
++ * fullscreen state is read from its style; RECOMP_FULLSCREEN is the parent's
++ * business. The parent keeps the child sized to its client area. */
++static HWND s_fb_parent;
+ 
+ void xbox_FramebufferSetPresenter(xbox_FramebufferPresenterFn fn) { s_presenter = fn; }
+ void xbox_FramebufferSetKeyFilter(xbox_FramebufferKeyFilterFn fn) { s_key_filter = fn; }
+ void *xbox_FramebufferWindowHwnd(void) { return (void *)s_fb_hwnd; }
+-int xbox_FramebufferIsFullscreen(void) { return s_fb_full != 0; }
++int xbox_FramebufferIsFullscreen(void)
++{
++    if (s_fb_parent)
++        return IsWindow(s_fb_parent) && !(GetWindowLongPtrA(s_fb_parent, GWL_STYLE) & WS_CAPTION);
++    return s_fb_full != 0;
++}
+ 
+ void xbox_FramebufferToggleFullscreen(void)
+ {
+@@ -304,6 +318,11 @@ static void fb_toggle_fullscreen(HWND h)
+     static int full;
+     static RECT saved;
+     static LONG_PTR saved_style;
++    if (s_fb_parent) {
++        (void)h;
++        PostMessageA(s_fb_parent, WM_FB_TOGGLE_FULLSCREEN, 0, 0);
++        return;
++    }
+     if (!full) {
+         MONITORINFO mi;
+         mi.cbSize = sizeof mi;
+@@ -423,6 +442,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+             int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
+             if (vk)
+                 xbox_InputKeySet(vk, down);
++            if (down && s_fb_parent && GetFocus() != h)
++                SetFocus(h);            /* a child is not focused by being clicked */
+             if (down)
+                 SetCapture(h);
+             else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
+@@ -595,6 +616,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+                                && r.bottom - r.top <= work.bottom - work.top))
+                 break;
+         }
++        {
++            const char *pe = getenv("RECOMP_FB_PARENT");
++            HWND parent = pe && *pe ? (HWND)(uintptr_t)_strtoui64(pe, NULL, 10) : NULL;
++            if (parent && IsWindow(parent))
++                s_fb_parent = parent;
++            else if (parent)
++                fprintf(stderr, "  [FBWIN] RECOMP_FB_PARENT=%s is not a window: top-level window\n", pe);
++        }
++        if (s_fb_parent) {
++            RECT pc;
++            GetClientRect(s_fb_parent, &pc);
++            hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
++                                   WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
++                                   pc.right - pc.left, pc.bottom - pc.top,
++                                   s_fb_parent, NULL, GetModuleHandleA(NULL), NULL);
++            if (hwnd && GetForegroundWindow() == s_fb_parent)
++                SetFocus(hwnd);
++        } else
+         hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
+@@ -610,7 +649,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+     hdc = GetDC(hwnd);
+     {
+         const char *fs = getenv("RECOMP_FULLSCREEN");
+-        if (fs && *fs && *fs != '0')
++        if (fs && *fs && *fs != '0' && !s_fb_parent)
+             fb_toggle_fullscreen(hwnd);
+     }
+ 
+-- 
+2.51.0.windows.2
+

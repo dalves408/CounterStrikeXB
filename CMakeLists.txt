@@ -52,6 +52,7 @@ set(GAME_SOURCES
     src/cs_settings.c
     src/cs_overlay.c
     src/cs_diag.c
+    src/cs_frame.c
     resources/cs.rc
 )
 
@@ -142,7 +143,3 @@ add_executable(cs_import installer/cs_import.c)
 target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)
 target_link_libraries(cs_import PRIVATE bcrypt shell32)
 target_compile_definitions(cs_import PRIVATE UNICODE _UNICODE)
-
-# RecompLauncher's start program: the game, kept as one session across its relaunches.
-add_executable(cs_play WIN32 installer/cs_play.c resources/play.rc)
-target_compile_definitions(cs_play PRIVATE UNICODE _UNICODE)

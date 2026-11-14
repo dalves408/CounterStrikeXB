@@ -1,4 +1,4 @@
-"""Builds the Counter-Strike player release: the game, importer, settings program and launcher start program, then the
+"""Builds the Counter-Strike player release: the game, importer and settings program, then the
 Setup and the RecompLauncher ZIP (the same steps as the Marvel vs. Capcom 2 recompilation's release).
 
     python scripts/build_installer.py --version 1.0.0
@@ -100,12 +100,12 @@ def main():
     iscc = find_iscc()
     print(f'Inno Setup: {iscc}', flush=True)
 
-    for rc in ('cs.rc', 'config.rc', 'play.rc'):
+    for rc in ('cs.rc', 'config.rc'):
         set_rc_version(ROOT / 'resources' / rc, args.version)
     if not args.skip_build:
         run('cmake', '-S', ROOT, '-B', BUILD, '-DCS_RELEASE=ON')
         run('cmake', '--build', BUILD, '--config', CONFIG, '-j', '12',
-            '--target', 'cs2_xbox_recomp', 'cs_import', 'config', 'cs_play')
+            '--target', 'cs2_xbox_recomp', 'cs_import', 'config')
     keep_symbols(args.version)
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)
