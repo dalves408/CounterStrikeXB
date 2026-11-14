@@ -2101,8 +2101,19 @@ static void frame_cap(void)
 /* The flip (xbox_FramebufferSetPresenter), on the executor thread. */
 static void cs_window_present(uint32_t fb_va, uint32_t pitch)
 {
+    static HWND s_icon_for;
     HWND h = (HWND)xbox_FramebufferWindowHwnd();
     (void)pitch;
+    if (h && h != s_icon_for) {     /* the toolkit's window has no icon: give it the game's (resources/cs.rc) */
+        HINSTANCE self = GetModuleHandleA(NULL);
+        HANDLE big = LoadImageA(self, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON),
+                                GetSystemMetrics(SM_CYICON), 0);
+        HANDLE little = LoadImageA(self, MAKEINTRESOURCEA(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                  GetSystemMetrics(SM_CYSMICON), 0);
+        if (big) PostMessageA(h, WM_SETICON, ICON_BIG, (LPARAM)big);
+        if (little) PostMessageA(h, WM_SETICON, ICON_SMALL, (LPARAM)little);
+        s_icon_for = h;
+    }
     if (!s_inited || s_failed || !h || !blit_init()) return;
     s_presenting = 1;
     present_frame(h, fb_va, 1);

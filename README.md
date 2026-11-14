@@ -181,4 +181,4 @@ The generated code in `src/recomp/gen` is pure pipeline output and is never edit
 
 ## Legal
 
-This repository contains only original source code, scripts and documentation. It does not contain any Counter-Strike game code, assets or disc images. Counter-Strike is a trademark of Valve Corporation; this project is not affiliated with or endorsed by Valve or Microsoft.
+This repository contains original source code, scripts and documentation, plus an icon (`resources/cs.ico`, `cs.png`) made from the game's logo. It does not contain any Counter-Strike game code, other assets or disc images; the release builds contain code translated from the game, and the game files come from the player's own disc. Counter-Strike is a trademark of Valve Corporation; this project is not affiliated with or endorsed by Valve or Microsoft.

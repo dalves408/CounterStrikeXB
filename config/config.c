@@ -436,7 +436,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));     /* the game's icon (resources/config.rc) */
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "CounterStrikeXBConfig";
     RegisterClassA(&wc);
