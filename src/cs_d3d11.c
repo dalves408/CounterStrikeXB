@@ -1084,6 +1084,7 @@ typedef struct {
     uint32_t blend, alpha, depth, cull, cmask, count, kept, vkey;   /* packed state, see drawlog() */
 } DrawLogRec;
 static FILE *s_dlog;
+static uint32_t s_dl_in_cpu, s_dl_in_gv, s_dl_no_rt, s_dl_none_kept;   /* this frame: draws that arrived, and why some were not drawn */
 
 static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uint32_t count, uint32_t kept,
                     uint32_t vkey)
@@ -1099,6 +1100,10 @@ static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uin
     memset(&d, 0, sizeof d);
     d.frame = s_frame; d.kind = kind; d.count = count; d.kept = kept; d.vkey = vkey;
     if (s) { d.rt = s->color_va; d.rt_wh = (s->width << 16) | (s->height & 0xFFFF); }
+    if (kind == 3) {   /* a flip: the executor's draw count, to tell commands never executed from draws dropped here */
+        extern uint32_t xbox_Nv2aDrawCount(void);
+        d.tex = xbox_Nv2aDrawCount();
+    }
     if (b) {
         const Nv2aRenderState *r = b->state;
         const Nv2aTexture *t = b->stages && (b->stage_valid & 1) ? &b->stages[0] : b->texture;
@@ -1140,8 +1145,9 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11SamplerState *smps[4];
 
     if (!cs_ready() || !b->count) return;
+    s_dl_in_cpu++;
     rt = get_rt(s);
-    if (!rt) return;
+    if (!rt) { s_dl_no_rt++; return; }
     ds = get_ds(s, r->zeta_va);
     {   /* RECOMP_CS_TRACE=N: describe the first N draws of every 100th frame */
         static int tn = -1;
@@ -1339,7 +1345,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         }
     }
 
-    if (!kept) return;
+    if (!kept) { s_dl_none_kept++; return; }
 
     use_rc = bind_state(s, b, rt, ds, srvs);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
@@ -1699,7 +1705,8 @@ static void cs_flip(void)
     DWORD now;
     if (!s_inited || s_failed) return;
     if (s_log) gpu_timer_flip();
-    drawlog(3, NULL, NULL, 0, 0, 0);
+    drawlog(3, NULL, NULL, s_dl_in_cpu, s_dl_in_gv, (s_dl_no_rt << 16) | (s_dl_none_kept & 0xFFFF));
+    s_dl_in_cpu = s_dl_in_gv = s_dl_no_rt = s_dl_none_kept = 0;
     s_frame++; s_tick++; st_flips++;
     if (s_csv && (s_frame % 30) == 0) fflush(s_csv);   /* runs are often ended by killing the process */
     now = GetTickCount();
@@ -1816,6 +1823,7 @@ static ID3D11VertexShader *gv_shader(const Nv2aProgramDraw *p)
 static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
 {
     const Nv2aRenderState *r = b->state;
+    s_dl_in_gv++;
     ID3D11VertexShader *vs;
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11ShaderResourceView *srvs[4];

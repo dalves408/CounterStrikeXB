@@ -1,0 +1,190 @@
+From 6b40db0d1eb6ff5df10bb48cd83b83a96e9e19c8 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] pb_scan: run a recorded pushbuffer whose JUMP back was
+ rewritten; segment diagnostics (CounterStrikeXB2 local patch)
+
+XDK D3D rewrites a recorded pushbuffer's final JUMP with each run's return
+address. With the executor behind (a slow host), the title had already
+rewritten it for its next run, the detour check (comes back to the word after
+the JUMP) failed, the JUMP was taken for the ring's wrap and the rest of the
+segment -- the HUD, menus, the first-person weapon -- was dropped. A JUMP that
+leaves the ring and whose chain comes back into it is now run as the detour
+and the walk goes on after it (a wrap stays within the ring). The ring's extent
+is learned from the segments walked.
+
+Diagnostics, all off by default: RECOMP_PB_DETOUR_FAIL_LOG (jumps that end a
+segment with commands left, recorded buffers that ran short), RECOMP_PB_SEGLOG
+(one line per walked segment, a line per flip) and xbox_Nv2aDrawCount() for a
+title's own per-frame accounting.
+---
+ src/kernel/nv2a_pb_exec.c | 12 +++++
+ src/kernel/nv2a_pb_scan.c | 96 +++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 104 insertions(+), 4 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index 92304bd..2271d7b 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -4037,6 +4037,11 @@ static int pb_exec_verbose(void)
+     return v;
+ }
+ 
++/* Draw commands executed so far (DRAW_ARRAYS / END of an inline batch), for a title's diagnostics. */
++uint32_t xbox_Nv2aDrawCount(void);
++static void draw_primitive(void);
++uint32_t xbox_Nv2aDrawCount(void) { return s_gpu.draws; }
++
+ static void draw_primitive(void)
+ {
+     float v[4];
+@@ -5078,6 +5083,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         /* And this is a completed swap, which is what a title's own swap
+          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+         xbox_Nv2aFrameCounterFlip();
++        {
++            static int seglog = -1;
++            static unsigned nflips;
++            if (seglog < 0) seglog = getenv("RECOMP_PB_SEGLOG") != NULL;
++            if (seglog && nflips++ < 3000)
++                fprintf(stderr, "[SEG] flip %u, draws %u%c", nflips, s_gpu.draws, 10);
++        }
+         if (s_backend_present_sync)
+             s_backend_present_sync();
+         /* Hand the window a copy of the frame just finished.
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 4c4db05..5e369a9 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -503,6 +503,45 @@ static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint3
+  * pieces to run, each from its start up to (not including) its JUMP. A ring
+  * wrap's JUMP lands on the ring's start, whose next JUMP does not return to the
+  * word after the wrap, so a wrap is never taken for a detour. */
++/* The ring's extent as the segments walked so far have covered it (top-level
++ * segments only: they lie in the ring; detours and CALLs do not). */
++static uint32_t s_ring_lo, s_ring_hi;
++
++static int pb_in_ring(uint32_t va)
++{
++    return s_ring_lo && va >= s_ring_lo && va < s_ring_hi + 0x1000u;
++}
++
++/* A JUMP out of the ring to a recorded pushbuffer (XDK D3D's RunPushBuffer)
++ * whose chain comes back into the ring -- but not to the word after the JUMP.
++ * D3D rewrites a recorded buffer's final JUMP with each run's return address,
++ * and when the executor is behind (a slow host) the title has already rewritten
++ * it for its next run: the chain returns a frame further on. That is still the
++ * detour, and the run continues after the JUMP; taken for the ring's wrap
++ * instead, the rest of the segment -- the HUD, menus, the first-person weapon --
++ * was dropped, and frames flashed with them missing. A wrap is a JUMP within
++ * the ring (to its start), so it is never taken for this. */
++static int pb_detour_stale(uint32_t target, uint32_t *from, uint32_t *to, int *n)
++{
++    uint32_t cur = target, jat, t;
++    int hop;
++
++    if (pb_in_ring(target) || !s_ring_lo)
++        return 0;
++    for (hop = 0; hop < PB_DETOUR_HOPS; hop++) {
++        if (!pb_find_jump(cur, cur + 0x400000u, &jat, &t))
++            return 0;
++        from[hop] = cur;
++        to[hop] = jat;
++        if (pb_in_ring(t)) {
++            *n = hop + 1;
++            return 1;
++        }
++        cur = t;
++    }
++    return 0;
++}
++
+ static int pb_detour(uint32_t target, uint32_t back, uint32_t *from, uint32_t *to, int *n)
+ {
+     uint32_t cur = target, jat, t;
+@@ -565,14 +604,45 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             if (!in_call) {
+                 uint32_t from[PB_DETOUR_HOPS], to[PB_DETOUR_HOPS];
+                 int n, k;
+-                if (!pb_detour(0x80000000u | (target & 0x0FFFFFFFu), va, from, to, &n))
++                if (!pb_detour(0x80000000u | (target & 0x0FFFFFFFu), va, from, to, &n)
++                        && pb_detour_stale(0x80000000u | (target & 0x0FFFFFFFu), from, to, &n)) {
++                    static unsigned stale;
++                    if (stale++ < 3 || (stale & (stale - 1)) == 0)
++                        fprintf(stderr, "[PB] recorded pushbuffer %08X returns past this run (its JUMP back rewritten for a"
++                                " later one): run it and go on at %08X (%u so far)%c",
++                                0x80000000u | (target & 0x0FFFFFFFu), va, stale, 10);
++                } else if (!pb_detour(0x80000000u | (target & 0x0FFFFFFFu), va, from, to, &n)) {
++                    static unsigned fails;
++                    if (getenv("RECOMP_PB_DETOUR_FAIL_LOG") && end_va > va && fails++ < 200) {
++                        uint32_t jat = 0, t2 = 0, tv = 0x80000000u | (target & 0x0FFFFFFFu);
++                        int found = pb_find_jump(tv, tv + 0x400000u, &jat, &t2);
++                        fprintf(stderr, "[PB] jump ends the segment: JUMP at %08X -> %08X; its next JUMP %s at %08X -> %08X"
++                                " (expected back %08X, %d bytes off); segment end %08X, %u bytes unwalked%c",
++                                va - 4, tv, found ? "found" : "not found", jat, t2, va, (int)(t2 - va),
++                                end_va, end_va - va, 10);
++                    }
+                     break;                    /* the ring: a jump ends it */
++                }
+                 s_tot_detours++;
+                 if (s_tot_detours < 60 && getenv("RECOMP_PB_DETOUR_LOG"))
+                     fprintf(stderr, "[PB] detour %u: JUMP at %08X -> %08X, %d piece(s), first %08X-%08X, back %08X\n",
+                             s_tot_detours, va - 4, 0x80000000u | (target & 0x0FFFFFFFu), n, from[0], to[0], va);
+-                for (k = 0; k < n; k++)      /* run it, then carry on after the JUMP */
+-                    words += pb_walk_segment(from[k], to[k], 0, jumps, unknown);
++                {
++                    uint32_t dw = 0;
++                    for (k = 0; k < n; k++)      /* run it, then carry on after the JUMP */
++                        dw += pb_walk_segment(from[k], to[k], 0, jumps, unknown);
++                    words += dw;
++                    if (getenv("RECOMP_PB_DETOUR_FAIL_LOG")) {   /* a run much shorter than the last of the same buffer */
++                        static uint32_t last_t, last_w;
++                        static unsigned shorts;
++                        uint32_t tv = 0x80000000u | (target & 0x0FFFFFFFu);
++                        if (tv == last_t && dw * 2u < last_w && shorts++ < 200)
++                            fprintf(stderr, "[PB] recorded pushbuffer %08X ran %u words (last run %u), %d piece(s) %08X-%08X%c",
++                                    tv, dw, last_w, n, from[0], to[0], 10);
++                        if (tv == last_t && dw * 2u < last_w) { /* keep the full length as the reference */ }
++                        else { last_t = tv; last_w = dw; }
++                    }
++                }
+                 continue;
+             }
+             va = 0x80000000u | (target & 0x0FFFFFFFu);
+@@ -690,6 +760,8 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+         return;
+     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+         end_va = start_va + 0x400000u;
++    if (!s_ring_lo || start_va < s_ring_lo) s_ring_lo = start_va;   /* the ring, as covered (pb_in_ring) */
++    if (end_va > s_ring_hi) s_ring_hi = end_va;
+ 
+     if (s_exec_enabled) {
+         extern void nv2a_pb_exec_walk_begin(void);
+@@ -697,7 +769,23 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+     }
+     s_walk_put = end_va;
+     s_walk_acks = 0;
+-    words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++    {
++        extern uint32_t xbox_Nv2aDrawCount(void);
++        static int seglog = -1;
++        static unsigned lo, hi, seg_n;
++        uint32_t d0 = xbox_Nv2aDrawCount(), det0 = s_tot_detours;
++        if (seglog < 0) {   /* RECOMP_PB_SEGLOG=<from segment>,<count>: one line per walked segment */
++            const char *e = getenv("RECOMP_PB_SEGLOG");
++            seglog = e && *e;
++            if (seglog) { lo = (unsigned)strtoul(e, NULL, 10); hi = lo + (strchr(e, ',') ? (unsigned)strtoul(strchr(e, ',') + 1, NULL, 10) : 200u); }
++        }
++        words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
++        seg_n++;
++        if (seglog && seg_n >= lo && seg_n < hi)
++            fprintf(stderr, "[SEG] %u: %08X-%08X (%u bytes) walked %u words, %u draws, %u detours%c",
++                    seg_n, start_va, end_va, end_va - start_va, words, xbox_Nv2aDrawCount() - d0,
++                    s_tot_detours - det0, 10);
++    }
+     s_walk_put = 0;
+ 
+     s_tot_words += words;
+-- 
+2.51.0.windows.2
+
