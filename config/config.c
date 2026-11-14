@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,7 +42,7 @@ static const char *const VIDEO_LABEL[NVIDEO] = {
 static const char *const T_OFFON[2] = { "Off", "On" };
 static const char *const T_STRETCH[2] = { "Off (keep 4:3)", "On (fill the window)" };
 
-enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200 };
+enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200, ID_REPORT = 330 };
 enum { PAGE_VIDEO, PAGE_CONTROLS };
 
 static CsSettings s_set;
@@ -331,10 +332,13 @@ static void make_ui(HWND h)
 
     s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 520, 580, 20, ID_STATUS, f);
     mk("BUTTON", "Reset to defaults", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 10, 548, 130, 28, ID_RESET, f);
+    mk("BUTTON", "Report a problem...", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 150, 548, 140, 28, ID_REPORT, f);
     mk("BUTTON", "Save", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 444, 548, 70, 28, ID_SAVE, f);
     mk("BUTTON", "Close", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 520, 548, 70, 28, ID_CLOSE, f);
     show_page(PAGE_VIDEO);
 }
+
+#include "report.inc"
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -366,6 +370,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         case ID_RESET: do_reset(); return 0;
+        case ID_REPORT: do_report(h); return 0;
         case ID_SAVE:  do_save(); return 0;
         case ID_CLOSE: PostMessageA(h, WM_CLOSE, 0, 0); return 0;
         }

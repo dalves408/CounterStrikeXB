@@ -465,7 +465,7 @@ Must-have, in order:
 4. Multi-hour soak including several map rotations and menu <-> game relaunches.
 5. Input and settings: controller layout, keyboard/mouse, in-game options saved.
 6. Other machines: another GPU vendor, a weaker CPU; windowed/fullscreen; frame pacing.
-7. Packaging: no game-derived code shipped -- users build from their own disc (extract_disc.py -> pipeline.py -> build) with a one-command wrapper and README.
+7. Packaging: ~~users build from their own disc~~ changed by David 2026-11-13: an installer and RecompLauncher ZIP like MvC2 1.0.2 (the exe ships, the game files come from the player's own disc), below.
 Later: GPU vertex fetch, x87 stack in the recompiler, system link.
 
 ## Intro freeze fixed: title-built KEVENTs (2026-11-13)
@@ -505,3 +505,12 @@ Modelled on NHLHitzPro's (C:\Recomp\NHLHitzPro, reference only), adapted for Cou
 - config.exe (config/config.c, CMake target `config`): Video tab (the same options) and Controls tab (key + alternate per Xbox control) writing `keymap.ini`, which the toolkit reads at start (`RECOMP_KEYMAP`, set by cs_settings_startup).
 - Checked (scratch LOCALAPPDATA; scripts/settings_probe.ps1 + scripts/winshot.py): both menus over a running match; 3x + 4x MSAA + 16x AF on Dust visibly sharper at 69 FPS (66 at 1x: CPU-bound); live F1 changes 1x -> 2x -> 3x and 2x MSAA applied mid-round and saved; fullscreen + stretch at 1920x1080; 60 FPS cap and VSync both 16.6 ms median; intro movies and title through the new presenter; config.exe set A -> Space and 2x, the game read the key map (24 controls) and Space opened Training.
 - Tools: scripts/settings_probe.ps1, scripts/winshot.py (captures the window as shown; the dumps no longer hold the final picture), scripts/config_check.py.
+
+## Installer, logger and RecompLauncher level 3 (2026-11-13)
+Modelled on Marvel vs. Capcom 2 1.0.2 (C:\Recomp\mvc2_pc, reference only). At David's request the release now ships the program (checklist item 7); the game files still come from the player's own disc.
+- Player build (`-DCS_RELEASE=ON`, build_release/): static C runtime (no redistributable), cwd = the exe's folder, RECOMP_* cleared and the run settings built into main.c, data in `%LOCALAPPDATA%\CounterStrikeXB` (settings, keymap, SaveData, logs). The .pdb is kept in out/symbols/<version>, not shipped.
+- Logger (src/cs_diag.c): `logs\cs-<date>-<time>.log` per run and per map relaunch, newest five kept, 20 MB cap, user name blanked; `[BUILD]` (version, pdb id, Windows, CPU, GPU, RAM), `[VIDEO]` (at start and on every settings change), `[FREEZE]` (no flip for 10 s: every thread's stack as module offsets), `[CRASH]` (unhandled exception). scripts/symbolize_log.py names the offsets.
+- config.exe: "Report a problem..." opens the logs folder with the newest log selected and a GitHub issue pre-filled with the version and PC.
+- Setup (installer/cs.iss, Inno Setup 6): the same pages and update/repair logic as MvC2's; installer/cs_import.exe (not installed) checks the image against installer/manifest.h (82 files, SHA-256 each, default.xbe = dependencies.json's) and copies them to `game_files`.
+- RecompLauncher (scripts/recomplauncher_manifest.py, `CounterStrike-v<ver>-Windows-x64.zip`): level 3 -- Redump dump (disc 35835, CRC-32 275fb9f8), `prepare` = `cs_import --prepare`, the seven video settings, saves/data/logs folders (`folders.logs` is what the launcher attaches to crash reports). Start program cs_play.exe holds the game's relaunch chain in a job, so the launcher sees one session. The manifest validates against the published schema (0 errors).
+- Checked with test build 0.9.0: no CRT DLLs imported by any of the four exes; silent Setup from the .iso in 12 s, 82 files / 1,675,487,281 bytes, exit 0; installed game (scratch LOCALAPPDATA) boots to the title, writes its log with [BUILD] and [VIDEO]; through cs_play a relaunch made a second log and cs_play ended with the game; silent uninstall left no files, no registry entry and no shortcuts. Not yet checked: the Setup wizard pages by hand, the Report button, RecompLauncher itself, another PC.

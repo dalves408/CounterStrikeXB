@@ -46,6 +46,7 @@
 #include "cs_launch.h"
 #include "cs_settings.h"
 #include "cs_overlay.h"
+#include "cs_diag.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -286,11 +287,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         /* Print native stack return addresses for debugging */
         {
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
+            char where[200];
+            cs_diag_where((const void *)(uintptr_t)ep->ContextRecord->Rip, where, sizeof where);
+            fprintf(stderr, "  at %s\n  Native stack (return addresses into the game):\n", where);
             for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
-                }
+                cs_diag_where((const void *)sp[i], where, sizeof where);
+                if (!strncmp(where, "cs2_xbox_recomp+", 16))
+                    fprintf(stderr, "    [%d] %s\n", i, where);
             }
         }
         fflush(stderr);
@@ -308,6 +311,47 @@ static DWORD WINAPI stderr_flusher(LPVOID unused)
     return 0;
 }
 
+/* Freeze and crash reports, and the player build's log file: cs_diag.c. */
+#include "platform/recomp_exit_hook.h"
+static void diag_on_exit(const char *why) { (void)why; cs_diag_flush(); }
+
+#ifdef CS_RELEASE
+/* The installed game (cmake -DCS_RELEASE=ON, scripts/build_installer.py): it
+ * runs from its own folder, with game_files beside it, whatever the shortcut's
+ * working folder; the player's data lives in %LOCALAPPDATA%\CounterStrikeXB
+ * (settings, keys, saves, logs); and no RECOMP_ variable left in the
+ * environment by something else changes how it runs. */
+static void player_setup(void)
+{
+    char path[MAX_PATH], base[MAX_PATH], *slash;
+
+    if (GetModuleFileNameA(NULL, path, MAX_PATH) && (slash = strrchr(path, '\\')) != NULL) {
+        *slash = 0;
+        SetCurrentDirectoryA(path);
+    }
+    for (;;) {      /* removing a variable changes _environ, so start over each time */
+        char name[128];
+        char **e;
+        for (e = _environ; *e; e++)
+            if (!strncmp(*e, "RECOMP_", 7) && strchr(*e, '=') && (size_t)(strchr(*e, '=') - *e) < sizeof name)
+                break;
+        if (!*e)
+            break;
+        snprintf(name, sizeof name, "%.*s", (int)(strchr(*e, '=') - *e), *e);
+        _putenv_s(name, "");
+    }
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 60)
+        strcpy(base, ".");
+    snprintf(path, sizeof path, "%s\\CounterStrikeXB", base);
+    CreateDirectoryA(path, NULL);
+    cs_diag_log_start(path);            /* from here on everything printed is also in CounterStrikeXB\logs */
+    snprintf(path, sizeof path, "%s\\CounterStrikeXB\\SaveData", base);
+    CreateDirectoryA(path, NULL);
+    _putenv_s("CS_SAVE_ROOT", path);
+    _putenv_s("RECOMP_SAVE_DIR", path);
+}
+#endif
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -318,6 +362,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+#ifdef CS_RELEASE
+    player_setup();
+#endif
+    /* What this title needs to run (scripts/run.ps1 sets the same for
+     * development runs); an explicit environment value wins. */
+    {
+        static const char *defs[][2] = {
+            { "RECOMP_USB", "1" }, { "RECOMP_KEYBOARD", "1" }, { "RECOMP_FB_WINDOW", "1" },
+            { "RECOMP_D3D_PRESENT", "1" }, { "RECOMP_PB_EXEC", "1" }, { "RECOMP_CONTIG_AVOID_IMAGE", "1" },
+            { "RECOMP_AC97_READY", "1" }, { "RECOMP_VBLANK", "paced" }, { "RECOMP_DISPATCH_GATE", "1" },
+            { "RECOMP_TITLE_KEVENTS", "1" }, { "RECOMP_PHY_LINK", "0" },
+        };
+        int di;
+        for (di = 0; di < (int)(sizeof defs / sizeof defs[0]); di++)
+            if (!getenv(defs[di][0])) _putenv_s(defs[di][0], defs[di][1]);
+    }
+    /* The freeze report (no frame for 10 s); RECOMP_STALL_DUMP=<secs> repeats it every <secs>. */
+    {
+        const char *sdv = getenv("RECOMP_STALL_DUMP");
+        if (sdv && atoi(sdv) > 0) cs_diag_start((unsigned)atoi(sdv), 1);
+        else cs_diag_start(10, 0);
+    }
+    recomp_exit_hook_set(diag_on_exit);
 
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -352,6 +420,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    cs_diag_install_crash_filter();
+    cs_diag_build_line();
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {

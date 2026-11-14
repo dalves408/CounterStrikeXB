@@ -27,3 +27,7 @@ analysis/
 *.log
 build-clang/
 build-abi/
+build_release/
+# Installer output and its generated wizard pictures (scripts/build_installer.py)
+installer/Output/
+installer/wizard_small_*.bmp

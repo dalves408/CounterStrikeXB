@@ -12,6 +12,21 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
 
+# The player build (scripts/build_installer.py): the C runtime linked in, so a PC
+# with no Visual C++ redistributable runs it; its data in %LOCALAPPDATA% and a
+# log file per run (src/main.c player_setup, src/cs_diag.c); and symbols for
+# every release, kept on the build PC and never shipped -- a player's freeze or
+# crash report gives code offsets, scripts/symbolize_log.py names them.
+# Set before the toolkit is added, so its libraries use the same runtime.
+option(CS_RELEASE "Player build for the installer" OFF)
+if(CS_RELEASE)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_compile_definitions(CS_RELEASE=1)
+    if(MSVC)
+        string(APPEND CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO " /OPT:REF /OPT:ICF")
+    endif()
+endif()
+
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH "xboxrecomp root")
 if(NOT EXISTS "${XBOXRECOMP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "xboxrecomp missing at ${XBOXRECOMP_DIR}; run scripts/setup.ps1")
@@ -36,6 +51,8 @@ set(GAME_SOURCES
     src/cs_launch.c
     src/cs_settings.c
     src/cs_overlay.c
+    src/cs_diag.c
+    resources/cs.rc
 )
 
 option(CS_GEN_INLINE "MSVC: /Ob2 /GS- for the generated code (measured: no gain)" OFF)
@@ -81,6 +98,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
+    # The player build names its .pdb without the build folder (symbolize_log.py finds it by id).
+    if(CS_RELEASE)
+        target_link_options(${PROJECT_NAME} PRIVATE /PDBALTPATH:cs2_xbox_recomp.pdb)
+    endif()
     # /FS: parallel cl.exe instances share one PDB.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /FS)
 endif()
@@ -103,6 +124,7 @@ endif()
 # keymap.ini the toolkit's keyboard reads, with the toolkit's own key names.
 add_executable(config WIN32
     config/config.c
+    resources/config.rc
     src/cs_settings.c
     ${XBOXRECOMP_DIR}/src/input/input_map.c
     ${XBOXRECOMP_DIR}/src/input/keyboard.c
@@ -112,4 +134,15 @@ target_include_directories(config PRIVATE
     ${XBOXRECOMP_DIR}/src/input
     ${XBOXRECOMP_DIR}/src
 )
-target_link_libraries(config PRIVATE comctl32)
+target_link_libraries(config PRIVATE comctl32 shell32 version advapi32 user32)
+
+# The installer's import tool (not installed; Setup runs it from its temp folder) and
+# RecompLauncher's prepare step: copies the game files from the player's own disc.
+add_executable(cs_import installer/cs_import.c)
+target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)
+target_link_libraries(cs_import PRIVATE bcrypt shell32)
+target_compile_definitions(cs_import PRIVATE UNICODE _UNICODE)
+
+# RecompLauncher's start program: the game, kept as one session across its relaunches.
+add_executable(cs_play WIN32 installer/cs_play.c resources/play.rc)
+target_compile_definitions(cs_play PRIVATE UNICODE _UNICODE)

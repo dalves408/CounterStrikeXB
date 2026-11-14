@@ -26,6 +26,7 @@
 #include "cs_overlay.h"
 #include "cs_settings.h"
 #include "cs_d3d11.h"
+#include "cs_diag.h"
 #include "video/video_player.h"
 
 extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
@@ -108,6 +109,7 @@ static void item_set(int i, int v)
     case IT_ANISO: s->aniso = CS_SET_ANISO_N[v]; cs_d3d11_settings_changed(); break;
     }
     cs_settings_save(s);
+    cs_diag_log_video("settings changed");      /* the log says what a report's picture was drawn with */
 }
 
 /* ---- drawing --------------------------------------------------------------- */

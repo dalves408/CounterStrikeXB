@@ -1620,6 +1620,9 @@ static void gpu_timer_flip(void)
     k = (k + 1) % N;
 }
 
+/* Flips presented so far: the freeze watch (cs_diag.c) sees the game is alive while this moves. */
+unsigned cs_d3d11_frames(void) { return s_frame; }
+
 static void cs_flip(void)
 {
     static DWORD last;

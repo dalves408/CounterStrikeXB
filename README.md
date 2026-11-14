@@ -32,6 +32,45 @@ Known issues from the earlier gameplay baseline:
 The current renderer is CPU-based; the optional D3D11 renderer does not yet
 cover all the state needed by this game.
 
+## Install (players)
+
+Two ways, the same as the Marvel vs. Capcom 2 recompilation's:
+
+- **Setup:** run `CounterStrike-Setup-<version>.exe` (Windows 10/11, 64-bit, no administrator rights needed). It asks
+  for your own disc image (`.iso`/`.xiso`) or a folder holding `default.xbe`, checks it is the USA release, and copies
+  the 1.6 GB of game files into `<install folder>\game_files`. Running a newer Setup over an install only replaces
+  the program files (no disc needed); the same version offers Repair. Silent install:
+  `CounterStrike-Setup-<version>.exe /VERYSILENT /SOURCE=<image or folder> /DIR=<folder>`.
+- **RecompLauncher:** add the GitHub release (`CounterStrike-v<version>-Windows-x64.zip`). The launcher asks for the
+  disc, checks it against Redump, runs the same import (`cs_import.exe --prepare`), and starts the game through
+  `cs_play.exe`, which keeps the game's relaunches on a map change as one session.
+
+Your settings, key map, saves and logs are in `%LOCALAPPDATA%\CounterStrikeXB`.
+
+### Problem reports and logs
+
+The game writes a log for every run and every map change to `%LOCALAPPDATA%\CounterStrikeXB\logs`
+(`cs-<date>-<time>.log`, the newest five kept, your Windows user name blanked out). It records the build, the PC
+(Windows, CPU, GPU, memory), the video settings, a `[FREEZE]` report if the picture stops for 10 seconds and a
+`[CRASH]` report with code offsets if the game crashes.
+
+- In `config.exe`, **Report a problem...** opens the logs folder with the newest log selected and a new GitHub issue
+  filled in with the game version and PC; describe the problem and drag the log onto it.
+- RecompLauncher's own crash report sends the newest log by itself (the manifest's `folders.logs`).
+
+Release builds ship without symbols; `scripts/build_installer.py` keeps each release's `.pdb` in `out\symbols\<version>`
+and `python scripts/symbolize_log.py <log>` names the offsets in a player's log.
+
+### Building the installer
+
+```powershell
+python scripts/build_installer.py --version 1.0.0
+```
+
+Needs Inno Setup 6.4+ and Pillow. It builds the player configuration (`-DCS_RELEASE=ON`: static C runtime, data in
+`%LOCALAPPDATA%`) into `build_release\`, then writes `installer\Output\CounterStrike-Setup-<version>.exe` and the
+RecompLauncher ZIP, each with a `.sha256`. Both contain code translated from the game, so they are not in git.
+
 ## Requirements
 
 - Windows 10/11 x64
