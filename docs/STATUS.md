@@ -562,4 +562,7 @@ David's report on 0.9.5: buy menu dark or missing, team select not right, the A/
 - XNet's DHCP is answered by the NIC itself (169.254.x.y/16 from the MAC, no gateway), so map loads do not wait out the 20 s DHCP timeout that patch 0020's `RECOMP_PHY_LINK=0` avoided; the link is now up and `RECOMP_NET=1` is a game default. Dust still reaches team select in ~25 s.
 - XC_FACTORY_ETHERNET_ADDR answers the NIC's MAC: 00:50:F2 plus a hash of the computer name (`RECOMP_XBOX_MAC` overrides).
 - settings.ini `[network] peers=host,...` for partners on another subnet or over a VPN (Tailscale).
-- Verified on champ: driver bring-up, DHCP/ARP frames, TX interrupts acknowledged by the title's ISR. Not yet verified: two consoles finding each other (champ + hpvictus over Tailscale), test build 0.9.7.
+- First two-PC test (0.9.7): Join kept searching. Two causes, both fixed in toolkit patch 0028 (pin 0e6cd76, reproduced):
+  - The relaunch (cs_launch.c, CreateProcess with inheritance for the log pipe) handed the NIC's UDP socket to the new process; the port stayed bound to the dead process's socket and the host never read a probe. The socket is now non-inheritable.
+  - Joining then failed with "This game session is no longer available": XNet's key exchange calls XcModExp (Diffie-Hellman) and DES/3DES (XcKeyTable, XcBlockCrypt, XcBlockCryptCBC), all stubs. Now real: modexp checked against Python pow() at 768 bits, DES against the standard vector.
+- Verified on champ with two instances (ports 30750/30751, peers on 127.0.0.1): the client lists the host's Airstrip match, joins, picks a team, and both are in the same round (clock 4:56 on both). Two-PC test pending, build 0.9.8. Logs show the first frames each way and a traffic line every 5 s.

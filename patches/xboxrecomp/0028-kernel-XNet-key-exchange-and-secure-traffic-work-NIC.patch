@@ -1,0 +1,400 @@
+From 0e6cd7656f28452ccb3a361ec29b73a037d5d692 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel: XNet key exchange and secure traffic work; NIC socket
+ not inherited (CounterStrikeXB2 local patch)
+
+XcModExp computes (it was a stub, so XNet's Diffie-Hellman never agreed and a system link join failed with 'session no longer available'); XcKeyTable/XcBlockCrypt/XcBlockCryptCBC do DES/3DES through BCrypt and XcDESKeyParity sets parity. The NIC link socket is created non-inheritable: a title relaunching itself handed it to the new process, which kept the port bound to a socket nobody read. The NIC logs its first frames each way and a traffic line every 5 s.
+---
+ src/kernel/kernel_crypto.c | 239 +++++++++++++++++++++++++++++++++----
+ src/kernel/nvnet.c         |  53 +++++++-
+ src/kernel/nvnet_link.c    |   7 +-
+ 3 files changed, 269 insertions(+), 30 deletions(-)
+
+diff --git a/src/kernel/kernel_crypto.c b/src/kernel/kernel_crypto.c
+index f8a502c..c2342f7 100644
+--- a/src/kernel/kernel_crypto.c
++++ b/src/kernel/kernel_crypto.c
+@@ -18,6 +18,7 @@
+ 
+ #include "kernel.h"
+ #include <string.h>
++#include <stdint.h>
+ 
+ /* SHA-1 / RC4 / HMAC below are portable software implementations, so the
+  * only platform dependency is BCrypt's types in the (unused) SHA_INTERNAL
+@@ -351,56 +352,246 @@ BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID
+     return TRUE;
+ }
+ 
+-ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength)
++/* XcModExp(A, B, C, D, n): A = B^C mod D, each n little-endian DWORDs.
++ *
++ * XNet's key exchange is Diffie-Hellman over this (system link included):
++ * each console sends g^x mod p and keys the session with (g^y)^x mod p. With
++ * this stubbed the two ends never agreed on a key, and a system link join
++ * found the host and then reported "This game session is no longer
++ * available". Square-and-multiply with a shift-and-add modular multiply:
++ * slow next to Montgomery, but a 768-bit exchange is a few milliseconds and
++ * happens once per connection. */
++#define MODEXP_MAX 64           /* DWORDs: 2048-bit */
++
++static int bn_cmp(const uint32_t *a, const uint32_t *b, ULONG n)
+ {
+-    (void)Result;
+-    (void)Base;
+-    (void)Exponent;
+-    (void)Modulus;
+-    (void)ModulusLength;
+-    xbox_log(XBOX_LOG_WARN, XBOX_LOG_CRYPTO, "XcModExp: stubbed");
++    ULONG i = n;
++    while (i--) {
++        if (a[i] != b[i])
++            return a[i] > b[i] ? 1 : -1;
++    }
+     return 0;
+ }
+ 
++static void bn_sub(uint32_t *a, const uint32_t *b, ULONG n)     /* a -= b */
++{
++    uint64_t borrow = 0;
++    ULONG i;
++    for (i = 0; i < n; i++) {
++        uint64_t d = (uint64_t)a[i] - b[i] - borrow;
++        a[i] = (uint32_t)d;
++        borrow = (d >> 63) & 1u;
++    }
++}
++
++/* r = 2r + bit, then reduced: r < m on entry, so one subtraction suffices
++ * (with the carry out of the top word standing for the bit above it). */
++static void bn_dbl_mod(uint32_t *r, const uint32_t *m, ULONG n)
++{
++    uint32_t carry = 0;
++    ULONG i;
++    for (i = 0; i < n; i++) {
++        uint32_t c = r[i] >> 31;
++        r[i] = (r[i] << 1) | carry;
++        carry = c;
++    }
++    if (carry || bn_cmp(r, m, n) >= 0)
++        bn_sub(r, m, n);
++}
++
++static void bn_add_mod(uint32_t *r, const uint32_t *b, const uint32_t *m, ULONG n)
++{
++    uint64_t carry = 0;
++    ULONG i;
++    for (i = 0; i < n; i++) {
++        uint64_t s = (uint64_t)r[i] + b[i] + carry;
++        r[i] = (uint32_t)s;
++        carry = s >> 32;
++    }
++    if (carry || bn_cmp(r, m, n) >= 0)
++        bn_sub(r, m, n);
++}
++
++/* out = a * b mod m; a, b < m. */
++static void bn_mulmod(uint32_t *out, const uint32_t *a, const uint32_t *b, const uint32_t *m, ULONG n)
++{
++    uint32_t r[MODEXP_MAX];
++    int bit;
++    memset(r, 0, n * 4u);
++    for (bit = (int)(n * 32u) - 1; bit >= 0; bit--) {
++        bn_dbl_mod(r, m, n);
++        if ((a[bit >> 5] >> (bit & 31)) & 1u)
++            bn_add_mod(r, b, m, n);
++    }
++    memcpy(out, r, n * 4u);
++}
++
++ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength)
++{
++    uint32_t m[MODEXP_MAX], b[MODEXP_MAX], r[MODEXP_MAX], one[MODEXP_MAX];
++    ULONG n = ModulusLength, top;
++    int bit;
++
++    if (!Result || !Base || !Exponent || !Modulus || n == 0 || n > MODEXP_MAX)
++        return 0;
++    memcpy(m, Modulus, n * 4u);
++    for (top = n; top && m[top - 1] == 0; top--)
++        ;
++    if (!top)
++        return 0;
++    /* b = Base mod m (Base * 1), r = 1 mod m */
++    memset(one, 0, sizeof one); one[0] = 1;
++    {
++        uint32_t base[MODEXP_MAX];
++        memcpy(base, Base, n * 4u);
++        memset(r, 0, n * 4u);
++        for (bit = (int)(n * 32u) - 1; bit >= 0; bit--) {      /* r = base mod m, bit by bit */
++            bn_dbl_mod(r, m, n);
++            if ((base[bit >> 5] >> (bit & 31)) & 1u)
++                bn_add_mod(r, one, m, n);
++        }
++        memcpy(b, r, n * 4u);
++    }
++    memset(r, 0, n * 4u);
++    bn_add_mod(r, one, m, n);                                   /* r = 1 mod m */
++    for (bit = (int)(n * 32u) - 1; bit >= 0; bit--) {
++        bn_mulmod(r, r, r, m, n);
++        if ((Exponent[bit >> 5] >> (bit & 31)) & 1u)
++            bn_mulmod(r, r, b, m, n);
++    }
++    memcpy(Result, r, n * 4u);
++    return 1;
++}
++
+ /* ============================================================================
+- * DES / Block Cipher Operations
++ * DES / 3DES
+  *
+- * Used for EEPROM and hard drive key derivation. Not needed for PC.
++ * XNet encrypts secured traffic (system link and Xbox Live) with DES or
++ * triple DES in CBC mode through these. The key table is the title's opaque
++ * buffer (XC_SERVICE_DES_TABLESIZE 0x80, DES3 0x180); here it holds a tag,
++ * the cipher and the raw key, and the work is done by BCrypt in ECB mode
++ * with the chaining done here. Key handles are cached by key.
++ * Operation: 1 encrypts, 0 decrypts. Cipher: 0 DES, 1 triple DES.
+  * ============================================================================ */
+ 
+ VOID __stdcall xbox_XcDESKeyParity(PUCHAR Key, ULONG KeyLength)
+ {
+-    (void)Key;
+-    (void)KeyLength;
++    ULONG i;
++    if (!Key)
++        return;
++    for (i = 0; i < KeyLength; i++) {
++        UCHAR v = (UCHAR)(Key[i] & 0xFE), c = v;
++        c ^= c >> 4; c ^= c >> 2; c ^= c >> 1;
++        Key[i] = (UCHAR)(v | ((c & 1u) ? 0u : 1u));             /* odd parity */
++    }
+ }
+ 
++#define DES_TAG 0x53454458u     /* "XDES" */
++
++typedef struct { uint32_t tag, cipher; UCHAR key[24]; } DesTable;
++
+ VOID __stdcall xbox_XcKeyTable(ULONG CipherSelect, PVOID KeyTable, const UCHAR* Key)
+ {
+-    (void)CipherSelect;
+-    (void)KeyTable;
+-    (void)Key;
++    DesTable *t = (DesTable *)KeyTable;
++    if (!t || !Key)
++        return;
++    t->tag = DES_TAG;
++    t->cipher = CipherSelect ? 1u : 0u;
++    memset(t->key, 0, sizeof t->key);
++    memcpy(t->key, Key, CipherSelect ? 24u : 8u);
++}
++
++#if defined(_WIN32)
++typedef struct { uint32_t cipher; UCHAR key[24]; BCRYPT_KEY_HANDLE h; } DesKeyEnt;
++
++static BCRYPT_KEY_HANDLE des_key(const DesTable *t)
++{
++    static BCRYPT_ALG_HANDLE alg[2];
++    static DesKeyEnt cache[16];
++    static unsigned next;
++    static SRWLOCK lock = SRWLOCK_INIT;
++    BCRYPT_KEY_HANDLE h = NULL;
++    unsigned i;
++
++    AcquireSRWLockExclusive(&lock);
++    for (i = 0; i < 16; i++)
++        if (cache[i].h && cache[i].cipher == t->cipher && !memcmp(cache[i].key, t->key, sizeof t->key)) {
++            h = cache[i].h;
++            goto out;
++        }
++    if (!alg[t->cipher]) {
++        if (BCryptOpenAlgorithmProvider(&alg[t->cipher], t->cipher ? BCRYPT_3DES_ALGORITHM : BCRYPT_DES_ALGORITHM, NULL, 0) != 0)
++            goto out;
++        BCryptSetProperty(alg[t->cipher], BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
++                          sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
++    }
++    if (BCryptGenerateSymmetricKey(alg[t->cipher], &h, NULL, 0, (PUCHAR)t->key, t->cipher ? 24u : 8u, 0) != 0) {
++        h = NULL;
++        goto out;
++    }
++    i = next++ % 16u;
++    if (cache[i].h)
++        BCryptDestroyKey(cache[i].h);
++    cache[i].cipher = t->cipher;
++    memcpy(cache[i].key, t->key, sizeof t->key);
++    cache[i].h = h;
++out:
++    ReleaseSRWLockExclusive(&lock);
++    return h;
++}
++
++static void des_block(const DesTable *t, UCHAR *out, const UCHAR *in, int encrypt)
++{
++    BCRYPT_KEY_HANDLE h = (t && t->tag == DES_TAG) ? des_key(t) : NULL;
++    UCHAR buf[8];
++    ULONG got = 0;
++    memcpy(buf, in, 8);
++    if (!h) { memcpy(out, buf, 8); return; }
++    if (encrypt)
++        BCryptEncrypt(h, buf, 8, NULL, NULL, 0, out, 8, &got, 0);
++    else
++        BCryptDecrypt(h, buf, 8, NULL, NULL, 0, out, 8, &got, 0);
++}
++#else
++static void des_block(const DesTable *t, UCHAR *out, const UCHAR *in, int encrypt)
++{
++    (void)t; (void)encrypt;
++    memmove(out, in, 8);
+ }
++#endif
+ 
+ VOID __stdcall xbox_XcBlockCrypt(ULONG CipherSelect, PVOID Output, PVOID Input, PVOID KeyTable, ULONG Operation)
+ {
+     (void)CipherSelect;
+-    (void)Output;
+-    (void)Input;
+-    (void)KeyTable;
+-    (void)Operation;
++    if (!Output || !Input)
++        return;
++    des_block((const DesTable *)KeyTable, (UCHAR *)Output, (const UCHAR *)Input, Operation != 0);
+ }
+ 
+ VOID __stdcall xbox_XcBlockCryptCBC(
+     ULONG CipherSelect, ULONG OutputLength, PVOID Output, PVOID Input,
+     PVOID KeyTable, ULONG Operation, PVOID FeedbackVector)
+ {
++    UCHAR *out = (UCHAR *)Output, *fb = (UCHAR *)FeedbackVector;
++    const UCHAR *in = (const UCHAR *)Input;
++    const DesTable *t = (const DesTable *)KeyTable;
++    ULONG off, k;
+     (void)CipherSelect;
+-    (void)OutputLength;
+-    (void)Output;
+-    (void)Input;
+-    (void)KeyTable;
+-    (void)Operation;
+-    (void)FeedbackVector;
++    if (!out || !in || !fb)
++        return;
++    for (off = 0; off + 8 <= OutputLength; off += 8) {
++        UCHAR blk[8], save[8];
++        if (Operation) {
++            for (k = 0; k < 8; k++) blk[k] = (UCHAR)(in[off + k] ^ fb[k]);
++            des_block(t, out + off, blk, 1);
++            memcpy(fb, out + off, 8);
++        } else {
++            memcpy(save, in + off, 8);
++            des_block(t, blk, save, 0);
++            for (k = 0; k < 8; k++) out[off + k] = (UCHAR)(blk[k] ^ fb[k]);
++            memcpy(fb, save, 8);
++        }
++    }
+ }
+ 
+ VOID __stdcall xbox_XcCryptService(ULONG Operation, PVOID Param)
+diff --git a/src/kernel/nvnet.c b/src/kernel/nvnet.c
+index 54ceed3..ad1252c 100644
+--- a/src/kernel/nvnet.c
++++ b/src/kernel/nvnet.c
+@@ -116,6 +116,23 @@ static Frame    s_rxq[RXQ];
+ static int      s_rxq_head, s_rxq_n;
+ static unsigned s_reads, s_writes, s_undecoded, s_tx_frames, s_rx_frames, s_rx_dropped, s_irqs;
+ static int      s_trace;
++static unsigned s_rx_link, s_rx_filtered, s_stat_sum;
++static DWORD    s_stat_at;
++
++/* One line about a frame for the log: MACs, and IPv4/UDP addresses and ports. */
++static void frame_desc(const uint8_t *f, int n, char *out, size_t cap)
++{
++    int k = snprintf(out, cap, "%d B %02X:%02X:%02X:%02X:%02X:%02X->%02X:%02X:%02X:%02X:%02X:%02X %02X%02X", n,
++                     f[6], f[7], f[8], f[9], f[10], f[11], f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13]);
++    if (n >= 34 && f[12] == 8 && f[13] == 0 && k > 0 && (size_t)k < cap) {
++        const uint8_t *ip = f + 14;
++        int ihl = (ip[0] & 15) * 4;
++        k += snprintf(out + k, cap - (size_t)k, " %u.%u.%u.%u->%u.%u.%u.%u p%u", ip[12], ip[13], ip[14], ip[15],
++                      ip[16], ip[17], ip[18], ip[19], ip[9]);
++        if (ip[9] == 17 && n >= 14 + ihl + 4 && k > 0 && (size_t)k < cap)
++            snprintf(out + k, cap - (size_t)k, " udp %u->%u", ip[ihl] << 8 | ip[ihl + 1], ip[ihl + 2] << 8 | ip[ihl + 3]);
++    }
++}
+ 
+ #define REG(o) s_reg[(o) / 4]
+ 
+@@ -335,9 +352,11 @@ static void tx_kick(void)
+         *(uint16_t *)(d + 6) = flags;
+         ring_advance(1);
+         if (flags & (TX_LAST | TX_LAST1)) {
+-            if (s_trace && s_tx_frames < 40)
+-                fprintf(stderr, "  [NVNET] tx %d bytes to %02X:%02X:%02X:%02X:%02X:%02X type %02X%02X\n", s_txlen,
+-                        s_txbuf[0], s_txbuf[1], s_txbuf[2], s_txbuf[3], s_txbuf[4], s_txbuf[5], s_txbuf[12], s_txbuf[13]);
++            if (s_tx_frames < (s_trace ? 200u : 16u)) {
++                char dsc[160];
++                frame_desc(s_txbuf, s_txlen, dsc, sizeof dsc);
++                fprintf(stderr, "  [NVNET] tx %s\n", dsc);
++            }
+             if (!(s_dhcp_local && dhcp_answer(s_txbuf, s_txlen)))
+                 nvlink_send(s_txbuf, s_txlen);
+             s_tx_frames++;
+@@ -631,11 +650,35 @@ static DWORD WINAPI nic_thread(LPVOID unused)
+     for (;;) {
+         int n = nvlink_recv(f, sizeof f, 1);
+         uint32_t pending;
++        DWORD now = GetTickCount();
+         EnterCriticalSection(&s_lock);
+-        if (n > 0 && rx_accept(f, n))
+-            rxq_push(f, n);
++        if (n > 0) {
++            int ok = rx_accept(f, n);
++            s_rx_link++;
++            if (!ok) s_rx_filtered++;
++            if (s_rx_link <= 12) {
++                char d[160];
++                frame_desc(f, n, d, sizeof d);
++                fprintf(stderr, "  [NVNET] rx %s%s\n", d, ok ? "" : " (filtered)");
++            }
++            if (ok) rxq_push(f, n);
++        }
+         rx_deliver();
+         pending = REG(R_IRQ_STATUS) & REG(R_IRQ_MASK);
++        if (now - s_stat_at >= 5000) {
++            unsigned sum = s_tx_frames + s_rx_link + s_rx_frames + s_irqs;
++            if (sum != s_stat_sum) {
++                uint32_t at = REG(R_RX_NEXT);
++                uint8_t *dd = REG(R_RX_RING) ? guest(at, 8) : NULL;
++                fprintf(stderr, "  [NVNET] tx %u, link rx %u (filtered %u), delivered %u, dropped %u, queued %d, ISR %u; "
++                                "rxctl %X txrx %X irq %X/%X rx desc %08X flags %04X\n",
++                        s_tx_frames, s_rx_link, s_rx_filtered, s_rx_frames, s_rx_dropped, s_rxq_n, s_irqs,
++                        REG(R_RX_CONTROL), REG(R_TXRX_CONTROL), REG(R_IRQ_STATUS), REG(R_IRQ_MASK),
++                        at, dd ? *(uint16_t *)(dd + 6) : 0xFFFFu);
++                s_stat_sum = sum;
++            }
++            s_stat_at = now;
++        }
+         LeaveCriticalSection(&s_lock);
+         if (pending && nic_kint())
+             raise_line();
+diff --git a/src/kernel/nvnet_link.c b/src/kernel/nvnet_link.c
+index 48acf5e..f7e68a2 100644
+--- a/src/kernel/nvnet_link.c
++++ b/src/kernel/nvnet_link.c
+@@ -120,9 +120,14 @@ int nvlink_open(const uint8_t mac[6])
+         s_port = (unsigned short)atoi(p);
+     if (WSAStartup(MAKEWORD(2, 2), &wd) != 0)
+         return -1;
+-    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    /* Not inheritable: a title that relaunches itself (XLaunchNewImage as a new
++     * process) would hand this socket to its successor, keep the port bound
++     * after it exits, and the frames sent to it would go to a socket nobody
++     * reads. */
++    s_sock = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT);
+     if (s_sock == INVALID_SOCKET)
+         return -1;
++    SetHandleInformation((HANDLE)s_sock, HANDLE_FLAG_INHERIT, 0);
+     setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
+     setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof on);
+     memset(&me, 0, sizeof me);
+-- 
+2.51.0.windows.2
+
