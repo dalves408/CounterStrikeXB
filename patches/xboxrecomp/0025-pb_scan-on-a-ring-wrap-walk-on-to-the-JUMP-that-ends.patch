@@ -1,0 +1,117 @@
+From 5ee1b3c1969d181dcc105216eab5fe7b4169f4a4 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] pb_scan: on a ring wrap, walk on to the JUMP that ends the
+ lap (CounterStrikeXB2 local patch)
+
+A wrap was handled by finding the first JUMP after the old PUT and taking it for
+the end of the lap. When the title ran a recorded pushbuffer between the old
+PUT and the wrap (XDK D3D's RunPushBuffer, a JUMP out and back), that JUMP was
+found first: the scan stopped there and resumed at the recorded buffer's
+address, which lies above the new PUT, so the rest of the lap was never walked.
+Counter-Strike draws its HUD, sprites and models that way, so whenever the ring
+wrapped mid-frame the frame lost its tail -- the HUD, menus and the weapon
+flashed off. A title that runs ahead of the executor (a slow GPU, WARP, a frame
+cap) wraps mid-frame every few frames: every 6th frame at a 30 FPS cap on an
+RTX 3070, 10-20% of frames on WARP, the "flicker" on an Intel UHD laptop.
+
+The wrap now walks on from the old PUT like any segment (recorded pushbuffers
+run as detours) and stops at the first JUMP it does not take for one -- the
+wrap -- then goes on from that JUMP's target to the new PUT. The walk's stop is
+also what extends the learned ring, not its open-ended bound.
+
+Measured: per-frame executor draws constant at a 30 FPS cap (753/754, were
+672 every 6th frame), all 2699 WARP frames complete (were 10-20% short), 2933
+in-match frames on the Intel laptop without a dip; RTX 3070 frame times
+unchanged (median 9.5 ms).
+---
+ src/kernel/nv2a_pb_scan.c | 41 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index 5e369a9..90b01f7 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -492,6 +492,9 @@ static uint32_t s_walk_put;      /* end (PUT) of the segment being walked; 0 whe
+  * with the byte bound alone). */
+ #define PB_ACK_KICKS 8u
+ static uint32_t s_walk_acks;
++/* Where the last walk stopped on a JUMP it did not take for a detour (the ring's
++ * wrap), and that JUMP's target; 0 when it stopped otherwise. */
++static uint32_t s_stop_at, s_stop_target;
+ int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ 
+ static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint32_t *target_va);
+@@ -621,6 +624,8 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+                                 va - 4, tv, found ? "found" : "not found", jat, t2, va, (int)(t2 - va),
+                                 end_va, end_va - va, 10);
+                     }
++                    s_stop_at = va - 4;
++                    s_stop_target = 0x80000000u | (target & 0x0FFFFFFFu);
+                     break;                    /* the ring: a jump ends it */
+                 }
+                 s_tot_detours++;
+@@ -738,21 +743,43 @@ static int pb_find_jump(uint32_t va, uint32_t limit_va, uint32_t *jump_at, uint3
+  * ran with the previous menu draw's modulate combiner and black vertex colour:
+  * a black frame on a menu change. So: follow the actual JUMP. Returns 0, having
+  * scanned nothing, if no JUMP is found, and the caller falls back. */
++static void scan_segment(uint32_t start_va, uint32_t end_va, int learn_ring);
++
+ int nv2a_pb_scan_wrap(uint32_t last_put_va, uint32_t put_va)
+ {
+-    uint32_t jump_at, target;
++    uint32_t stop_at, target;
+ 
+     if (!pb_walk_enabled())
+         return 1;
+-    if (!pb_find_jump(last_put_va, last_put_va + 0x400000u, &jump_at, &target))
++    /* Walk on from the old PUT as any segment is walked -- recorded pushbuffers
++     * run as detours -- to the JUMP that ends the lap. Searching for "the first
++     * JUMP" instead found a detour's JUMP whenever the title ran a recorded
++     * pushbuffer between the old PUT and the wrap (Counter-Strike draws its
++     * HUD, sprites and models that way), and the rest of the lap was never
++     * walked: whenever the ring wrapped mid-frame the frame lost its tail, and a
++     * title running ahead of the executor (a slow host, a frame cap) wraps
++     * mid-frame every few frames. */
++    s_stop_at = s_stop_target = 0;
++    scan_segment(last_put_va, last_put_va + 0x400000u, 0);
++    stop_at = s_stop_at;
++    target = s_stop_target;
++    if (!stop_at)
+         return 0;
+-    nv2a_pb_scan_segment(last_put_va, jump_at + 4u);   /* stops at the JUMP */
++    if (stop_at + 4u > s_ring_hi)
++        s_ring_hi = stop_at + 4u;
+     if (put_va > target)
+-        nv2a_pb_scan_segment(target, put_va);
++        scan_segment(target, put_va, 1);
+     return 1;
+ }
+ 
+ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
++{
++    scan_segment(start_va, end_va, 1);
++}
++
++/* learn_ring: the segment lies in the ring (its extent feeds pb_in_ring); the
++ * wrap's open-ended walk does not, its end being a bound, not the ring's. */
++static void scan_segment(uint32_t start_va, uint32_t end_va, int learn_ring)
+ {
+     uint32_t words, jumps = 0, unknown = 0;
+ 
+@@ -760,8 +787,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+         return;
+     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+         end_va = start_va + 0x400000u;
+-    if (!s_ring_lo || start_va < s_ring_lo) s_ring_lo = start_va;   /* the ring, as covered (pb_in_ring) */
+-    if (end_va > s_ring_hi) s_ring_hi = end_va;
++    if (learn_ring) {   /* the ring, as covered (pb_in_ring) */
++        if (!s_ring_lo || start_va < s_ring_lo) s_ring_lo = start_va;
++        if (end_va > s_ring_hi) s_ring_hi = end_va;
++    }
+ 
+     if (s_exec_enabled) {
+         extern void nv2a_pb_exec_walk_begin(void);
+-- 
+2.51.0.windows.2
+

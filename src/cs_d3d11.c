@@ -1102,7 +1102,15 @@ static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uin
     if (s) { d.rt = s->color_va; d.rt_wh = (s->width << 16) | (s->height & 0xFFFF); }
     if (kind == 3) {   /* a flip: the executor's draw count, to tell commands never executed from draws dropped here */
         extern uint32_t xbox_Nv2aDrawCount(void);
+        const uint8_t *gm = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t dev = *(const volatile uint32_t *)(gm + 0x00316FE8u);   /* XDK D3D's device (read only, diagnostics) */
         d.tex = xbox_Nv2aDrawCount();
+        if (dev >= 0x10000u && dev < 0x84000000u) {
+            uint32_t gp = *(const volatile uint32_t *)(gm + dev + 0x30u);
+            d.zeta = *(const volatile uint32_t *)(gm + dev + 0x2Cu);       /* CPU fence time */
+            d.comb = (gp >= 0x10000u && gp < 0x84000000u) ? *(const volatile uint32_t *)(gm + gp) : 0xFFFFFFFFu;
+            d.cmask = gp;                                                  /* where the GPU time is read */
+        }
     }
     if (b) {
         const Nv2aRenderState *r = b->state;
