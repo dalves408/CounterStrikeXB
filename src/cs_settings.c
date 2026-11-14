@@ -10,7 +10,7 @@ const int CS_SET_RATE_HZ[CS_SET_RATES] = { 30, 60, 120, 144, 240, 0 };
 const int CS_SET_MSAA_N[CS_SET_MSAAS] = { 1, 2, 4, 8 };
 const int CS_SET_ANISO_N[CS_SET_ANISOS] = { 1, 2, 4, 8, 16 };
 const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES] = {
-    "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440", "4x  2560x1920" };
+    "Low  (1x, 640x480)", "Medium  (2x, 1280x960)", "High  (3x, 1920x1440)" };
 const char *const CS_SET_RATE_TEXT[CS_SET_RATES] = {
     "30", "60", "120", "144", "240", "Uncapped" };
 const char *const CS_SET_MSAA_TEXT[CS_SET_MSAAS] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };

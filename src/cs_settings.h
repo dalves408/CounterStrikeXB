@@ -3,7 +3,8 @@
  * config.exe.
  *
  * %LOCALAPPDATA%\CounterStrikeXB\settings.ini, [display]:
- *   resolution_scale  1..4      internal resolution, a multiple of the Xbox's 640x480
+ *   resolution_scale  1..3      internal resolution: Low 1x (the Xbox's 640x480, default),
+ *                               Medium 2x, High 3x
  *   fullscreen        0/1       borderless fullscreen at start (F11 / Alt+Enter toggle)
  *   stretch           0/1       fill the window instead of keeping 4:3
  *   vsync             0/1
@@ -30,7 +31,7 @@ typedef struct {
 } CsSettings;
 
 /* The choices each option offers, in menu order, and their names. */
-#define CS_SET_SCALES 4
+#define CS_SET_SCALES 3                               /* Low 1x (default), Medium 2x, High 3x */
 #define CS_SET_RATES 6
 #define CS_SET_MSAAS 4
 #define CS_SET_ANISOS 5

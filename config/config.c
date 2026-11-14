@@ -303,7 +303,7 @@ static void make_ui(HWND h)
         s_vpage[s_nv++] = s_combo[i];
     }
     s_vpage[s_nv++] = mk("STATIC",
-        "Render scale draws the game at a multiple of the Xbox's 640x480. Anti-aliasing smooths edges and anisotropic "
+        "Render scale: Low draws the game at the Xbox's own 640x480, Medium at 2x and High at 3x. Anti-aliasing smooths edges and anisotropic "
         "filtering keeps distant textures sharp; both cost a little GPU time. Fullscreen fills the screen without a border "
         "(F11 or Alt+Enter switch while playing). Frame rate cap limits how fast the game runs; Uncapped is the default.",
         SS_LEFT, 30, 410, 540, 80, 0, f);

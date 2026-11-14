@@ -99,7 +99,7 @@ game. The F1 menu changes these as you play, and saves them as you go:
 
 | Setting | Choices |
 | --- | --- |
-| Render scale | 1x (640x480, the Xbox's own) up to 4x (2560x1920) |
+| Render scale | Low 1x (640x480, the Xbox's own; default), Medium 2x (1280x960), High 3x (1920x1440) |
 | Fullscreen | borderless, on the window's monitor |
 | Stretch image | fill the window instead of keeping 4:3 |
 | VSync | on / off |
