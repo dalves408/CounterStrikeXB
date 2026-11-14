@@ -43,5 +43,10 @@
                  "image":  "Counter-Strike (USA) (En,Fr,Es,It,Ko).xiso.iso",
                  "image_sha256":  "435d65bd29e04cb8dd0d80f18ce9632ada7b62b6abc3d7935b24b866281e418b",
                  "default_xbe_sha256":  "8f0c12e345ed7b900f5732602e16ad7d17e3239b13f9baaf50541104169cb105"
-             }
+             },
+    "title_update":  {
+                         "note":  "Counter-Strike title update (cert version 257, built 2003-11-25), the version Insignia expects. The game is translated from this default.xbe; installs make it from the disc one with installer/tu_default.xbepatch.",
+                         "source":  "TDATA/4d530036/$u/default.xbe on a console hard drive",
+                         "default_xbe_sha256":  "c7584a61912d2174eaa09fbc51ddf7b25c88b59e54a53b95a677419525276c55"
+                     }
 }

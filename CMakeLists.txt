@@ -53,6 +53,7 @@ set(GAME_SOURCES
     src/cs_overlay.c
     src/cs_diag.c
     src/cs_frame.c
+    installer/tu_apply.c
     resources/cs.rc
 )
 
@@ -84,6 +85,7 @@ endif()
 add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/installer
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen
@@ -139,7 +141,7 @@ target_link_libraries(config PRIVATE comctl32 shell32 version advapi32 user32)
 
 # The installer's import tool (not installed; Setup runs it from its temp folder) and
 # RecompLauncher's prepare step: copies the game files from the player's own disc.
-add_executable(cs_import installer/cs_import.c)
+add_executable(cs_import installer/cs_import.c installer/tu_apply.c)
 target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)
-target_link_libraries(cs_import PRIVATE bcrypt shell32)
+target_link_libraries(cs_import PRIVATE bcrypt shell32 cabinet)
 target_compile_definitions(cs_import PRIVATE UNICODE _UNICODE)

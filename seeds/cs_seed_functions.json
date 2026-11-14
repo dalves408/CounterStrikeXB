@@ -1,15 +1,15 @@
 [
   {
-    "start": "0x000C6310",
-    "note": "Thread start routine (SEH prolog: push -1; push 0x23B750; mov eax,fs:[0]). Address is pushed as a CreateThread start at 0x000C64BA. Measured: old project run boot5 logged '[ICALL] Failed to resolve VA 0x000C6310' because the detector missed it."
+    "start": "0x000C5FD0",
+    "note": "Thread start routine (SEH prolog: push -1; push 0x23B750; mov eax,fs:[0]). Address is pushed as a CreateThread start at 0x000C64BA. Measured: old project run boot5 logged '[ICALL] Failed to resolve VA 0x000C6310' because the detector missed it. Title update address; the disc build had it at 0x000C6310."
   },
   {
-    "start": "0x002353A4",
+    "start": "0x002353E4",
     "observed": true,
-    "note": "x87 math dispatch target observed unresolved during Airstrip. The entry pops two x87 operands and returns zero; its address is in the table at 0x003A53B8."
+    "note": "x87 math dispatch target observed unresolved during Airstrip. The entry pops two x87 operands and returns zero; its address is in the table at 0x003A53B8. Title update address; the disc build had it at 0x002353A4."
   },
   {
-    "start": "0x00235446",
-    "note": "Another valid entry in the same x87 math dispatch table, at 0x003A53AC and six other slots. It follows a ret and shares its tail with 0x00235459."
+    "start": "0x00235486",
+    "note": "Another valid entry in the same x87 math dispatch table, at 0x003A53AC and six other slots. It follows a ret and shares its tail with 0x00235459. Title update address; the disc build had it at 0x00235446."
   }
 ]

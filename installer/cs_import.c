@@ -14,8 +14,12 @@
  * are written to a staging folder beside <dest_dir> and swapped in at the end, so a failed or
  * interrupted run never leaves a half-written game folder (an existing one is kept until then).
  *
+ * The game is translated from the title update (cert version 257), so after the copy default.xbe is
+ * turned into the update's with cs_tu.xbepatch, found beside this program (tu_apply.c).
+ *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 wrong game or
- * version (default.xbe differs), 5 files missing or the wrong size, 6 cannot write. */
+ * version (default.xbe differs), 5 files missing or the wrong size, 6 cannot write,
+ * 7 the title update patch is missing or could not be applied. */
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -24,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "manifest.h"
+#include "tu_apply.h"
 
 #define SECTOR 2048ull
 static const unsigned long long XDVDFS_OFFSETS[] = { 0, 0x18300000ull, 0x0FD90000ull, 0x02080000ull };
@@ -323,6 +328,17 @@ static int run_import(const WCHAR *source, const WCHAR *destination)
             printf("ERROR Could not write to the install folder.\n");
             return 6;
         }
+    }
+    {   /* the title update */
+        WCHAR xbe[MAX_PATH], patch[MAX_PATH], *sl;
+        int r;
+        dest_path("default.xbe", xbe);
+        GetModuleFileNameW(NULL, patch, MAX_PATH);
+        sl = wcsrchr(patch, L'\\');
+        if (sl) *(sl + 1) = 0;
+        wcscat_s(patch, MAX_PATH, L"cs_tu.xbepatch");
+        r = tu_apply_file(xbe, patch);
+        if (r < 0) { printf("ERROR The title update could not be applied: %s.\n", tu_error_text(r)); return 7; }
     }
     printf("OK %u files\n", g_found);
     return 0;

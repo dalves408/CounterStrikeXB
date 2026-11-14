@@ -1,4 +1,7 @@
-"""Regenerate src/recomp/gen from the original default.xbe with the pinned toolkit.
+"""Regenerate src/recomp/gen from the title update's default.xbe with the pinned toolkit.
+
+game_files/default.xbe is the update's (scripts/tu_patch.py apply makes it from the
+disc's, which is kept as default.disc.xbe).
 
 The generated tree is pure pipeline output: this script wipes it first and
 nothing in it is ever edited by hand. Game-specific code lives in src/.
@@ -30,8 +33,8 @@ args = ap.parse_args()
 if not xbe.is_file():
     raise SystemExit(f"missing {xbe}; run scripts/extract_disc.py first")
 digest = hashlib.sha256(xbe.read_bytes()).hexdigest()
-if digest != deps["disc"]["default_xbe_sha256"]:
-    raise SystemExit(f"default.xbe sha256 {digest} != expected {deps['disc']['default_xbe_sha256']}")
+if digest != deps["title_update"]["default_xbe_sha256"]:
+    raise SystemExit(f"default.xbe sha256 {digest} != the title update's {deps['title_update']['default_xbe_sha256']}; run scripts/tu_patch.py apply")
 head = subprocess.run(["git", "-C", str(toolkit), "rev-parse", "HEAD"], capture_output=True,
                       text=True, check=True).stdout.strip()
 if head != deps["xboxrecomp"]["commit"]:

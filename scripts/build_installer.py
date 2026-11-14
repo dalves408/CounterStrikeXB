@@ -106,6 +106,9 @@ def main():
         run('cmake', '-S', ROOT, '-B', BUILD, '-DCS_RELEASE=ON')
         run('cmake', '--build', BUILD, '--config', CONFIG, '-j', '12',
             '--target', 'cs2_xbox_recomp', 'cs_import', 'config')
+    # The title update as a patch from the disc's default.xbe (scripts/tu_patch.py): installed beside the
+    # game, which applies it when an install still has the disc's file, and used by cs_import.
+    run(sys.executable, ROOT / 'scripts' / 'tu_patch.py', 'make', '--out', BUILD / CONFIG / 'cs_tu.xbepatch')
     keep_symbols(args.version)
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)

@@ -44,6 +44,10 @@ Two ways, the same as the Marvel vs. Capcom 2 recompilation's:
 - **RecompLauncher:** add the GitHub release (`CounterStrike-v<version>-Windows-x64.zip`). The launcher asks for the
   disc, checks it against Redump, runs the same import (`cs_import.exe --prepare`), and starts the game.
 
+The game runs as its **title update** (version 257, Nov 2003, the version Xbox Live/Insignia expects). You still
+supply only the original disc: Setup and the launcher turn its `default.xbe` into the update's with a small
+patch (`cs_tu.xbepatch`, installed beside the game), so no download or update file is needed.
+
 Your settings, key map, saves and logs are in `%LOCALAPPDATA%\CounterStrikeXB`.
 
 ### Problem reports and logs
@@ -86,10 +90,15 @@ powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 # 2. Extract your disc image into game_files\
 python scripts\extract_disc.py "Counter-Strike (USA) (En,Fr,Es,It,Ko).xiso.iso" game_files
 
-# 3. Generate the recompiled C (src\recomp\gen) from game_files\default.xbe
+# 3. Make game_files\default.xbe the title update's (the disc's is kept as default.disc.xbe). The patch is
+#    built by `scripts\tu_patch.py make` from the update's default.xbe (TDATA\4d530036\$u on a console's drive),
+#    and ships with every Setup as cs_tu.xbepatch.
+python scripts\tu_patch.py apply --patch cs_tu.xbepatch
+
+# 4. Generate the recompiled C (src\recomp\gen) from game_files\default.xbe (the title update's)
 python scripts\pipeline.py
 
-# 4. Build
+# 5. Build
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Configuration RelWithDebInfo
 ```
 

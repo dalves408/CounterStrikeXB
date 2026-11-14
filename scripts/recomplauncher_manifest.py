@@ -95,6 +95,7 @@ def manifest():
             '4': 'That is not the supported version of Counter-Strike (the USA Xbox release).',
             '5': 'The disc image is damaged or incomplete.',
             '6': 'The game files could not be written to the install folder.',
+            '7': 'The title update could not be applied to the game files.',
         },
         'looks': {'graphics': 'd3d11', 'lines': 480},
     }
@@ -115,7 +116,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f'CounterStrike-v{args.version}-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
-        for name in ('cs2_xbox_recomp.exe', 'cs_import.exe', 'config.exe'):
+        for name in ('cs2_xbox_recomp.exe', 'cs_import.exe', 'config.exe', 'cs_tu.xbepatch'):
             package.write(args.build / name, name)
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

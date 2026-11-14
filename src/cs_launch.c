@@ -52,7 +52,7 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 
-#define CS_THUNK_HALRETURNTOFIRMWARE 0x003211BCu   /* ordinal 49 (analysis json) */
+#define CS_THUNK_HALRETURNTOFIRMWARE 0x003211FCu   /* title update (disc: 0x003211BC) */   /* ordinal 49 (analysis json) */
 #define CS_LAUNCH_PAGE_SIZE 0x1000u
 #define CS_SELF_PATH_TAIL ";default.xbe"
 

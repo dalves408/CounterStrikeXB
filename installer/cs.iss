@@ -49,6 +49,10 @@ Source: "{#BuildDir}\cs2_xbox_recomp.exe"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\cs_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+; the title update, as a patch to the disc's default.xbe: used by cs_import, and by the game when an
+; install made before it still has the disc's file
+Source: "{#BuildDir}\cs_tu.xbepatch"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+Source: "{#BuildDir}\cs_tu.xbepatch"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Counter-Strike"; Filename: "{app}\cs2_xbox_recomp.exe"; WorkingDir: "{app}"
@@ -374,6 +378,7 @@ begin
         4: Msg := 'That is not the supported version of Counter-Strike (the USA Xbox release).';
         5: Msg := 'Some game files are missing or damaged. The dump may be incomplete.';
         6: Msg := 'The game files could not be written to the install folder.';
+        7: Msg := 'The game update could not be applied to the game files.';
       else
         Msg := 'The game files could not be copied.';
       end;

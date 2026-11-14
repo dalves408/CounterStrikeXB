@@ -56,7 +56,7 @@
 
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 
-#define CS_THUNK_NTREADFILE 0x003210D8u
+#define CS_THUNK_NTREADFILE 0x00321118u          /* title update (disc: 0x003210D8) */
 
 static uint32_t s_ntreadfile_va;   /* synthetic VA the thunk slot holds */
 
@@ -117,11 +117,11 @@ static void cs_NtReadFile(void)
  */
 #include <stdio.h>
 #include <stdlib.h>
-#define CS_THUNK_KERAISEIRQLTODPC 0x003211A8u   /* ordinal 129 */
+#define CS_THUNK_KERAISEIRQLTODPC 0x003211E8u   /* title update (disc: 0x003211A8) */   /* ordinal 129 */
 static uint32_t s_keraise_va;
 
 int xbox_IrqlRaisedCount(void);                  /* kernel_hal.c */
-#define CS_THUNK_KFLOWERIRQL 0x003211A4u        /* ordinal 161, fastcall cl */
+#define CS_THUNK_KFLOWERIRQL 0x003211E4u        /* title update (disc: 0x003211A4) */        /* ordinal 161, fastcall cl */
 static uint32_t s_kflower_va;
 static volatile long s_irql_logged;
 

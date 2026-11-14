@@ -48,6 +48,7 @@
 #include "cs_overlay.h"
 #include "cs_diag.h"
 #include "cs_frame.h"
+#include "tu_apply.h"
 #include "kernel/nvnet.h"
 
 /*
@@ -91,7 +92,7 @@ extern ptrdiff_t g_xbox_mem_offset;
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
  */
-#define YOUR_GAME_ENTRY_POINT   0x00202C3C  /* XBE entry point VA (retail XOR decoded; xbe_parser) */
+#define YOUR_GAME_ENTRY_POINT   0x00202C7C  /* title update (disc: 0x00202C3C) */  /* XBE entry point VA (retail XOR decoded; xbe_parser) */
 #define YOUR_GAME_XBE_PATH      "game_files\\default.xbe"
 #define YOUR_GAME_DIR            "game_files"
 /* CS2: project-local save/partition/cache root instead of the shared
@@ -450,6 +451,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     cs_diag_install_crash_filter();
     cs_diag_build_line();
 
+    /* The code here is translated from the title update (cert version 257), and
+     * so must the default.xbe loaded beside it be. An install made before the
+     * update, or by a route that only replaced the program, still has the disc's:
+     * cs_tu.xbepatch next to the program turns it into the update's
+     * (installer/tu_apply.c). Development trees carry no patch and are made with
+     * scripts/tu_patch.py apply. */
+    if (GetFileAttributesW(L"cs_tu.xbepatch") != INVALID_FILE_ATTRIBUTES) {
+        int tr = tu_apply_file(L"game_files\\default.xbe", L"cs_tu.xbepatch");
+        fprintf(stderr, "[CS2] title update: %s\n", tu_error_text(tr));
+    }
+
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
         MessageBoxA(NULL, "Failed to load default.xbe.\n"
@@ -458,6 +470,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+    {   /* the certificate's version: 257 for the title update this was built from */
+        const uint8_t *x = (const uint8_t *)xbe_data;
+        uint32_t base = xbe_size >= 0x180 ? *(const uint32_t *)(x + 0x104) : 0;
+        uint32_t cert = xbe_size >= 0x180 ? *(const uint32_t *)(x + 0x118) - base : 0;
+        uint32_t ver = cert && cert + 0xB0 <= xbe_size ? *(const uint32_t *)(x + cert + 0xAC) : 0;
+        if (ver != 257) {
+            fprintf(stderr, "[CS2] default.xbe has certificate version %u, not the title update's 257\n", ver);
+            MessageBoxA(NULL, "The installed game files are not the updated version this program needs.\n\n"
+                        "Run Setup again (it updates them from your disc), or use Repair.",
+                        "Counter-Strike", MB_ICONERROR);
+            return 1;
+        }
+    }
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
