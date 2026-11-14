@@ -330,6 +330,8 @@ static void player_setup(void)
         *slash = 0;
         SetCurrentDirectoryA(path);
     }
+    /* CS_KEEP_ENV=1 keeps them, so a player's PC can be checked with the diagnostic switches (RECOMP_CS_D3D11_LOG...) */
+    if (!getenv("CS_KEEP_ENV"))
     for (;;) {      /* removing a variable changes _environ, so start over each time */
         char name[128];
         char **e;
@@ -369,6 +371,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         int code;
         if (cs_frame_main(&code))
             return code;
+    }
+    {   /* Never power-throttled. Inside the frame this process owns no visible top-level window, and Windows 11 then
+         * treats it as background: it ignores its 1 ms timer resolution (sleeps round up to ~15.6 ms) and may run it
+         * in EcoQoS (efficiency cores on hybrid CPUs). The emulated Xbox's timers, vblank pacing and frame cap need
+         * fine timing; with the frame, matches froze within a minute in 3 of ~8 runs (a GPU wait never signalled). */
+        PROCESS_POWER_THROTTLING_STATE pt;
+        memset(&pt, 0, sizeof pt);
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        pt.StateMask = 0;                   /* both controlled, both off */
+        if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt))
+            fprintf(stderr, "[CS] power throttling opt-out failed (%lu)\n", GetLastError());
     }
 #ifdef CS_RELEASE
     player_setup();

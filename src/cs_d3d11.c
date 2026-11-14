@@ -275,6 +275,7 @@ static StateEnt s_bs[96], s_dss[96], s_ss[48];
 static int s_nbs, s_ndss, s_nss;
 
 static uint32_t s_fr_draws, s_fr_tris;   /* this frame, for RECOMP_CS_FRAME_CSV */
+static uint32_t s_fr_gv, s_fr_fog;        /* this frame: vertex-program draws, and those with fog on */
 static int s_dump_now;                    /* the RECOMP_CS_DUMP flag was up at the last present */
 static float s_pick_x, s_pick_y;          /* RECOMP_CS_PICK point */
 static int s_pick_hit;                    /* this draw covers it: read the pixel back after drawing */
@@ -299,6 +300,18 @@ static int s_alpha_lift = 0;
 static float s_pixofs;
 static unsigned st_draws, st_tris, st_culled, st_clears, st_flips, st_decodes, st_rtsamples,
                 st_bad_tex, st_decode_fail, st_rb, st_vb_drop;
+static unsigned st_map_fail;
+
+/* Every write Map, checked: a failure is logged (the first 20, with the call site) and counted. */
+static HRESULT map_w(ID3D11Resource *r, D3D11_MAP type, D3D11_MAPPED_SUBRESOURCE *m, int line)
+{
+    HRESULT hr = ID3D11DeviceContext_Map(s_ctx, r, 0, type, 0, m);
+    if (FAILED(hr) && st_map_fail++ < 20)
+        fprintf(stderr, "[CS-D3D11] Map failed at line %d (%s): 0x%08lX\n", line,
+                type == D3D11_MAP_WRITE_DISCARD ? "discard" : "no-overwrite", (unsigned long)hr);
+    return hr;
+}
+#define MAP_W(res, type, m) map_w((ID3D11Resource *)(res), (type), (m), __LINE__)
 
 /* ---- init ---------------------------------------------------------------- */
 
@@ -326,8 +339,12 @@ static int cs_d3d11_setup(void)
     unsigned i;
     HRESULT hr;
 
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                           NULL, 0, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
+    {   /* RECOMP_CS_WARP=1: Windows' software rasteriser instead of the GPU, to tell a renderer bug (shows on WARP
+         * too) from a driver one (does not) */
+        const char *w = getenv("RECOMP_CS_WARP");
+        hr = D3D11CreateDevice(NULL, (w && *w == '1') ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
+    }
     if (FAILED(hr)) {
         fprintf(stderr, "[CS-D3D11] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr);
         return 0;
@@ -379,6 +396,14 @@ static int cs_d3d11_setup(void)
             SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad)) && SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
             fprintf(stderr, "[CS-D3D11] back end up on '%ls' (feature level 0x%X)\n", desc.Description, (unsigned)fl);
         SAFE_REL(ad); SAFE_REL(dd);
+    }
+    {   /* What the driver allows that differs between GPUs (the GPU vertex-program inputs are written with
+         * NO_OVERWRITE into a buffer the shader reads) */
+        D3D11_FEATURE_DATA_D3D11_OPTIONS o;
+        memset(&o, 0, sizeof o);
+        if (SUCCEEDED(ID3D11Device_CheckFeatureSupport(s_dev, D3D11_FEATURE_D3D11_OPTIONS, &o, sizeof o)))
+            fprintf(stderr, "[CS-D3D11] driver: no-overwrite on shader-read buffers %d, constant-buffer offsets %d\n",
+                    (int)o.MapNoOverwriteOnDynamicBufferSRV, (int)o.ConstantBufferOffsetting);
     }
     return 1;
 }
@@ -998,7 +1023,7 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
                 rcbuf = last_rcbuf;
             } else {
                 rcbuf = s_rcr[s_rc_i++ % CB_RING];
-                if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)rcbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                if (SUCCEEDED(MAP_W(rcbuf, D3D11_MAP_WRITE_DISCARD, &m))) {
                     memcpy(m.pData, &rcb, sizeof rcb);
                     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)rcbuf, 0);
                 }
@@ -1014,7 +1039,7 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
             cbuf = last_cbuf;
         } else {
             cbuf = s_cbr[s_cb_i++ % CB_RING];
-            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            if (SUCCEEDED(MAP_W(cbuf, D3D11_MAP_WRITE_DISCARD, &m))) {
                 memcpy(m.pData, &cb, sizeof cb);
                 ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)cbuf, 0);
             }
@@ -1102,8 +1127,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     if (s_vb_off + need > VB_BYTES) { s_vb_off = 0; s_vb_i = (s_vb_i + 1) % VB_RING; }
     vb = s_vbr[s_vb_i];
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)vb, 0,
-               s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
+    if (FAILED(MAP_W(vb, s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, &m)))
         return;
     dst = (Nv2aVertex *)((uint8_t *)m.pData + s_vb_off);
     for (i = 0; i + 2 < b->count; i += 3) {
@@ -1558,14 +1582,15 @@ done:
     if (s_csv) {
         t1 = cs_now_ms();
         if (s_sig_valid)
-            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,%.1f,%.2f,%016llX\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
-                    s_fr_draws, s_fr_tris, nrb, t1 - t0, s_sig_luma, s_sig_black, (unsigned long long)s_sig_hash);
+            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,%.1f,%.2f,%016llX,%u,%u\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
+                    s_fr_draws, s_fr_tris, nrb, t1 - t0, s_sig_luma, s_sig_black, (unsigned long long)s_sig_hash,
+                    s_fr_gv, s_fr_fog);
         else
-            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,,,\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
-                    s_fr_draws, s_fr_tris, nrb, t1 - t0);
+            fprintf(s_csv, "%.2f,%u,%.2f,%u,%u,%d,%.3f,,,,%u,%u\n", t0, s_frame, last_flip ? t0 - last_flip : 0.0,
+                    s_fr_draws, s_fr_tris, nrb, t1 - t0, s_fr_gv, s_fr_fog);
         last_flip = t0;
     }
-    s_fr_draws = s_fr_tris = 0;
+    s_fr_draws = s_fr_tris = s_fr_gv = s_fr_fog = 0;
 }
 
 /* GPU time per frame (RECOMP_CS_D3D11_LOG): timestamp queries around each
@@ -1777,13 +1802,11 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     /* Inputs and indices into their rings; constants and per-draw values. */
     s_gv_in_off = (s_gv_in_off + nin - 1) / nin * nin;   /* vertex-aligned: indices carry the base */
     if (s_gv_in_off + rows > GV_IN_ROWS) s_gv_in_off = 0;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_in, 0,
-               s_gv_in_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+    if (FAILED(MAP_W(s_gv_in, s_gv_in_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, &m))) return 0;
     memcpy((uint8_t *)m.pData + (size_t)s_gv_in_off * 16u, p->inputs, (size_t)rows * 16u);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_in, 0);
     if (s_gv_ib_off + p->index_count > GV_IB_IDX) s_gv_ib_off = 0;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_ib, 0,
-               s_gv_ib_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+    if (FAILED(MAP_W(s_gv_ib, s_gv_ib_off ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, &m))) return 0;
     {
         uint32_t *dst = (uint32_t *)m.pData + s_gv_ib_off, base = s_gv_in_off / nin, q;
         for (q = 0; q < p->index_count; q++) dst[q] = p->indices[q] + base;
@@ -1793,7 +1816,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         static float last_c[192][4];
         static int have_c;
         if (!have_c || memcmp(last_c, p->constants, sizeof last_c)) {
-            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+            if (FAILED(MAP_W(s_gv_cb, D3D11_MAP_WRITE_DISCARD, &m))) return 0;
             memcpy(m.pData, p->constants, sizeof last_c);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_cb, 0);
             memcpy(last_c, p->constants, sizeof last_c);
@@ -1803,12 +1826,13 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     memset(&g, 0, sizeof g);
     g.in_base = 0; g.in_n = nin;
     g.aa[0] = (float)(s->aa_sx ? s->aa_sx : 1); g.aa[1] = (float)(s->aa_sy ? s->aa_sy : 1);
+    s_fr_gv++; if (p->fog_enable) s_fr_fog++;
     g.fog_en = p->fog_enable; g.fog_mode = p->fog_mode; g.fog_p[0] = p->fog_param[0]; g.fog_p[1] = p->fog_param[1];
     {
         static GvCb last_g;
         static int have_g;
         if (!have_g || memcmp(&last_g, &g, sizeof g)) {
-            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_gv_pcb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+            if (FAILED(MAP_W(s_gv_pcb, D3D11_MAP_WRITE_DISCARD, &m))) return 0;
             memcpy(m.pData, &g, sizeof g);
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_gv_pcb, 0);
             last_g = g; have_g = 1;
@@ -2026,6 +2050,20 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
     if (!swapchain_ensure(h)) return;
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].va == PHYS(fb_va) && (!rt || s_rt[i].w == 640)) rt = &s_rt[i];
+    {   /* Which surfaces get presented: each new one is logged once, and how often each was shown */
+        static uint32_t seen_va[16], seen_n[16];
+        static int nseen;
+        int k;
+        for (k = 0; k < nseen && seen_va[k] != PHYS(fb_va); k++) {}
+        if (k == nseen && nseen < 16) {
+            seen_va[nseen] = PHYS(fb_va); seen_n[nseen] = 0; nseen++;
+            fprintf(stderr, "[CS-D3D11] present: new surface %08X (%ux%u%s) at frame %u\n", PHYS(fb_va),
+                    rt ? rt->w : 0, rt ? rt->h : 0, rt ? "" : ", no target", s_frame);
+        }
+        if (k < nseen && ++seen_n[k] % 600 == 0 && s_log)
+            for (k = 0; k < nseen; k++)
+                fprintf(stderr, "[CS-D3D11] present: %08X shown %u times\n", seen_va[k], seen_n[k]);
+    }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_bb_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
     {   /* the picture: 4:3 in the middle, or the whole window with Stretch */
@@ -2142,7 +2180,7 @@ void cs_d3d11_init(void)
             setvbuf(s_csv, NULL, _IOFBF, 1 << 16);
             fseek(s_csv, 0, SEEK_END);
             if (ftell(s_csv) == 0)
-                fprintf(s_csv, "t_ms,frame,dt_ms,draws,tris,readbacks,rb_ms,luma,black_pct,hash\n");
+                fprintf(s_csv, "t_ms,frame,dt_ms,draws,tris,readbacks,rb_ms,luma,black_pct,hash,gv,fog\n");
         }
     }
     cs_now_ms();
