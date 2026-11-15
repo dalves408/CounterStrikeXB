@@ -13,7 +13,8 @@
  * stages (toolkit local patch 0004) and are shaded by an HLSL port of the
  * toolkit's nv2a_rc_eval (tools/xboxrecomp/src/kernel/nv2a_combiner.c).
  * Blend / depth / alpha-test / stencil / cull / colour-mask state applies to
- * both. Not modelled yet: mip levels (level 0 only), cube maps, bump/dot
+ * both. Guest textures use level 0. Optional BC7 replacements have mipmaps.
+ * Not modelled yet: cube maps, bump/dot
  * product stage programs (they read zero, as in the CPU rasteriser).
  *
  * Structure follows the other xboxrecomp D3D11 back ends on this PC as
@@ -21,7 +22,7 @@
  * RoboTechBC Xbox): render targets and depth surfaces cached by guest
  * address, textures decoded by the toolkit and cached by content hash, state
  * objects cached by key. Game-specific parts of those (sprite filter, texture
- * packs, combiner shaders, shared present texture) are intentionally absent.
+ * packs, combiner shaders, shared present texture) are adapted to this title.
  *
  * Presentation: the toolkit's framebuffer window reads guest memory. The
  * executor calls present_sync() just before it snapshots the frame, so dirty
@@ -52,6 +53,7 @@
 #include <string.h>
 
 #include "cs_d3d11.h"
+#include "cs_texture_pack.h"
 #include "cs_settings.h"
 #include "video/video_player.h"
 #include "nv2a_backend.h"
@@ -103,7 +105,7 @@ typedef struct {
     uint32_t offset, w, h, color, pitch, used;
     uint32_t verified;            /* frame (+1) of the last full-content verify */
     uint64_t hash, sig;
-    int force_opaque;
+    size_t replacement_bytes;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
 } TexEnt;
@@ -188,10 +190,10 @@ static const char s_hlsl_rc[] =
 "  uint n = hdr.x & 255u, flags = hdr.x >> 8, sp = hdr.y, s, k;\n"
 "  float4 out4;\n"
 "  tcs[0] = i.t0; tcs[1] = i.t1; tcs[2] = i.t2; tcs[3] = i.t3;\n"
-"  { float2 c = tcs[0].xy / ((tcs[0].w != 0.0) ? tcs[0].w : 1.0) * uvs[0].xy; if (uvs[0].w != 0.0) c = frac(c); smp[0] = tx0.Sample(sm0, c); }\n"
-"  { float2 c = tcs[1].xy / ((tcs[1].w != 0.0) ? tcs[1].w : 1.0) * uvs[1].xy; if (uvs[1].w != 0.0) c = frac(c); smp[1] = tx1.Sample(sm1, c); }\n"
-"  { float2 c = tcs[2].xy / ((tcs[2].w != 0.0) ? tcs[2].w : 1.0) * uvs[2].xy; if (uvs[2].w != 0.0) c = frac(c); smp[2] = tx2.Sample(sm2, c); }\n"
-"  { float2 c = tcs[3].xy / ((tcs[3].w != 0.0) ? tcs[3].w : 1.0) * uvs[3].xy; if (uvs[3].w != 0.0) c = frac(c); smp[3] = tx3.Sample(sm3, c); }\n"
+"  { float2 c = tcs[0].xy / ((tcs[0].w != 0.0) ? tcs[0].w : 1.0) * uvs[0].xy; float2 gx = ddx(c), gy = ddy(c); if (uvs[0].w != 0.0) c = frac(c); smp[0] = tx0.SampleGrad(sm0, c, gx, gy); }\n"
+"  { float2 c = tcs[1].xy / ((tcs[1].w != 0.0) ? tcs[1].w : 1.0) * uvs[1].xy; float2 gx = ddx(c), gy = ddy(c); if (uvs[1].w != 0.0) c = frac(c); smp[1] = tx1.SampleGrad(sm1, c, gx, gy); }\n"
+"  { float2 c = tcs[2].xy / ((tcs[2].w != 0.0) ? tcs[2].w : 1.0) * uvs[2].xy; float2 gx = ddx(c), gy = ddy(c); if (uvs[2].w != 0.0) c = frac(c); smp[2] = tx2.SampleGrad(sm2, c, gx, gy); }\n"
+"  { float2 c = tcs[3].xy / ((tcs[3].w != 0.0) ? tcs[3].w : 1.0) * uvs[3].xy; float2 gx = ddx(c), gy = ddy(c); if (uvs[3].w != 0.0) c = frac(c); smp[3] = tx3.SampleGrad(sm3, c, gx, gy); }\n"
 "  if (n > 8u) n = 8u;\n"
 "  [unroll] for (k = 0u; k < 16u; k++) R[k] = float4(0, 0, 0, 0);\n"
 "  R[3] = float4(fogc.rgb, i.fog); R[4] = i.c; R[5] = i.d1;\n"
@@ -272,7 +274,9 @@ static uint32_t s_vb_off;
 static Rt s_rt[MAX_RT];
 static Ds s_ds[MAX_DS];
 static TexEnt s_tx[MAX_TEX];
-static StateEnt s_bs[96], s_dss[96], s_ss[48];
+static size_t s_pack_bytes;
+#define CS_PACK_BUDGET (384u * 1024u * 1024u)
+static StateEnt s_bs[96], s_dss[96], s_ss[200];
 static int s_nbs, s_ndss, s_nss;
 
 static uint32_t s_fr_draws, s_fr_tris;   /* this frame, for RECOMP_CS_FRAME_CSV */
@@ -638,11 +642,12 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
     return D3D11_TEXTURE_ADDRESS_WRAP;
 }
 
-static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
+static ID3D11SamplerState *get_sampler(const Nv2aTexture *t, int use_mips)
 {
     /* SET_TEXTURE_FILTER: MIN in bits 16-23, MAG in 24-27; 1 = nearest. */
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
-    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v, (uint32_t)s_aniso };
+    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u,
+                         addr_mode(t->addr_u), addr_mode(t->addr_v), (uint32_t)s_aniso, (uint32_t)use_mips };
     ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(s_ss, s_nss, key);
     D3D11_SAMPLER_DESC d;
     if (s) return s;
@@ -656,10 +661,11 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
         d.Filter = D3D11_FILTER_ANISOTROPIC;
         d.MaxAnisotropy = (UINT)s_aniso;
     }
-    d.AddressU = addr_mode(t->addr_u); d.AddressV = addr_mode(t->addr_v); d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.MaxLOD = 0.0f; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    if (use_mips && !key[0] && !key[1] && s_aniso == 1) d.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    d.AddressU = key[2]; d.AddressV = key[3]; d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.MaxLOD = use_mips ? D3D11_FLOAT32_MAX : 0.0f; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s))) return NULL;
-    if (s_nss < 48) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
+    if (s_nss < (int)_countof(s_ss)) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
     return s;
 }
 
@@ -668,9 +674,9 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 static uint32_t tex_bytes(const Nv2aTexture *t)
 {
     uint32_t px = t->width * t->height;
+    unsigned block = d3d8_format_dxt_block_bytes(t->color);
+    if (block) return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
     switch (t->color) {
-    case 0x0C: return px / 2 < 8 ? 8 : px / 2;                 /* DXT1 */
-    case 0x0E: case 0x0F: return px < 16 ? 16 : px;            /* DXT3/5 */
     case 0x00: case 0x01: case 0x0B: case 0x19: return px;
     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1A: case 0x1B: case 0x28: return px * 2;
     }
@@ -739,16 +745,33 @@ static int tex_matches(const TexEnt *e, const Nv2aTexture *t)
            e->color == t->color && e->pitch == t->pitch;
 }
 
-/* *opaque is set for formats with no alpha channel. */
-static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
+static void release_texture(TexEnt *entry)
+{
+    s_pack_bytes -= entry->replacement_bytes;
+    entry->replacement_bytes = 0;
+    SAFE_REL(entry->srv);
+    SAFE_REL(entry->tex);
+}
+
+static int pack_source_format(unsigned color)
+{
+    switch (color) {
+    case 0x06: case 0x07: case 0x0c: case 0x0e: case 0x0f: case 0x3a: case 0x3c: return 1;
+    default: return 0;
+    }
+}
+
+/* The texture's original dimensions still determine its guest UV units. */
+static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int *use_mips)
 {
     int i, free_i = -1, lru = -1;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t n;
     uint64_t sig;
+    int try_pack;
     TexEnt *e = NULL;
 
-    *opaque = 0;
+    *opaque = *use_mips = 0;
     if (!tex_ok(t)) return s_white_srv;
     *opaque = tex_is_opaque_fmt(t->color);
 
@@ -782,26 +805,41 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
     /* Verified this frame already: the world binds the same lightmap and
      * detail textures hundreds of times a frame, and re-signing each bind (a
      * full hash under 32 KB) was ~9% of the executor thread. */
-    if (e && e->verified == s_frame + 1) { e->used = s_tick; return e->srv; }
+    if (e && e->verified == s_frame + 1) {
+        e->used = s_tick;
+        *use_mips = e->replacement_bytes != 0;
+        return e->srv;
+    }
     sig = sample_sig(mem + t->offset, n);
     if (e) {
         e->used = s_tick;
         if (e->sig == sig) {
-            if (hash_bytes(mem + t->offset, n) == e->hash) { e->verified = s_frame + 1; return e->srv; }
+            if (hash_bytes(mem + t->offset, n) == e->hash) {
+                e->verified = s_frame + 1;
+                *use_mips = e->replacement_bytes != 0;
+                return e->srv;
+            }
         }
         free_i = (int)(e - s_tx);                                /* content changed: decode into the same slot */
-        SAFE_REL(e->srv); SAFE_REL(e->tex);
+        release_texture(e);
     } else if (free_i < 0) {
         free_i = lru;
-        SAFE_REL(s_tx[free_i].srv); SAFE_REL(s_tx[free_i].tex);
+        release_texture(&s_tx[free_i]);
     }
 
     {
-        uint32_t *argb = (uint32_t *)malloc((size_t)t->width * t->height * 4);
+        uint32_t *argb = NULL;
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA sd;
         TexEnt *ne = &s_tx[free_i];
         memset(ne, 0, sizeof *ne);
+        try_pack = pack_source_format(t->color) && cs_pack_enabled() && s_pack_bytes < CS_PACK_BUDGET;
+        if (try_pack && cs_pack_load(s_dev, t->color, t->width, t->height, mem + t->offset, n,
+                                     CS_PACK_BUDGET - s_pack_bytes,
+                                     &ne->tex, &ne->srv, &ne->replacement_bytes))
+            goto cache_texture;
+
+        argb = malloc((size_t)t->width * t->height * 4);
         if (!argb) return s_white_srv;
         if (t->color == 0x28) {
             /* SZ_G8B8 (the toolkit's decoder has no case for it): two bytes a
@@ -859,6 +897,12 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
             size_t k, np = (size_t)t->width * t->height;
             for (k = 0; k < np; k++) argb[k] |= 0xFF000000u;
         }
+        if (try_pack && cs_pack_load(s_dev, CS_PACK_DECODED_BGRA, t->width, t->height, argb,
+                                     (size_t)t->width * t->height * 4, CS_PACK_BUDGET - s_pack_bytes,
+                                     &ne->tex, &ne->srv, &ne->replacement_bytes)) {
+            free(argb);
+            goto cache_texture;
+        }
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
@@ -871,6 +915,9 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque)
         free(argb);
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)ne->tex, NULL, &ne->srv);
         if (!ne->srv) { SAFE_REL(ne->tex); return s_white_srv; }
+    cache_texture:
+        s_pack_bytes += ne->replacement_bytes;
+        *use_mips = ne->replacement_bytes != 0;
         ne->offset = t->offset; ne->w = t->width; ne->h = t->height; ne->color = t->color; ne->pitch = t->pitch;
         ne->hash = hash_bytes(mem + t->offset, n); ne->sig = sig;
         ne->verified = s_frame + 1; ne->used = s_tick;
@@ -1002,15 +1049,16 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
     cb.afunc = (!s_no_alpha && r->alpha_test_enable) ? r->alpha_func : 0x207;
     cb.aref = (float)(r->alpha_ref & 0xFF);
     if (b->texture) {
-        srv = get_tex(b->texture, &opaque);
-        smp = get_sampler(b->texture);
+        int use_mips;
+        srv = get_tex(b->texture, &opaque, &use_mips);
+        smp = get_sampler(b->texture, use_mips);
         cb.textured = (srv != s_white_srv) ? 1u : 0u;
         cb.opaque = opaque ? 1u : 0u;
         cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
     }
     if (s_force_a1) cb.opaque = 1u;
     { static int dbg = -1; if (dbg < 0) { const char *e = getenv("RECOMP_CS_RC_DEBUG"); dbg = e ? atoi(e) : 0; } cb.dbg = r->depth_test_enable ? (uint32_t)dbg : 0u; }
-    if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
+    if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt, 0); }
 
     if (b->combiner && b->stages) {            /* 3D path: register combiners */
         const Nv2aCombiner *rc = b->combiner;
@@ -1033,7 +1081,7 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
             Nv2aTexture dflt;
             memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3;
             srvs[st] = s_white_srv;
-            smps[st] = get_sampler(&dflt);
+            smps[st] = get_sampler(&dflt, 0);
             rcb.uvs[st][0] = rcb.uvs[st][1] = 1.0f;
             /* WRAP on both axes: wrap the coordinate in the shader (frac), as the
              * NV2A and the CPU rasteriser do exactly. CS's world detail stage
@@ -1048,8 +1096,9 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
                             t->addr_u, t->addr_v, t->filter, b->stages[0].offset, b->stages[0].width, b->stages[0].height, b->stages[0].color);
             }
             if ((mode == 1 || mode == 2 || ((mode == 15 || mode == 16) && st > 0)) && (b->stage_valid & (1u << st))) {
-                srvs[st] = get_tex(t, &op);
-                smps[st] = get_sampler(t);
+                int use_mips;
+                srvs[st] = get_tex(t, &op, &use_mips);
+                smps[st] = get_sampler(t, use_mips && (mode == 1 || mode == 2));
                 rcb.uvs[st][2] = (srvs[st] != s_white_srv) ? 1.0f : 0.0f;
                 if (!(d3d8_format_is_swizzled(t->color) || d3d8_format_dxt_block_bytes(t->color)) && t->width && t->height) {
                     rcb.uvs[st][0] = 1.0f / (float)t->width;

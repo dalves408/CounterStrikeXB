@@ -324,7 +324,8 @@ static void diag_on_exit(const char *why) { (void)why; cs_diag_flush(); }
  * runs from its own folder, with game_files beside it, whatever the shortcut's
  * working folder; the player's data lives in %LOCALAPPDATA%\CounterStrikeXB
  * (settings, keys, saves, logs); and no RECOMP_ variable left in the
- * environment by something else changes how it runs. */
+ * environment by something else changes how it runs. The texture pack path
+ * is a supported user override. */
 static void player_setup(void)
 {
     char path[MAX_PATH], base[MAX_PATH], *slash;
@@ -339,7 +340,9 @@ static void player_setup(void)
         char name[128];
         char **e;
         for (e = _environ; *e; e++)
-            if (!strncmp(*e, "RECOMP_", 7) && strchr(*e, '=') && (size_t)(strchr(*e, '=') - *e) < sizeof name)
+            if (!strncmp(*e, "RECOMP_", 7) &&
+                _strnicmp(*e, "RECOMP_CS_TEXTURE_PACK=", sizeof("RECOMP_CS_TEXTURE_PACK=") - 1) &&
+                strchr(*e, '=') && (size_t)(strchr(*e, '=') - *e) < sizeof name)
                 break;
         if (!*e)
             break;

@@ -50,6 +50,20 @@ patch (`cs_tu.xbepatch`, installed beside the game), so no download or update fi
 
 Your settings, key map, saves and logs are in `%LOCALAPPDATA%\CounterStrikeXB`.
 
+### Optional DDS texture pack
+
+The D3D11 renderer looks for `texture_pack\index.tsv` next to the game executable.
+Set `RECOMP_CS_TEXTURE_PACK` to an absolute pack folder to use another location,
+or set it to `0` for the original textures. Restart the game after changing packs.
+The pack contains 4× BC7_UNORM textures with full mip chains. Matches use the
+original guest texture's content and dimensions, so maps and localized screens
+can use different images with the same name. Missing or invalid files fall back
+to the original texture. Render targets and indexed lookup data stay original.
+
+With the extracted PNGs and manifests from the texture project, generate the
+lookup index with `python scripts/index_texture_pack.py <asset-root>` (requires
+Pillow). Use the resulting `texture_pack_dds` folder as your pack directory.
+
 ### Problem reports and logs
 
 The game writes a log for every run and every map change to `%LOCALAPPDATA%\CounterStrikeXB\logs`
