@@ -358,6 +358,11 @@ static void player_setup(void)
     CreateDirectoryA(path, NULL);
     _putenv_s("CS_SAVE_ROOT", path);
     _putenv_s("RECOMP_SAVE_DIR", path);
+    /* The drive's config sectors (network settings, Xbox Live accounts) live
+     * beside settings.ini, not in the save folder: the toolkit emulates the
+     * raw disk in memory and keeps only these 4 KB (kernel_vdisk.c). */
+    snprintf(path, sizeof path, "%s\\CounterStrikeXB\\drive_config.bin", base);
+    _putenv_s("RECOMP_DISK_CONFIG", path);
 }
 #endif
 

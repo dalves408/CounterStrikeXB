@@ -10,7 +10,7 @@
  *
  *   %LOCALAPPDATA%\CounterStrikeXB\eeprom.bin               the console's EEPROM
  *   %LOCALAPPDATA%\CounterStrikeXB\settings.ini             [insignia] hdd_key=
- *   %LOCALAPPDATA%\CounterStrikeXB\SaveData\Partition0.img  the drive's config sectors
+ *   %LOCALAPPDATA%\CounterStrikeXB\drive_config.bin         the drive's config sectors 8-15
  *
  * This program checks what the player gives it and writes those. The accounts
  * come from a dump of the console's drive (the first sectors are enough), a
@@ -389,38 +389,29 @@ static void check_accounts(const char *path)
 }
 
 /* ---- saving ----------------------------------------------------------------------------------- */
+/* drive_config.bin holds the drive's config sectors 8-15 (the game emulates
+ * the raw disk and keeps only these). Sector 8, the network settings, is kept
+ * as it is; the accounts go in 9-15. */
 static int write_partition0(void)
 {
     char path[MAX_PATH], bak[MAX_PATH];
-    HANDLE f;
-    uint8_t zero[512];
-    LARGE_INTEGER sz;
+    uint8_t cfg[8 * 512];
+    FILE *f;
     int i;
-    if (!cs_settings_path("SaveData", path, sizeof path, 1)) return 0;
-    CreateDirectoryA(path, NULL);
-    strncat(path, "\\Partition0.img", sizeof path - strlen(path) - 1);
-    snprintf(bak, sizeof bak, "%s.before-insignia", path);
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && GetFileAttributesA(bak) == INVALID_FILE_ATTRIBUTES)
-        CopyFileA(path, bak, TRUE);                        /* the first time only */
-    f = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return 0;
-    memset(zero, 0, sizeof zero);
-    if (GetFileSizeEx(f, &sz) && sz.QuadPart < 9 * 512) {  /* the sectors before ours exist, empty */
-        LARGE_INTEGER li; DWORD w;
-        li.QuadPart = sz.QuadPart;
-        SetFilePointerEx(f, li, NULL, FILE_BEGIN);
-        while (li.QuadPart < 9 * 512) { WriteFile(f, zero, 512, &w, NULL); li.QuadPart += 512; }
+    if (!cs_settings_path("drive_config.bin", path, sizeof path, 1)) return 0;
+    memset(cfg, 0, sizeof cfg);
+    if ((f = fopen(path, "rb")) != NULL) {
+        fread(cfg, 1, sizeof cfg, f);
+        fclose(f);
+        snprintf(bak, sizeof bak, "%s.before-insignia", path);
+        if (GetFileAttributesA(bak) == INVALID_FILE_ATTRIBUTES)
+            CopyFileA(path, bak, TRUE);                    /* the first time only */
     }
-    for (i = 0; i < 7; i++) {
-        LARGE_INTEGER li; DWORD w = 0;
-        li.QuadPart = (9 + i) * 512LL;
-        if (!SetFilePointerEx(f, li, NULL, FILE_BEGIN) || !WriteFile(f, s_sectors[i], 512, &w, NULL) || w != 512) {
-            CloseHandle(f);
-            return 0;
-        }
-    }
-    CloseHandle(f);
-    return 1;
+    for (i = 0; i < 7; i++)
+        memcpy(cfg + (1 + i) * 512, s_sectors[i], 512);
+    if (!(f = fopen(path, "wb"))) return 0;
+    i = fwrite(cfg, 1, sizeof cfg, f) == sizeof cfg;
+    return fclose(f) == 0 && i;
 }
 
 static void save(void)
