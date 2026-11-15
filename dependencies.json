@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "04912b302e2b553c9fb488cb96532cdf0e52ec31",
+                       "commit":  "4bf4c365a4a9592b2110fe990b85dc8de97eb67e",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -34,7 +34,8 @@
                                              "patches/xboxrecomp/0027-kernel-model-the-MCPX-Ethernet-controller-frames-ove.patch",
                                              "patches/xboxrecomp/0028-kernel-XNet-key-exchange-and-secure-traffic-work-NIC.patch",
                                              "patches/xboxrecomp/0029-kernel-console-identity-from-the-player-s-EEPROM-a-r.patch",
-                                             "patches/xboxrecomp/0030-kernel-ObReferenceObjectByHandle-gives-event-handles.patch"
+                                             "patches/xboxrecomp/0030-kernel-ObReferenceObjectByHandle-gives-event-handles.patch",
+                                             "patches/xboxrecomp/0031-nvnet-log-only-the-maker-prefix-of-Ethernet-addresse.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

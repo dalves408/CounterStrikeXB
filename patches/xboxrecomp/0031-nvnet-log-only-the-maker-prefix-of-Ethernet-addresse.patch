@@ -1,0 +1,57 @@
+From 4bf4c365a4a9592b2110fe990b85dc8de97eb67e Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nvnet: log only the maker prefix of Ethernet addresses
+
+---
+ src/kernel/nvnet.c | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/src/kernel/nvnet.c b/src/kernel/nvnet.c
+index 1542c28..62ee8e8 100644
+--- a/src/kernel/nvnet.c
++++ b/src/kernel/nvnet.c
+@@ -121,11 +121,24 @@ static int      s_trace;
+ static unsigned s_rx_link, s_rx_filtered, s_stat_sum;
+ static DWORD    s_stat_at;
+ 
++/* An Ethernet address for the log: the maker prefix only (a console's address
++ * is part of the identity it registered with Xbox Live, and logs are sent with
++ * problem reports). Broadcast is shown whole. */
++static void mac_text(const uint8_t *m, char out[20])
++{
++    if (m[0] == 0xFF && m[1] == 0xFF && m[2] == 0xFF && m[3] == 0xFF && m[4] == 0xFF && m[5] == 0xFF)
++        strcpy(out, "FF:FF:FF:FF:FF:FF");
++    else
++        sprintf(out, "%02X:%02X:%02X:..", m[0], m[1], m[2]);
++}
++
+ /* One line about a frame for the log: MACs, and IPv4/UDP addresses and ports. */
+ static void frame_desc(const uint8_t *f, int n, char *out, size_t cap)
+ {
+-    int k = snprintf(out, cap, "%d B %02X:%02X:%02X:%02X:%02X:%02X->%02X:%02X:%02X:%02X:%02X:%02X %02X%02X", n,
+-                     f[6], f[7], f[8], f[9], f[10], f[11], f[0], f[1], f[2], f[3], f[4], f[5], f[12], f[13]);
++    char src[20], dst[20];
++    int k;
++    mac_text(f + 6, src); mac_text(f, dst);
++    k = snprintf(out, cap, "%d B %s->%s %02X%02X", n, src, dst, f[12], f[13]);
+     if (n >= 34 && f[12] == 8 && f[13] == 0 && k > 0 && (size_t)k < cap) {
+         const uint8_t *ip = f + 14;
+         int ihl = (ip[0] & 15) * 4;
+@@ -743,8 +756,11 @@ void xbox_NvnetInit(void)
+     nat_init(nic_inject);
+     if (nvlink_open(s_mac) != 0)
+         fprintf(stderr, "  [NVNET] no network link; the NIC sends nowhere\n");
+-    fprintf(stderr, "  [NVNET] NIC at 0x%08X, MAC %02X:%02X:%02X:%02X:%02X:%02X\n", NIC_BASE,
+-            s_mac[0], s_mac[1], s_mac[2], s_mac[3], s_mac[4], s_mac[5]);
++    {
++        char m[20];
++        mac_text(s_mac, m);
++        fprintf(stderr, "  [NVNET] NIC at 0x%08X, MAC %s\n", NIC_BASE, m);
++    }
+     {
+         HANDLE th = CreateThread(NULL, 0, nic_thread, NULL, 0, NULL);
+         if (th) CloseHandle(th);
+-- 
+2.51.0.windows.2
+

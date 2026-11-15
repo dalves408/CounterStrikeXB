@@ -39,7 +39,7 @@ def manifest():
         setting('scale', 'Render scale', 'display/resolution_scale',
                 [('Low (1x, 640x480)', 1), ('Medium (2x, 1280x960)', 2), ('High (3x, 1920x1440)', 3)], 1,
                 'Low is the game as it was; Medium and High draw it sharper but need a faster graphics card.'),
-        setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 0,
+        setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 1,
                 'Big Picture mode always starts fullscreen. F11 or Alt+Enter switches in the game.'),
         setting('stretch', 'Stretch image', 'display/stretch', [('Off (4:3)', 0), ('On (fills window)', 1)], 0),
         setting('vsync', 'VSync', 'display/vsync', toggle, 0),

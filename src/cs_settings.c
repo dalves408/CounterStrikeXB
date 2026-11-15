@@ -21,7 +21,7 @@ CsSettings g_cs_settings;
 void cs_settings_defaults(CsSettings *s)
 {
     s->scale = 1;
-    s->fullscreen = 0;
+    s->fullscreen = 1;      /* a fresh install starts fullscreen; settings.ini keeps the player's choice */
     s->stretch = 0;
     s->vsync = 0;
     s->frame_rate = 60;
@@ -106,8 +106,16 @@ void cs_settings_startup(void)
     char path[MAX_PATH];
     cs_settings_load(&g_cs_settings);
     /* _putenv_s: the toolkit reads these with getenv, the CRT's own copy. */
-    if (!getenv("RECOMP_FULLSCREEN"))
-        _putenv_s("RECOMP_FULLSCREEN", g_cs_settings.fullscreen ? "1" : "0");
+    /* RecompLauncher's Big Picture mode (RECOMPLAUNCHER_MODE=bigpicture) always
+     * starts fullscreen, whatever the setting says; the setting itself is left alone. */
+    {
+        const char *mode = getenv("RECOMPLAUNCHER_MODE");
+        if (mode && _stricmp(mode, "bigpicture") == 0) {
+            _putenv_s("RECOMP_FULLSCREEN", "1");
+            fprintf(stderr, "[CS-SET] RecompLauncher Big Picture mode: fullscreen\n");
+        } else if (!getenv("RECOMP_FULLSCREEN"))
+            _putenv_s("RECOMP_FULLSCREEN", g_cs_settings.fullscreen ? "1" : "0");
+    }
     if (!getenv("RECOMP_KEYMAP") && cs_settings_path("keymap.ini", path, sizeof path, 0)
         && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
         _putenv_s("RECOMP_KEYMAP", path);
