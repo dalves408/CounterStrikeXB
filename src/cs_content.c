@@ -14,9 +14,9 @@
  *
  * The header is signed the way XAPI's content check (sub_00207288 ->
  * sub_002071A3) verifies one: key = HMAC-SHA1(XboxHDKey, title ID), digest =
- * HMAC-SHA1(key, header bytes 0x14..0x88), stored in the first 20 bytes. The
- * runtime's XboxHDKey is all zeros, so the files are signed with that, and a
- * verification path the game may take later (Xbox Live) finds them valid.
+ * HMAC-SHA1(key, header bytes 0x14..0x88), stored in the first 20 bytes, under
+ * the XboxHDKey the runtime reports (the player's for Insignia, else zeros);
+ * files written under another key are re-signed.
  */
 #include "cs_content.h"
 
@@ -43,14 +43,65 @@ static int hmac_sha1(const uint8_t *key, ULONG klen, const uint8_t *data, ULONG 
     return st == 0;
 }
 
+static uint32_t rd32le(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 
 /* ContentMeta.xbx: the 0x88-byte header, then the display names (UTF-16 with a
  * BOM, an INI the way Xbox Live wrote them). */
+/* The XboxHDKey the toolkit will report: the player's (RECOMP_XBOX_HDKEY, set
+ * from settings.ini by cs_settings_startup) or all zeros. */
+static void current_hd_key(uint8_t k[16])
+{
+    const char *s = getenv("RECOMP_XBOX_HDKEY");
+    int n = 0;
+    memset(k, 0, 16);
+    for (; s && *s && n < 32; s++) {
+        int v;
+        if (*s >= '0' && *s <= '9') v = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') v = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') v = *s - 'A' + 10;
+        else continue;
+        if (n & 1) k[n / 2] |= (uint8_t)v; else k[n / 2] = (uint8_t)(v << 4);
+        n++;
+    }
+    if (n != 32) memset(k, 0, 16);
+}
+
+/* The header digest under the current key; 1 when buf's first 20 bytes match. */
+static int digest(uint8_t *buf, int check)
+{
+    uint8_t hd_key[16], key[20], tid[4], d[20];
+    current_hd_key(hd_key);
+    put32(tid, CS_TITLE_ID);
+    if (!hmac_sha1(hd_key, 16, tid, 4, key) || !hmac_sha1(key, 20, buf + 0x14, HDR_SIZE - 0x14, d))
+        return 0;
+    SecureZeroMemory(hd_key, sizeof hd_key);
+    if (check) return memcmp(d, buf, 20) == 0;
+    memcpy(buf, d, 20);
+    return 1;
+}
+
+/* A package this file wrote earlier whose signature is not the current key's
+ * (written before the player set their hard-drive key, say): rewritten, or the
+ * game's own check counts it as not installed and offers it again (the "new
+ * content" arrow on Xbox Live > Download Content). Packages it did not write
+ * -- a player's own, copied from a console, with a file table -- are kept. */
+static int needs_rewrite(const char *path)
+{
+    uint8_t buf[1024];
+    size_t n;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+    n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    if (n < HDR_SIZE || memcmp(buf + 0x14, "XCSF", 4)) return 0;     /* not a package: leave it */
+    if (rd32le(buf + 0x50) != 0 || n > 0x200) return 0;              /* has a file table: not ours */
+    return !digest(buf, 1);
+}
+
 static int write_meta(const char *path, uint32_t offer, const wchar_t *name)
 {
-    static const uint8_t hd_key[16] = { 0 };    /* the runtime's XboxHDKey */
-    uint8_t buf[1024], key[20], tid[4];
+    uint8_t buf[1024];
     wchar_t text[256];
     int tl;
     uint32_t nbytes;
@@ -72,8 +123,7 @@ static int write_meta(const char *path, uint32_t offer, const wchar_t *name)
     put32(buf + 0x34, HDR_SIZE);        /* display names: offset, size */
     put32(buf + 0x38, nbytes);
     memcpy(buf + HDR_SIZE, text, nbytes);
-    put32(tid, CS_TITLE_ID);
-    if (!hmac_sha1(hd_key, 16, tid, 4, key) || !hmac_sha1(key, 20, buf + 0x14, HDR_SIZE - 0x14, buf))
+    if (!digest(buf, 0))
         return 0;
     f = fopen(path, "wb");
     if (!f) return 0;
@@ -95,7 +145,7 @@ void cs_content_install(void)
     for (i = 0; i < 2; i++) {
         snprintf(dir, sizeof dir, "%s\\TDATA\\%08x\\$c\\%08x%08x", root, CS_TITLE_ID, CS_TITLE_ID, maps[i].offer);
         snprintf(path, sizeof path, "%s\\ContentMeta.xbx", dir);
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES && !needs_rewrite(path))
             continue;
         {   /* the folders above it */
             char p[MAX_PATH];

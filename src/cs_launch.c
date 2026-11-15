@@ -216,6 +216,24 @@ static void cs_HalReturnToFirmware(void)
         fprintf(stderr, "[CS2-LAUNCH] firmware return %u to another image: type %u title 0x%08X path '%s'\n",
                 routine, MEM32(page), MEM32(page + 4), path);
         cs_log_launch_data(page);
+        /* The disc's other programs, downloader.xbe (Xbox Live > Downloadable
+         * Content) and update.xbe (Xbox Live's title updater), are not
+         * translated: the game closed when it handed off to one. Come back to
+         * the game instead, as from the Dashboard. The downloadable maps are
+         * unlocked already (cs_content.c) and the game runs as the update. */
+        if (routine == 2 && MEM32(page + 4) == 0x4D530036u &&
+            (strstr(path, "downloader.xbe") || strstr(path, "update.xbe"))) {
+            uint8_t buf[CS_LAUNCH_PAGE_SIZE];
+            static const char self_path[] = "\\Device\\CdRom0;default.xbe";
+            memset(buf, 0, sizeof buf);
+            *(uint32_t *)(buf + 0) = CS_LDT_FROM_DASHBOARD;
+            *(uint32_t *)(buf + 4) = 0x4D530036u;
+            memcpy(buf + 8, self_path, sizeof self_path);
+            fprintf(stderr, "[CS2-LAUNCH] %s is not part of this program: back to the game\n",
+                    strstr(path, "downloader.xbe") ? "downloader.xbe" : "update.xbe");
+            if (!cs_relaunch_with(buf))
+                fprintf(stderr, "[CS2-LAUNCH] relaunch failed; exiting as before\n");
+        }
     }
     cs_diag_flush();       /* the bridge's ExitProcess would cut the log's last lines */
     if (bridge)
