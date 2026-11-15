@@ -324,7 +324,7 @@ void cs_diag_flush(void)
 /* ---- [BUILD] ------------------------------------------------------------------------------------------------------- */
 void cs_diag_build_line(void)
 {
-    char ver[32] = "dev", pdb[64] = "none", cpu[96] = "?", gpu[128] = "?", os[64] = "?", disp[16] = "";
+    char ver[32] = "dev", pdb[64] = "none", cpu[96] = "?", gpu[256] = "", os[64] = "?", disp[16] = "";
     BYTE *base = (BYTE *)GetModuleHandleA(NULL);
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
     IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
@@ -374,12 +374,25 @@ void cs_diag_build_line(void)
           RegCloseKey(k); } }
     memset(&dev, 0, sizeof dev);
     dev.cb = sizeof dev;
-    for (i = 0; EnumDisplayDevicesA(NULL, i, &dev, 0); i++)
-        if (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) { snprintf(gpu, sizeof gpu, "%s", dev.DeviceString); break; }
+    /* Every GPU, the one driving the main screen marked: on a laptop that is the
+     * integrated one even when the game renders on the discrete one (the
+     * [CS-D3D11] "back end up on" line names the GPU the game uses). */
+    {
+        char primary[128] = "";
+        for (i = 0; EnumDisplayDevicesA(NULL, i, &dev, 0); i++)
+            if (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) { snprintf(primary, sizeof primary, "%s", dev.DeviceString); break; }
+        for (i = 0; EnumDisplayDevicesA(NULL, i, &dev, 0); i++) {
+            size_t used = strlen(gpu);
+            if (!dev.DeviceString[0] || strstr(gpu, dev.DeviceString)) continue;     /* one entry per GPU */
+            snprintf(gpu + used, sizeof gpu - used, "%s%s%s", used ? ", " : "", dev.DeviceString,
+                     !strcmp(dev.DeviceString, primary) ? " (screen)" : "");
+        }
+        if (!gpu[0]) strcpy(gpu, "?");
+    }
     ms.dwLength = sizeof ms;
     GlobalMemoryStatusEx(&ms);
     { SYSTEM_INFO si; GetSystemInfo(&si);
-      putf("[BUILD] cs2_xbox_recomp %s, symbols %s | %s | %s, %lu logical CPUs | display %s | %llu GB\n", ver, pdb, os, cpu,
+      putf("[BUILD] cs2_xbox_recomp %s, symbols %s | %s | %s, %lu logical CPUs | GPUs %s | %llu GB\n", ver, pdb, os, cpu,
            (unsigned long)si.dwNumberOfProcessors, gpu, (unsigned long long)((ms.ullTotalPhys + (1ull << 29)) >> 30)); }
 }
 
