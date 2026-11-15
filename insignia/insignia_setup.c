@@ -470,8 +470,33 @@ enum { ID_REC_TAG = 300, ID_REC_NUM, ID_REC_OK, ID_REC_CANCEL };
 static HWND s_rec, s_rec_tag, s_rec_num;
 static int s_rec_done;
 
+/* Insignia shows the number as 0000-0000-0000-0000: keep only its digits as it
+ * is typed or pasted, so the dashes (and spaces) never count. */
+static void rec_digits_only(HWND e)
+{
+    static int busy;
+    char t[64], d[17];
+    int i, n = 0;
+    if (busy) return;
+    GetWindowTextA(e, t, sizeof t);
+    for (i = 0; t[i] && n < 16; i++) if (t[i] >= '0' && t[i] <= '9') d[n++] = t[i];
+    d[n] = 0;
+    if (strcmp(t, d)) {
+        busy = 1;
+        SetWindowTextA(e, d);
+        SendMessageA(e, EM_SETSEL, (WPARAM)n, (LPARAM)n);
+        busy = 0;
+    }
+    SecureZeroMemory(t, sizeof t);
+    SecureZeroMemory(d, sizeof d);
+}
+
 static LRESULT CALLBACK rec_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_COMMAND && LOWORD(w) == ID_REC_NUM && HIWORD(w) == EN_CHANGE) {
+        rec_digits_only((HWND)l);
+        return 0;
+    }
     if (m == WM_COMMAND && (LOWORD(w) == ID_REC_OK || LOWORD(w) == ID_REC_CANCEL)) {
         s_rec_done = LOWORD(w) == ID_REC_OK ? 1 : -1;
         return 0;
@@ -510,9 +535,10 @@ static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
     rec_mk("STATIC", "Gamertag:", SS_LEFT, 14, 66, 110, 20, 0);
     s_rec_tag = rec_mk("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, 130, 62, 286, 23, ID_REC_TAG);
     rec_mk("STATIC", "16-digit number:", SS_LEFT, 14, 102, 110, 20, 0);
+    rec_mk("STATIC", "Paste it as shown (0000-0000-0000-0000): the dashes are dropped.", SS_LEFT, 130, 124, 286, 18, 0);
     s_rec_num = rec_mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 130, 98, 286, 23, ID_REC_NUM);
     SendMessageA(s_rec_tag, EM_LIMITTEXT, 15, 0);
-    SendMessageA(s_rec_num, EM_LIMITTEXT, 24, 0);
+    SendMessageA(s_rec_num, EM_LIMITTEXT, 32, 0);   /* room for a pasted 0000-0000-0000-0000; trimmed to 16 digits */
     rec_mk("BUTTON", "Recover", BS_DEFPUSHBUTTON | WS_TABSTOP, 222, 150, 94, 28, ID_REC_OK);
     rec_mk("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 322, 150, 94, 28, ID_REC_CANCEL);
     EnableWindow(s_main, FALSE);

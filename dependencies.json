@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "419607b2105763f451f6690d70f8072a48bd4f74",
+                       "commit":  "898d1365b74cc03236f1ae129602fb3146236e80",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -37,7 +37,8 @@
                                              "patches/xboxrecomp/0030-kernel-ObReferenceObjectByHandle-gives-event-handles.patch",
                                              "patches/xboxrecomp/0031-nvnet-log-only-the-maker-prefix-of-Ethernet-addresse.patch",
                                              "patches/xboxrecomp/0032-kernel-emulate-the-hard-disk-s-raw-devices-in-memory.patch",
-                                             "patches/xboxrecomp/0033-kernel-keep-config-sectors-8-23-all-eight-user-accou.patch"
+                                             "patches/xboxrecomp/0033-kernel-keep-config-sectors-8-23-all-eight-user-accou.patch",
+                                             "patches/xboxrecomp/0034-nvnet-send-Xbox-Live-DNS-lookups-to-the-first-DNS-se.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",
