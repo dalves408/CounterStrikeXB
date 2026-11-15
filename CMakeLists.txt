@@ -157,3 +157,9 @@ add_executable(cs_import installer/cs_import.c installer/tu_apply.c)
 target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)
 target_link_libraries(cs_import PRIVATE bcrypt shell32 cabinet)
 target_compile_definitions(cs_import PRIVATE UNICODE _UNICODE)
+
+# cs_texture_download.exe: the hi-res texture add-on Setup's downloader (WinHTTP,
+# resumable, size + pinned SHA-256 checked). Embedded in the add-on Setup only.
+add_executable(cs_texture_download installer/texture_download.c)
+target_link_libraries(cs_texture_download PRIVATE winhttp bcrypt shell32)
+set_property(TARGET cs_texture_download PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

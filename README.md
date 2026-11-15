@@ -52,6 +52,13 @@ Your settings, key map, saves and logs are in `%LOCALAPPDATA%\CounterStrikeXB`.
 
 ### Optional DDS texture pack
 
+Install it with `CounterStrike-HiRes-Textures-<version>-Setup.exe` from the
+[textures release](https://github.com/dalves408/CounterStrikeXB/releases/tag/textures-1.0.0):
+it finds the installed game, uses the `texture-NN.bin` parts beside it or downloads
+the missing ones (resumable, each checked by size and SHA-256), and puts the pack in
+`texture_pack` in the game folder. Run it again with `/REPAIRTEXTURES=1` to restore
+damaged files. F1 > Hi-res textures (or `config.exe`) turns the pack off and on.
+
 The D3D11 renderer looks for `texture_pack\index.tsv` next to the game executable.
 Set `RECOMP_CS_TEXTURE_PACK` to an absolute pack folder to use another location,
 or set it to `0` for the original textures. Restart the game after changing packs.
@@ -63,6 +70,13 @@ to the original texture. Render targets and indexed lookup data stay original.
 With the extracted PNGs and manifests from the texture project, generate the
 lookup index with `python scripts/index_texture_pack.py <asset-root>` (requires
 Pillow). Use the resulting `texture_pack_dds` folder as your pack directory.
+
+Building the add-on: `python scripts/build_texture_payload.py` makes the verified
+`texture-NN.bin` parts and `texture-payload.json` in `installer\Output\texture-addon-<version>`;
+`python scripts/build_texture_addon.py <that>\texture-payload.json --url-base <release download URL>/`
+compiles the Setup with every part's URL, size and hash pinned (needs Inno Setup 6.4+ and the
+`cs_texture_download` target); `python scripts/test_texture_addon.py <Setup.exe> [--download]`
+installs it into a scratch folder and checks every file.
 
 ### Problem reports and logs
 
