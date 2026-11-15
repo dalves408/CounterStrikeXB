@@ -53,6 +53,7 @@ set(GAME_SOURCES
     src/cs_overlay.c
     src/cs_diag.c
     src/cs_frame.c
+    src/cs_content.c
     installer/tu_apply.c
     resources/cs.rc
 )

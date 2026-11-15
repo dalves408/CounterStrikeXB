@@ -49,6 +49,7 @@
 #include "cs_diag.h"
 #include "cs_frame.h"
 #include "tu_apply.h"
+#include "cs_content.h"
 #include "kernel/nvnet.h"
 
 /*
@@ -438,6 +439,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* The player's settings (settings.ini / keymap.ini: F1 menu, config.exe),
      * before the window and the keyboard read theirs; then the ESC/F1 menus. */
     cs_settings_startup();
+    cs_content_install();     /* Office and Inferno, the downloadable maps (src/cs_content.c) */
     cs_overlay_init();
     printf("Loading XBE...\n");
 
@@ -486,6 +488,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
+    /* 128 MB of guest address space over the retail 64 MB of RAM, so the heap
+     * runs to 128 MB (the game still sees a 64 MB console). On hardware the
+     * title shares 64 MB between its heap and contiguous memory; here
+     * contiguous memory has its own window but the toolkit's fixed regions
+     * below the heap leave it 47 MB, and loading cs_office (one of the two
+     * downloadable maps) ran out at 49.4 MB: a NULL allocation was written
+     * through and took the main thread's TIB with it. */
+    xbox_SetMapSize(128u * 1024u * 1024u);
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
         MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
                     "The required virtual address range may be unavailable.",
