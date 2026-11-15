@@ -7,8 +7,6 @@ renderer drawing it at up to 3x the original resolution.
 
 **No game data is included.** You need your own legally dumped copy of the disc (*Counter-Strike (USA)*).
 
-![Counter-Strike running natively on Windows](docs/screenshot.png)
-
 ## Features
 
 - **The whole game:** training, single player with bots, every map, at 60 FPS and beyond.
@@ -179,7 +177,7 @@ checks every file. `python scripts\index_texture_pack.py <asset-root>` builds a 
 ## Legal
 
 This repository contains original source code, scripts and documentation, plus an icon (`resources/cs.ico`,
-`cs.png`) made from the game's logo and one screenshot. It contains no Counter-Strike game code, assets or disc
+`cs.png`) made from the game's logo. It contains no Counter-Strike game code, assets or disc
 images, and nothing from the Xbox dashboard. Release builds contain code translated from the game; the game files
 come from the player's own disc. Xbox Live play goes through Insignia, an independent revival service.
 Counter-Strike is a trademark of Valve Corporation; this project is not affiliated with or endorsed by Valve,
