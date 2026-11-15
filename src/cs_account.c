@@ -53,6 +53,7 @@
 #include "recomp_types.h"
 #include "cs_account.h"
 #include "cs_d3d11.h"   /* cs_now_ms */
+#include "cs_diag.h"    /* cs_diag_flush */
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
@@ -415,7 +416,7 @@ void cs_account_finish(void)
 {
     if (s_mode != MODE_RECOVER) return;
     fprintf(stderr, "[ACCT] account recovery finished: result %d\n", s_result);
-    fflush(stderr);
+    cs_diag_flush();                   /* the log file gets every line before the process ends */
     TerminateProcess(GetCurrentProcess(), (UINT)s_result);
 }
 
