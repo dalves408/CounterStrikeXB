@@ -1,0 +1,50 @@
+{
+  "product": "Counter-Strike Hi-Res Textures",
+  "version": "1.0.0",
+  "format": "BC7_UNORM",
+  "upscale": 4,
+  "files": 5362,
+  "installed_texture_bytes": 6259666248,
+  "categories": {
+    "MAPS": 2437,
+    "MDL": 345,
+    "SPR": 739,
+    "WAD": 225,
+    "XPR": 1616
+  },
+  "manifest_sha256": "5552a3650db504fc46480d5e9cb88966e82baf6a81aee1adbb69d412a7ebb5cd",
+  "payload_format": "7z",
+  "compression": "LZMA2",
+  "manifest_lines": 5363,
+  "parts": [
+    {
+      "filename": "texture-01.bin",
+      "bytes": 1192397223,
+      "sha256": "c9a1785c5d70be6ef07493c0586d3af91b1478df8f46b18bb58db626f5353c9e",
+      "extracted_bytes": 1565317077,
+      "files": 2204
+    },
+    {
+      "filename": "texture-02.bin",
+      "bytes": 680505175,
+      "sha256": "465da9f96390b3da236e62d2853cc551253c83f7c3c9343c8c409bcda252902b",
+      "extracted_bytes": 1564252240,
+      "files": 1876
+    },
+    {
+      "filename": "texture-03.bin",
+      "bytes": 585499096,
+      "sha256": "62f755d196259cd5b28e122c0b1dafdd253579869530392ec99f0cbe5a805478",
+      "extracted_bytes": 1556735280,
+      "files": 900
+    },
+    {
+      "filename": "texture-04.bin",
+      "bytes": 435966387,
+      "sha256": "05c3902de9e75d844f44f54a515bb44a97e9c76a43079c833279f624816fb9f7",
+      "extracted_bytes": 1574422376,
+      "files": 386
+    }
+  ],
+  "extracted_bytes": 6260726973
+}

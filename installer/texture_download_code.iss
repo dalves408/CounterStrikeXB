@@ -108,6 +108,17 @@ begin
   end;
 end;
 
+{ The game Setup offers the pack as the optional task "hires" (TextureOptional);
+  the add-on Setup always installs it. }
+function WantTexturePack: Boolean;
+begin
+#ifdef TextureOptional
+  Result := WizardIsTaskSelected('hires');
+#else
+  Result := True;
+#endif
+end;
+
 function TexturePackNeedsInstall: Boolean;
 begin
   Result := TextureForceRepair or not TextureInstalledPackCurrent(WizardDirValue);
@@ -315,6 +326,7 @@ var
   I: Integer;
 begin
   Result := '';
+  if not WantTexturePack then Exit;
   TexturePackAlreadyCurrent := not TextureForceRepair and TextureInstalledPackCurrent(WizardDirValue);
   TexturePackInstalled := TexturePackAlreadyCurrent;
   if TexturePackAlreadyCurrent then begin
@@ -412,7 +424,7 @@ var
   I: Integer;
   OldMoved, OwnPack: Boolean;
 begin
-  if TexturePackAlreadyCurrent then Exit;
+  if not WantTexturePack or TexturePackAlreadyCurrent then Exit;
   for I := 0 to {#TexturePartCount} - 1 do
     if TexturePartPaths[I] = '' then
       RaiseException('Every texture archive must be verified before extraction.');

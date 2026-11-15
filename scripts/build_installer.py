@@ -8,6 +8,7 @@ a .sha256. Both contain code translated from the game, so they stay out of git.
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -23,6 +24,9 @@ CONFIG = 'RelWithDebInfo'
 INSTALLER = ROOT / 'installer'
 OUTPUT = INSTALLER / 'Output'
 WIZARD_SIZES = (55, 64, 80, 96, 128)
+# The hi-res texture pack the Setup offers (task "hires"): its parts' sizes and hashes, pinned
+# (scripts/build_texture_payload.py), and the release they are downloaded from.
+TEXTURE_PAYLOAD = INSTALLER / 'texture-payload-1.0.0.json'
 
 
 def find_iscc():
@@ -94,6 +98,9 @@ def main():
     parser.add_argument('--version', required=True)
     parser.add_argument('--skip-build', action='store_true', help='use the programs already in build_release')
     parser.add_argument('--iscc', help="Inno Setup 6's ISCC.exe, if it is not found by itself")
+    parser.add_argument('--texture-url-base', help='where Setup downloads the texture parts from '
+                        '(default: the textures release on GitHub; an http://127.0.0.1 URL for tests)')
+    parser.add_argument('--output', type=Path, default=OUTPUT, help='where the Setup goes (default installer/Output)')
     args = parser.parse_args()
     if args.iscc:
         os.environ['ISCC_EXE'] = args.iscc
@@ -105,15 +112,23 @@ def main():
     if not args.skip_build:
         run('cmake', '-S', ROOT, '-B', BUILD, '-DCS_RELEASE=ON')
         run('cmake', '--build', BUILD, '--config', CONFIG, '-j', '12',
-            '--target', 'cs2_xbox_recomp', 'cs_import', 'config', 'insignia_setup')
+            '--target', 'cs2_xbox_recomp', 'cs_import', 'config', 'insignia_setup', 'cs_texture_download')
     # The title update as a patch from the disc's default.xbe (scripts/tu_patch.py): installed beside the
     # game, which applies it when an install still has the disc's file, and used by cs_import.
     run(sys.executable, ROOT / 'scripts' / 'tu_patch.py', 'make', '--out', BUILD / CONFIG / 'cs_tu.xbepatch')
     keep_symbols(args.version)
     wizard_images()
-    OUTPUT.mkdir(exist_ok=True)
-    run(iscc, f'/DAppVersion={args.version}', f'/DBuildDir={BUILD / CONFIG}', INSTALLER / 'cs.iss')
-    setup = OUTPUT / f'CounterStrike-Setup-{args.version}.exe'
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from build_texture_addon import RELEASE_URL_BASE, write_includes
+    payload = json.loads(TEXTURE_PAYLOAD.read_text(encoding='ascii'))
+    url_base = args.texture_url_base or RELEASE_URL_BASE.format(version=payload['version'])
+    if not url_base.endswith('/'):
+        url_base += '/'
+    write_includes(payload, INSTALLER, url_base)   # git-ignored, made fresh for every build
+    print(f'Texture pack {payload["version"]}: {len(payload["parts"])} parts from {url_base}', flush=True)
+    args.output.mkdir(parents=True, exist_ok=True)
+    run(iscc, f'/DAppVersion={args.version}', f'/DBuildDir={BUILD / CONFIG}', f'/O{args.output}', INSTALLER / 'cs.iss')
+    setup = args.output / f'CounterStrike-Setup-{args.version}.exe'
     print(f'Setup: {setup}\nSHA-256: {write_sha256(setup)}')
     run(sys.executable, ROOT / 'scripts' / 'recomplauncher_manifest.py', '--version', args.version,
         '--build', BUILD / CONFIG)

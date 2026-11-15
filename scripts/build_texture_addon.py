@@ -30,6 +30,38 @@ def digest(path):
         return file_digest(stream, 'sha256').hexdigest()
 
 
+# The release the published pack's parts are attached to (scripts/build_texture_payload.py output,
+# pinned in installer/texture-payload-<version>.json). Players can only download them while the
+# repository is public.
+RELEASE_URL_BASE = 'https://github.com/dalves408/CounterStrikeXB/releases/download/textures-{version}/'
+
+
+def write_includes(payload, folder, url_base=None):
+    """texture_payload.iss (defines) and texture_parts_code.iss (each part's URL, size and SHA-256)
+    for installer/texture_download_code.iss, used by the add-on and by the game Setup (cs.iss)."""
+    parts = payload['parts']
+    total = sum(p['bytes'] for p in parts)
+    defines = dict(TextureVersion=payload['version'], TexturePartCount=len(parts),
+                   TextureExtractedBytes=payload['extracted_bytes'],
+                   TextureManifestSHA256=payload['manifest_sha256'], TextureFileCount=payload['manifest_lines'],
+                   TextureCacheRoot=r'{localappdata}\CounterStrikeXB\Downloads',
+                   TextureDownloadBytes=total,
+                   TextureDownloadText=f'{len(parts)} parts, {total / 1e9:.1f} GB in all',
+                   TextureInstalledText=f'{payload["extracted_bytes"] / 1e9:.1f} GB')
+    lines = [f'#define {k} "{v}"' if isinstance(v, str) else f'#define {k} {v}' for k, v in defines.items()]
+    if url_base:
+        lines.append('#define TextureHasDownload')
+    (folder / 'texture_payload.iss').write_text('\n'.join(lines) + '\n', encoding='ascii')
+    code = ['procedure TexturePartInfo(Part: Integer; var Url, SHA: String; var Bytes: Int64);',
+            'begin', '  case Part of']
+    for number, part in enumerate(parts, 1):
+        assert part['filename'] == f'texture-{number:02d}.bin'
+        url = (url_base + part['filename']) if url_base else 'https://unused.invalid/' + part['filename']
+        code += [f"    {number}: begin Url := '{url}'; SHA := '{part['sha256']}'; Bytes := {part['bytes']}; end;"]
+    code += ["  else RaiseException('Unknown texture part');", '  end;', 'end;']
+    (folder / 'texture_parts_code.iss').write_text('\n'.join(code) + '\n', encoding='ascii')
+
+
 def compiler():
     found = next((c for c in COMPILERS if c.exists()), None) or shutil.which('ISCC')
     if not found:
@@ -58,25 +90,7 @@ def build(metadata, output, url_base=None):
         shutil.copyfile(ROOT / 'resources/cs.ico', resources / 'cs.ico')
         shutil.copyfile(HELPER, installer / 'cs_texture_download.exe')
 
-        total = sum(p['bytes'] for p in parts)
-        defines = dict(TextureVersion=payload['version'], TexturePartCount=len(parts),
-                       TextureExtractedBytes=payload['extracted_bytes'],
-                       TextureManifestSHA256=payload['manifest_sha256'], TextureFileCount=payload['manifest_lines'],
-                       TextureCacheRoot=r'{localappdata}\CounterStrikeXB\Downloads',
-                       TextureDownloadText=f'{len(parts)} parts, {total / 1e9:.1f} GB in all')
-        lines = [f'#define {k} "{v}"' if isinstance(v, str) else f'#define {k} {v}' for k, v in defines.items()]
-        if url_base:
-            lines.append('#define TextureHasDownload')
-        (installer / 'texture_payload.iss').write_text('\n'.join(lines) + '\n', encoding='ascii')
-
-        code = ['procedure TexturePartInfo(Part: Integer; var Url, SHA: String; var Bytes: Int64);',
-                'begin', '  case Part of']
-        for number, part in enumerate(parts, 1):
-            assert part['filename'] == f'texture-{number:02d}.bin'
-            url = (url_base + part['filename']) if url_base else 'https://unused.invalid/' + part['filename']
-            code += [f"    {number}: begin Url := '{url}'; SHA := '{part['sha256']}'; Bytes := {part['bytes']}; end;"]
-        code += ["  else RaiseException('Unknown texture part');", '  end;', 'end;']
-        (installer / 'texture_parts_code.iss').write_text('\n'.join(code) + '\n', encoding='ascii')
+        write_includes(payload, installer, url_base)
 
         subprocess.run([str(compiler()), '/Qp', f'/O{output}', str(installer / 'cs_textures.iss')], check=True)
 

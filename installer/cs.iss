@@ -11,6 +11,12 @@
 #ifndef BuildDir
 #define BuildDir "..\build_release\RelWithDebInfo"
 #endif
+; The optional hi-res texture pack (task "hires"): texture_payload.iss and texture_parts_code.iss pin
+; every texture-NN.bin part's URL, size and SHA-256 (scripts/build_installer.py writes them from
+; installer/texture-payload-<version>.json); installer/texture_download_code.iss does the work.
+#include "texture_payload.iss"
+#define TextureOptional
+#define TextureMarker "cs-addon-complete.txt"
 
 [Setup]
 AppId={{D7CEE68B-0EA8-48F7-884A-EF8B2BE16E1A}
@@ -40,6 +46,8 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ExtraDiskSpaceRequired=1700000000
+; the texture pack's parts are 7z archives (extracted by Setup itself)
+ArchiveExtraction=enhanced/nopassword
 
 [Messages]
 WelcomeLabel2=This installs the Counter-Strike (Xbox) PC recompilation.%n%nThe game's own files are not included. You need your own copy of the Xbox disc: a disc image (.iso or .xiso) or a folder with the game's files. Setup will ask for it and copy the files it needs.
@@ -54,6 +62,8 @@ Source: "{#BuildDir}\cs_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion dele
 ; install made before it still has the disc's file
 Source: "{#BuildDir}\cs_tu.xbepatch"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 Source: "{#BuildDir}\cs_tu.xbepatch"; DestDir: "{app}"; Flags: ignoreversion
+; downloads and checks the texture pack's parts (installer/texture_download.c); never installed
+Source: "{#BuildDir}\cs_texture_download.exe"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\Counter-Strike"; Filename: "{app}\cs2_xbox_recomp.exe"; WorkingDir: "{app}"
@@ -63,13 +73,19 @@ Name: "{autodesktop}\Counter-Strike"; Filename: "{app}\cs2_xbox_recomp.exe"; Wor
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+; hidden when this pack is already installed and complete (an update or repair does not fetch it again);
+; silent installs: /TASKS="hires" (with /MERGETASKS to keep the others)
+Name: "hires"; Description: "Download and install the hi-res texture pack ({#TextureDownloadText}, {#TextureInstalledText} on disk; uses texture-NN.bin files beside Setup if present)"; Flags: unchecked; Check: TexturePackNeedsInstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\game_files"
 ; the toolkit's kernel log, written beside the game
 Type: files; Name: "{app}\xbox_kernel.log"
+Type: filesandordirs; Name: "{app}\texture_pack"
 
 [Code]
+#include "texture_download_code.iss"
+
 var
   SrcPage, UpdatePage: TWizardPage;
   SrcEdit: TNewEdit;
@@ -78,6 +94,8 @@ var
   VerRel: Integer;          { -1: the installed version is older, 0: same, 1: newer than this Setup }
   RepairRadio, QuitRadio: TNewRadioButton;
   QuitNow: Boolean;
+  TexturesReady: Boolean;   { every texture part is verified and waiting to be extracted }
+  TextureSkipNote: String;  { why the texture pack was not installed, for the last page }
 
 { The game files are in place: default.xbe and a few of the largest files, so an install that was
   interrupted halfway is not mistaken for a finished one. }
@@ -283,6 +301,8 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if (CurPageID = wpFinished) and (TextureSkipNote <> '') then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 + TextureSkipNote;
   if UpdateMode and (CurPageID = UpdatePage.ID) then
   begin
     if VerRel = 0 then RadioClick(nil) else WizardForm.NextButton.Caption := 'Update';
@@ -336,6 +356,31 @@ end;
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
   if QuitNow then Confirm := False;      { Quit on the matching-version page: no "Exit Setup?" question }
+  TextureCancelButtonClick(Cancel, Confirm);
+end;
+
+{ The texture parts are found or downloaded and checked before anything is installed. A failure
+  never stops the game install: Retry, or install the game without the pack (silent installs
+  skip it and end with exit code 2). }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Err: String;
+begin
+  Result := '';
+  TexturesReady := False;
+  if not WantTexturePack then Exit;
+  repeat
+    Err := PrepareTexturePayload;
+    if Err = '' then begin
+      TexturesReady := not TexturePackAlreadyCurrent;
+      Exit;
+    end;
+    Log('Texture pack not prepared: ' + Err);
+    if WizardSilent then Break;
+  until MsgBox('The hi-res texture pack could not be prepared:' + #13#10#13#10 + Err + #13#10#13#10 +
+               'Click Retry to try again, or Cancel to install the game without the hi-res textures ' +
+               '(run Setup again later to add them).', mbError, MB_RETRYCANCEL) <> IDRETRY;
+  TextureSkipNote := 'The hi-res texture pack was not installed: ' + Err;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -388,11 +433,27 @@ begin
         'Run Setup again and select a correct disc image or folder.', mbError, MB_OK);
     end;
   end;
+  if (CurStep = ssPostInstall) and TexturesReady and GameFilesPresent(ExpandConstant('{app}')) then
+    try
+      InstallTexturePack;
+    except
+      TextureSkipNote := 'The hi-res texture pack was not installed: ' + GetExceptionMessage;
+      Log(TextureSkipNote);
+      if not WizardSilent then MsgBox(TextureSkipNote + #13#10#13#10 + 'The game itself is installed.', mbError, MB_OK);
+    end;
+  if CurStep = ssDone then TextureFinishCacheChoice;
+end;
+
+procedure DeinitializeSetup;
+begin
+  TextureCleanupOnExit;
 end;
 
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if not GameFilesPresent(ExpandConstant('{app}')) then
-    Result := 1;
+    Result := 1
+  else if WantTexturePack and not TexturePackInstalled then
+    Result := 2;   { the game is installed, the texture pack is not }
 end;
