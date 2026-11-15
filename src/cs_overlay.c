@@ -14,7 +14,7 @@
  * menu is not also a shot or a jump.
  * F1 (or the menu's own lines) changes the settings of cs_settings.h; each
  * change is saved to settings.ini at once and applied while the game runs:
- * render scale, anti-aliasing and anisotropy between frames, the rest at the
+ * render scale, anti-aliasing, anisotropy and hi-res textures between frames, the rest at the
  * next present. config.exe offers the same options before the game starts.
  */
 #define WIN32_LEAN_AND_MEAN
@@ -33,10 +33,10 @@ extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
 extern void xbox_InputSetHold(int on);      /* toolkit input/xinput_device.c */
 
 enum { MODE_QUIT, MODE_SETTINGS };
-enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
 static const char *const ITEM_LABEL[IT_COUNT] = {
     "Render scale", "Fullscreen", "Stretch image", "VSync", "Frame rate cap",
-    "Anti-aliasing", "Anisotropic filtering", "Back to the game", "Quit Counter-Strike" };
+    "Anti-aliasing", "Anisotropic filtering", "Hi-res textures", "Back to the game", "Quit Counter-Strike" };
 static const char *const OFFON[2] = { "Off", "On" };
 static const char *const STRETCH[2] = { "Off (4:3)", "On (fill the window)" };
 
@@ -59,7 +59,7 @@ static int item_count(int i)
     case IT_RATE:  return CS_SET_RATES;
     case IT_MSAA:  return CS_SET_MSAAS;
     case IT_ANISO: return CS_SET_ANISOS;
-    case IT_FULLSCREEN: case IT_STRETCH: case IT_VSYNC: return 2;
+    case IT_FULLSCREEN: case IT_STRETCH: case IT_VSYNC: case IT_HIRES: return 2;
     }
     return 0;
 }
@@ -75,6 +75,7 @@ static int item_get(int i)
     case IT_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, s->frame_rate);
     case IT_MSAA: return cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, s->msaa);
     case IT_ANISO: return cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, s->aniso);
+    case IT_HIRES: return s->hires;
     }
     return 0;
 }
@@ -88,7 +89,7 @@ static const char *item_text(int i)
     case IT_MSAA: return CS_SET_MSAA_TEXT[v];
     case IT_ANISO: return CS_SET_ANISO_TEXT[v];
     case IT_STRETCH: return STRETCH[v];
-    case IT_FULLSCREEN: case IT_VSYNC: return OFFON[v];
+    case IT_FULLSCREEN: case IT_VSYNC: case IT_HIRES: return OFFON[v];
     }
     return "";
 }
@@ -107,6 +108,7 @@ static void item_set(int i, int v)
     case IT_RATE: s->frame_rate = CS_SET_RATE_HZ[v]; break;
     case IT_MSAA: s->msaa = CS_SET_MSAA_N[v]; cs_d3d11_settings_changed(); break;
     case IT_ANISO: s->aniso = CS_SET_ANISO_N[v]; cs_d3d11_settings_changed(); break;
+    case IT_HIRES: s->hires = v; cs_d3d11_settings_changed(); break;
     }
     cs_settings_save(s);
     cs_diag_log_video("settings changed");      /* the log says what a report's picture was drawn with */

@@ -11,6 +11,7 @@
  *   frame_rate        30, 60 (default), 120, 144, 240, 0 = uncapped
  *   msaa              1, 2, 4, 8 samples
  *   anisotropy        1, 2, 4, 8, 16
+ *   hires_textures    0/1       use the BC7 texture pack when one is installed (default 1)
  * %LOCALAPPDATA%\CounterStrikeXB\keymap.ini, [keys]: the keyboard, one line
  * per Xbox control in the toolkit's names (src/input/input_map.h), read by the
  * toolkit at start through RECOMP_KEYMAP.
@@ -28,6 +29,7 @@ typedef struct {
     int frame_rate;   /* Hz, 0 = uncapped */
     int msaa;         /* 1, 2, 4, 8 */
     int aniso;        /* 1, 2, 4, 8, 16 */
+    int hires;        /* 0/1: hi-res texture pack */
 } CsSettings;
 
 /* The choices each option offers, in menu order, and their names. */

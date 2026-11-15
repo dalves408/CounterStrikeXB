@@ -36,9 +36,9 @@ static const char *const CONTROL_LABEL[INPUT_CONTROL_COUNT] = {
 };
 
 /* ---- video options: the F1 menu's ------------------------------------------------------------ */
-enum { V_SCALE, V_FULLSCREEN, V_STRETCH, V_VSYNC, V_RATE, V_MSAA, V_ANISO, NVIDEO };
+enum { V_SCALE, V_FULLSCREEN, V_STRETCH, V_VSYNC, V_RATE, V_MSAA, V_ANISO, V_HIRES, NVIDEO };
 static const char *const VIDEO_LABEL[NVIDEO] = {
-    "Render scale", "Fullscreen", "Stretch image", "VSync", "Frame rate cap", "Anti-aliasing", "Anisotropic filtering" };
+    "Render scale", "Fullscreen", "Stretch image", "VSync", "Frame rate cap", "Anti-aliasing", "Anisotropic filtering", "Hi-res textures" };
 static const char *const T_OFFON[2] = { "Off", "On" };
 static const char *const T_STRETCH[2] = { "Off (keep 4:3)", "On (fill the window)" };
 
@@ -86,6 +86,7 @@ static int video_get(int i)
     case V_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, s_set.frame_rate);
     case V_MSAA: return cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, s_set.msaa);
     case V_ANISO: return cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, s_set.aniso);
+    case V_HIRES: return s_set.hires;
     }
     return 0;
 }
@@ -100,6 +101,7 @@ static void video_set(int i, int v)
     case V_RATE: s_set.frame_rate = CS_SET_RATE_HZ[v]; break;
     case V_MSAA: s_set.msaa = CS_SET_MSAA_N[v]; break;
     case V_ANISO: s_set.aniso = CS_SET_ANISO_N[v]; break;
+    case V_HIRES: s_set.hires = v; break;
     }
 }
 
@@ -296,7 +298,7 @@ static void make_ui(HWND h)
     s_vpage[s_nv++] = mk("STATIC", "These are the same as the game's F1 menu (F1 while playing changes them live).",
                          SS_LEFT, 30, 52, 540, 30, 0, f);
     for (i = 0; i < NVIDEO; i++) {
-        int y = 96 + i * 44;
+        int y = 92 + i * 40;
         s_vpage[s_nv++] = mk("STATIC", VIDEO_LABEL[i], SS_LEFT, 40, y + 4, 180, 22, 0, f);
         s_combo[i] = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 230, y, 320, 200, ID_VIDEO0 + i, f);
         for (j = 0; j < video_count(i); j++) SendMessageA(s_combo[i], CB_ADDSTRING, 0, (LPARAM)video_text(i, j));
@@ -306,8 +308,9 @@ static void make_ui(HWND h)
     s_vpage[s_nv++] = mk("STATIC",
         "Render scale: Low draws the game at the Xbox's own 640x480, Medium at 2x and High at 3x. Anti-aliasing smooths edges and anisotropic "
         "filtering keeps distant textures sharp; both cost a little GPU time. Fullscreen fills the screen without a border "
-        "(F11 or Alt+Enter switch while playing). Frame rate cap limits how fast the game runs; Uncapped is the default.",
-        SS_LEFT, 30, 410, 540, 80, 0, f);
+        "(F11 or Alt+Enter switch while playing). Frame rate cap limits how fast the game runs. Hi-res textures uses the "
+        "texture_pack folder beside the game when it is there.",
+        SS_LEFT, 30, 416, 540, 84, 0, f);
 
     s_list = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "", WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                              20, 48, 560, 400, h, (HMENU)(INT_PTR)ID_LIST, NULL, NULL);

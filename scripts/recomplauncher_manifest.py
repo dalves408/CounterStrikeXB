@@ -48,6 +48,8 @@ def manifest():
         setting('msaa', 'Anti-aliasing (MSAA)', 'display/msaa', [('Off', 1), ('2x', 2), ('4x', 4), ('8x', 8)], 1),
         setting('anisotropy', 'Texture filtering', 'display/anisotropy',
                 [('Off', 1), ('2x', 2), ('4x', 4), ('8x', 8), ('16x', 16)], 1),
+        setting('hires-textures', 'Hi-res textures', 'display/hires_textures', toggle, 1,
+                'Uses the hi-res texture pack (a texture_pack folder beside the game) when it is installed.'),
     ]
     return {
         '$schema': 'https://recomplauncher.com/schema/recomplauncher.json',

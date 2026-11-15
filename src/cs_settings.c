@@ -27,6 +27,7 @@ void cs_settings_defaults(CsSettings *s)
     s->frame_rate = 60;
     s->msaa = 1;
     s->aniso = 1;
+    s->hires = 1;
 }
 
 int cs_settings_path(const char *name, char *out, unsigned n, int make_dir)
@@ -73,6 +74,7 @@ void cs_settings_load(CsSettings *s)
     s->frame_rate = CS_SET_RATE_HZ[cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, get(path, "frame_rate", s->frame_rate))];
     s->msaa = CS_SET_MSAA_N[cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, get(path, "msaa", s->msaa))];
     s->aniso = CS_SET_ANISO_N[cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, get(path, "anisotropy", s->aniso))];
+    s->hires = get(path, "hires_textures", s->hires) != 0;
 }
 
 static int put(const char *path, const char *key, int v)
@@ -95,6 +97,7 @@ int cs_settings_save(const CsSettings *s)
     ok &= put(path, "frame_rate", s->frame_rate);
     ok &= put(path, "msaa", s->msaa);
     ok &= put(path, "anisotropy", s->aniso);
+    ok &= put(path, "hires_textures", s->hires);
     return ok;
 }
 
@@ -134,7 +137,7 @@ void cs_settings_startup(void)
             fprintf(stderr, "[CS-SET] system link peers: %s\n", peers);
         }
     }
-    fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d\n",
+    fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d, hi-res textures %d\n",
             g_cs_settings.scale, g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
-            g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso);
+            g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso, g_cs_settings.hires);
 }

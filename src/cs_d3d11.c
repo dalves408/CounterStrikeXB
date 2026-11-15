@@ -97,7 +97,7 @@ typedef struct {
     ID3D11DepthStencilView *dsv;
 } Ds;
 
-static int s_scale = 1, s_msaa = 1, s_aniso = 1;   /* what the targets and samplers are made with now */
+static int s_scale = 1, s_msaa = 1, s_aniso = 1, s_hires = 1;   /* what the targets and samplers are made with now */
 static int s_presenting;                           /* our presenter draws the window (cs_window_present) */
 static void settings_apply(int first);
 
@@ -833,7 +833,7 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
         D3D11_SUBRESOURCE_DATA sd;
         TexEnt *ne = &s_tx[free_i];
         memset(ne, 0, sizeof *ne);
-        try_pack = pack_source_format(t->color) && cs_pack_enabled() && s_pack_bytes < CS_PACK_BUDGET;
+        try_pack = s_hires && pack_source_format(t->color) && cs_pack_enabled() && s_pack_bytes < CS_PACK_BUDGET;
         if (try_pack && cs_pack_load(s_dev, t->color, t->width, t->height, mem + t->offset, n,
                                      CS_PACK_BUDGET - s_pack_bytes,
                                      &ne->tex, &ne->srv, &ne->replacement_bytes))
@@ -2057,7 +2057,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
  * frame and drawn with its alpha.
  *
  * Settings (F1 menu, config.exe; cs_settings.h): render scale and MSAA remake
- * every target between frames; anisotropy remakes the samplers; stretch, vsync
+ * every target between frames; anisotropy remakes the samplers; hi-res textures empties the texture cache; stretch, vsync
  * and the frame-rate cap are read here at each present. The ESC/F1 menus are
  * a separate window over this one (cs_overlay.c): the game keeps drawing. */
 static IDXGISwapChain1 *s_sc;
@@ -2114,10 +2114,16 @@ static void settings_apply(int first)
         s_nss = 0;
         s_aniso = aniso;
     }
+    if ((g_cs_settings.hires != 0) != s_hires) {
+        /* Hi-res textures on/off: empty the texture cache; each texture is
+         * decoded (or its replacement loaded) again at its next bind. */
+        for (i = 0; i < MAX_TEX; i++) { release_texture(&s_tx[i]); memset(&s_tx[i], 0, sizeof s_tx[i]); }
+        s_hires = g_cs_settings.hires != 0;
+    }
     if (first || s_log)
-        fprintf(stderr, "[CS-D3D11] render scale %dx (%ux%u), msaa %d%s, anisotropy %d\n", s_scale,
+        fprintf(stderr, "[CS-D3D11] render scale %dx (%ux%u), msaa %d%s, anisotropy %d, hi-res textures %d\n", s_scale,
                 640u * (unsigned)s_scale, 480u * (unsigned)s_scale, s_msaa,
-                msaa != g_cs_settings.msaa ? " (the most this card has)" : "", s_aniso);
+                msaa != g_cs_settings.msaa ? " (the most this card has)" : "", s_aniso, s_hires);
 }
 
 static int blit_init(void)
