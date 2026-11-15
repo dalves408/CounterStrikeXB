@@ -51,6 +51,7 @@
 #include "recomp_types.h"
 #include "cs_kernel.h"
 #include "cs_d3d11.h"   /* cs_now_ms */
+#include "cs_account.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -182,8 +183,26 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0, uint32_
 }
 #endif
 
+/* 3. Account test (CS_ACCT, src/cs_account.c): the game calls
+ *    KeQuerySystemTime constantly, the main loop included; each call gives
+ *    the account code a step on that thread first. */
+#define CS_THUNK_KEQPC 0x00321154u              /* ordinal 128, KeQuerySystemTime */
+static uint32_t s_keqpc_va;
+static void cs_KeQueryPerformanceCounter(void)
+{
+    recomp_func_t bridge = recomp_lookup_kernel(s_keqpc_va);
+    cs_account_tick();
+    if (bridge) bridge();
+}
+
 recomp_func_t cs_kernel_override(uint32_t xbox_va)
 {
+    if (!s_keqpc_va && cs_account_enabled())
+        s_keqpc_va = MEM32(CS_THUNK_KEQPC);
+    if (s_keqpc_va && xbox_va == s_keqpc_va)
+        return cs_KeQueryPerformanceCounter;
+    if (xbox_va == CS_ACCOUNT_THREAD_VA && cs_account_enabled())
+        return cs_account_thread;
     if (!s_ntreadfile_va)
         s_ntreadfile_va = MEM32(CS_THUNK_NTREADFILE);
     if (!s_keraise_va)

@@ -141,7 +141,9 @@ void cs_settings_startup(void)
      * starts fullscreen, whatever the setting says; the setting itself is left alone. */
     {
         const char *mode = getenv("RECOMPLAUNCHER_MODE");
-        if (mode && _stricmp(mode, "bigpicture") == 0) {
+        if (getenv("CS_ACCT")) {
+            _putenv_s("RECOMP_FULLSCREEN", "0");     /* an account run for Insignia Setup: stay out of its way */
+        } else if (mode && _stricmp(mode, "bigpicture") == 0) {
             _putenv_s("RECOMP_FULLSCREEN", "1");
             fprintf(stderr, "[CS-SET] RecompLauncher Big Picture mode: fullscreen\n");
         } else if (!getenv("RECOMP_FULLSCREEN"))

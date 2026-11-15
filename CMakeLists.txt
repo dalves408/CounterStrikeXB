@@ -49,6 +49,7 @@ set(GAME_SOURCES
     src/cs_vsh_hlsl.c
     src/cs_rc_hlsl.c
     src/cs_kernel.c
+    src/cs_account.c
     src/cs_launch.c
     src/cs_settings.c
     src/cs_overlay.c

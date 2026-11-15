@@ -1,0 +1,48 @@
+From 419607b2105763f451f6690d70f8072a48bd4f74 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel: keep config sectors 8-23 (all eight user account
+ slots)
+
+---
+ src/kernel/kernel_vdisk.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/kernel_vdisk.c b/src/kernel/kernel_vdisk.c
+index f01f6bf..05aeb64 100644
+--- a/src/kernel/kernel_vdisk.c
++++ b/src/kernel/kernel_vdisk.c
+@@ -6,7 +6,7 @@
+  * read the partition table (XAPI's utility-drive mount), to format and check
+  * a cache partition, and the online stack to keep the console's network
+  * settings and Xbox Live accounts in the config area of the disk (Partition0,
+- * sectors 8-15). Files on those partitions do not go through here at all: the
++ * sectors 8-23). Files on those partitions do not go through here at all: the
+  * path rules put them in plain host folders (UDATA, TDATA, Cache, ...).
+  *
+  * These used to be PartitionN.img files in the save folder, most of them
+@@ -14,7 +14,7 @@
+  * device is a sparse set of 4 KB pages in memory, read as zeroes until
+  * written, sized from the same retail geometry as the partition table. The
+  * table itself is built in. The only part that outlives the process is the
+- * config area, sectors 8-15 (4 KB): it is kept in one small file, by default
++ * config area, sectors 8-23 (8 KB): it is kept in one small file, by default
+  * RECOMP_DISK_CONFIG, else <save dir>\DiskConfig.bin, and written back
+  * whenever the title changes it. A cache partition starts unformatted each
+  * run, which is what a title expects of a cache.
+@@ -36,7 +36,11 @@
+ #define VD_PAGE        4096u
+ #define VD_CHUNK_PAGES 1024u
+ #define VD_CFG_OFFSET  0x1000ull          /* sector 8  */
+-#define VD_CFG_SIZE    0x1000u            /* sectors 8-15 */
++/* Sectors 8-23: network settings (8), machine account (9), the user account
++ * directory (11) and the eight user account slots (12-19), with room to
++ * spare. A file kept by an earlier version (sectors 8-15 only) still loads:
++ * the sectors it lacks read as empty. */
++#define VD_CFG_SIZE    0x2000u
+ #define VD_MAX_HANDLES 64
+ 
+ /* Sizes in 512-byte sectors, as in the partition table (kernel_path.c). */
+-- 
+2.51.0.windows.2
+

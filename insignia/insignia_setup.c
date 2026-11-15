@@ -10,15 +10,18 @@
  *
  *   %LOCALAPPDATA%\CounterStrikeXB\eeprom.bin               the console's EEPROM
  *   %LOCALAPPDATA%\CounterStrikeXB\settings.ini             [insignia] hdd_key=
- *   %LOCALAPPDATA%\CounterStrikeXB\drive_config.bin         the drive's config sectors 8-15
+ *   %LOCALAPPDATA%\CounterStrikeXB\drive_config.bin         the drive's config sectors 8-23
  *
- * This program checks what the player gives it and writes those. The accounts
- * come from a dump of the console's drive (the first sectors are enough), a
- * raw drive image, or an xemu drive (.qcow2). Only sectors 9..15 (accounts) are
- * copied: the network settings stay this PC's (the game's router hands them
- * out). Creating a new account needs the dashboard's sign-up and is not here
- * yet. Nothing secret is shown: the hard-drive key field is masked and the
- * serial number shows only its last digits.
+ * This program checks what the player gives it and writes those. An account
+ * comes either from Insignia (Recover from Insignia: the gamertag and the
+ * 16-digit number on the insignia.live Web Dashboard; the game does the
+ * recovery itself, cs_account.c) or from a dump of the console's drive (the
+ * first sectors are enough), a raw drive image, or an xemu drive (.qcow2).
+ * From a drive only sectors 9..19 (accounts) are copied: the network settings
+ * stay this PC's (the game's router hands them out). Creating a new account
+ * needs the dashboard's sign-up and is not here yet. Nothing secret is shown:
+ * the hard-drive key and the recovery number are masked, and the serial
+ * number shows only its last digits.
  */
 #include <windows.h>
 #include <commdlg.h>
@@ -40,7 +43,8 @@ enum { ID_EE_EDIT = 100, ID_EE_BROWSE, ID_EE_STATUS, ID_KEY_EDIT, ID_KEY_SHOW, I
 static HWND s_main, s_ee, s_ee_st, s_key, s_key_st, s_acc, s_acc_st, s_status;
 static uint8_t s_eeprom[256];
 static int s_ee_ok, s_acc_ok;
-static uint8_t s_sectors[7][512];          /* the drive's sectors 9..15 */
+#define ACCOUNT_SECTORS 11                  /* 9 machine account, 10, 11 user directory, 12-19 user slots */
+static uint8_t s_sectors[ACCOUNT_SECTORS][512];   /* the drive's sectors 9..19 */
 static char s_gamertags[256];
 static void say(HWND w, const char *t);
 static void check_key(void);
@@ -361,17 +365,17 @@ static void check_accounts(const char *path)
     s_acc_ok = 0;
     s_gamertags[0] = 0;
     if (f == INVALID_HANDLE_VALUE) { say(s_acc_st, "That file could not be opened."); return; }
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < ACCOUNT_SECTORS; i++)
         if (!read_sector(f, 9 + (uint64_t)i, s_sectors[i])) { CloseHandle(f); say(s_acc_st, "That file is too short, or a drive image this program cannot read."); return; }
     CloseHandle(f);
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < ACCOUNT_SECTORS; i++) {
         const uint8_t *s = s_sectors[i];
         int k, empty = 1;
         for (k = 0; k < 512; k++) if (s[k]) { empty = 0; break; }
         if (empty) continue;
         if (!config_sector_ok(s)) { say(s_acc_st, "Those sectors are not an Xbox drive's account area (wrong file?)."); return; }
         valid++;
-        if (s[24] && memcmp(s + 24, "SN.", 3) != 0) {         /* a player's gamertag (the machine account is SN.<serial>) */
+        if (i >= 3 && s[24] && memcmp(s + 24, "SN.", 3) != 0) {   /* a user slot (12-19) with a gamertag */
             char tag[17];
             memcpy(tag, s + 24, 16); tag[16] = 0;
             for (k = 0; tag[k]; k++) if (tag[k] < 32 || tag[k] > 126) { tag[k] = 0; break; }
@@ -381,7 +385,7 @@ static void check_accounts(const char *path)
             }
         }
     }
-    if (!valid) { say(s_acc_st, "No Xbox Live accounts in that file (sectors 9-15 are empty)."); return; }
+    if (!valid) { say(s_acc_st, "No Xbox Live accounts in that file (sectors 9-19 are empty)."); return; }
     s_acc_ok = 1;
     snprintf(msg, sizeof msg, users ? "OK: account(s) %s" : "Found the console's machine account but no player accounts.",
              s_gamertags);
@@ -389,13 +393,13 @@ static void check_accounts(const char *path)
 }
 
 /* ---- saving ----------------------------------------------------------------------------------- */
-/* drive_config.bin holds the drive's config sectors 8-15 (the game emulates
+/* drive_config.bin holds the drive's config sectors 8-23 (the game emulates
  * the raw disk and keeps only these). Sector 8, the network settings, is kept
- * as it is; the accounts go in 9-15. */
+ * as it is; the accounts go in 9-19. */
 static int write_partition0(void)
 {
     char path[MAX_PATH], bak[MAX_PATH];
-    uint8_t cfg[8 * 512];
+    uint8_t cfg[16 * 512];
     FILE *f;
     int i;
     if (!cs_settings_path("drive_config.bin", path, sizeof path, 1)) return 0;
@@ -407,40 +411,214 @@ static int write_partition0(void)
         if (GetFileAttributesA(bak) == INVALID_FILE_ATTRIBUTES)
             CopyFileA(path, bak, TRUE);                    /* the first time only */
     }
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < ACCOUNT_SECTORS; i++)
         memcpy(cfg + (1 + i) * 512, s_sectors[i], 512);
     if (!(f = fopen(path, "wb"))) return 0;
     i = fwrite(cfg, 1, sizeof cfg, f) == sizeof cfg;
     return fclose(f) == 0 && i;
 }
 
-static void save(void)
+/* Steps 1 and 2: the console's EEPROM and hard-drive key. */
+static int save_identity(void)
 {
     char t[128], path[MAX_PATH], ini[MAX_PATH];
     uint8_t k[16];
     FILE *f;
     GetWindowTextA(s_key, t, sizeof t);
-    if (!s_ee_ok) { tell("Choose your console's EEPROM first.", MB_ICONWARNING); return; }
-    if (!hex_key(t, k)) { tell("Enter your console's hard-drive key (32 hex digits).", MB_ICONWARNING); return; }
-    if (!s_acc_ok) { tell("Choose a dump of your console's drive with your Xbox Live account.", MB_ICONWARNING); return; }
+    if (!s_ee_ok) { tell("Choose your console's EEPROM first.", MB_ICONWARNING); return 0; }
+    if (!hex_key(t, k)) { tell("Enter your console's hard-drive key (32 hex digits).", MB_ICONWARNING); return 0; }
     SecureZeroMemory(k, sizeof k);
     if (!cs_settings_path("eeprom.bin", path, sizeof path, 1) || !(f = fopen(path, "wb")) ||
         fwrite(s_eeprom, 1, 256, f) != 256 || fclose(f) != 0) {
         tell("The EEPROM could not be saved.", MB_ICONERROR);
-        return;
+        return 0;
     }
     if (!cs_settings_path("settings.ini", ini, sizeof ini, 1) || !WritePrivateProfileStringA("insignia", "hdd_key", t, ini)) {
         tell("The hard-drive key could not be saved.", MB_ICONERROR);
-        return;
+        return 0;
     }
     SecureZeroMemory(t, sizeof t);
-    if (!write_partition0()) {
+    return 1;
+}
+
+/* Step 3 is optional: an account from a drive dump if one was chosen; else
+ * the account comes from Insignia (Recover from Insignia...). */
+static void save(void)
+{
+    if (!save_identity()) return;
+    if (s_acc_ok && !write_partition0()) {
         tell("The account could not be written to the game's drive.", MB_ICONERROR);
         return;
     }
+    say(s_status, s_acc_ok ? "Saved. Start Counter-Strike, choose Xbox Live, and sign in."
+                           : "Saved. Now add your account: Recover from Insignia...");
+    tell(s_acc_ok ? "Your console identity and Xbox Live account are set up.\n\n"
+                    "Start Counter-Strike, choose Xbox Live, and pick your gamertag to sign in to Insignia."
+                  : "Your console identity is set up.\n\n"
+                    "To add your Xbox Live account, use Recover from Insignia... with your gamertag and the "
+                    "16-digit number from your insignia.live web dashboard.", MB_ICONINFORMATION);
+}
+
+/* ---- Recover from Insignia ----------------------------------------------------------------------- */
+/* Insignia's account recovery (insignia.live/guide/recover): the gamertag and
+ * the 16-digit number its web dashboard shows. The game does the recovery
+ * itself (cs_account.c, CS_ACCT=recover): it signs this console in, asks
+ * Insignia for the account, and saves it to the drive the way the Xbox
+ * Dashboard does. The two values go to it on a pipe, never on a command line
+ * or in a file, and are wiped here once written. */
+enum { ID_REC_TAG = 300, ID_REC_NUM, ID_REC_OK, ID_REC_CANCEL };
+static HWND s_rec, s_rec_tag, s_rec_num;
+static int s_rec_done;
+
+static LRESULT CALLBACK rec_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_COMMAND && (LOWORD(w) == ID_REC_OK || LOWORD(w) == ID_REC_CANCEL)) {
+        s_rec_done = LOWORD(w) == ID_REC_OK ? 1 : -1;
+        return 0;
+    }
+    if (m == WM_CLOSE) { s_rec_done = -1; return 0; }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static HWND rec_mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
+{
+    HWND c = CreateWindowExA(cls[0] == 'E' ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             x, y, w, h, s_rec, (HMENU)(INT_PTR)id, NULL, NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    return c;
+}
+
+/* The two values, or 0 if the player cancelled. */
+static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
+{
+    WNDCLASSA wc;
+    MSG msg;
+    RECT r = { 0, 0, 430, 196 };
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = rec_proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = "CounterStrikeXBRecover";
+    RegisterClassA(&wc);
+    AdjustWindowRect(&r, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE);
+    s_rec = CreateWindowExA(WS_EX_DLGMODALFRAME, wc.lpszClassName, "Recover your account from Insignia",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
+                            r.right - r.left, r.bottom - r.top, s_main, NULL, wc.hInstance, NULL);
+    rec_mk("STATIC", "Sign in to your Web Dashboard at insignia.live and press Reveal to see your account's "
+           "16-digit number. Don't share it: it lets anyone recover your account.", SS_LEFT, 14, 10, 402, 44, 0);
+    rec_mk("STATIC", "Gamertag:", SS_LEFT, 14, 66, 110, 20, 0);
+    s_rec_tag = rec_mk("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, 130, 62, 286, 23, ID_REC_TAG);
+    rec_mk("STATIC", "16-digit number:", SS_LEFT, 14, 102, 110, 20, 0);
+    s_rec_num = rec_mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 130, 98, 286, 23, ID_REC_NUM);
+    SendMessageA(s_rec_tag, EM_LIMITTEXT, 15, 0);
+    SendMessageA(s_rec_num, EM_LIMITTEXT, 24, 0);
+    rec_mk("BUTTON", "Recover", BS_DEFPUSHBUTTON | WS_TABSTOP, 222, 150, 94, 28, ID_REC_OK);
+    rec_mk("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 322, 150, 94, 28, ID_REC_CANCEL);
+    EnableWindow(s_main, FALSE);
+    ShowWindow(s_rec, SW_SHOW);
+    SetFocus(s_rec_tag);
+    s_rec_done = 0;
+    while (!s_rec_done && GetMessageA(&msg, NULL, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) { s_rec_done = 1; continue; }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { s_rec_done = -1; continue; }
+        if (IsDialogMessageA(s_rec, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    GetWindowTextA(s_rec_tag, tag, (int)tagn);
+    GetWindowTextA(s_rec_num, num, (int)numn);
+    SetWindowTextA(s_rec_num, "");
+    EnableWindow(s_main, TRUE);
+    DestroyWindow(s_rec);
+    SetForegroundWindow(s_main);
+    return s_rec_done == 1;
+}
+
+/* The game's exit code (cs_account.h) as a sentence. */
+static const char *recover_result(DWORD code)
+{
+    switch (code) {
+    case 0:  return NULL;
+    case 21: return "This console could not sign in to Xbox Live. Check the EEPROM and hard-drive key "
+                    "(the console must be registered with Insignia) and your internet connection.";
+    case 22: return "Insignia did not answer. Check your internet connection and try again.";
+    case 23: return "Insignia did not accept that gamertag and number. Check both on your insignia.live "
+                    "Web Dashboard (the number changes if you reveal a new one).";
+    case 24: return "The account could not be saved to the game's drive.";
+    case 25: return "All eight account slots on this console are in use.";
+    default: return "The recovery did not finish. The game's log (CounterStrikeXB\\logs) says why.";
+    }
+}
+
+static void recover(void)
+{
+    char tag[32], num[40], exe[MAX_PATH], dir[MAX_PATH], line[96], *sl;
+    unsigned i, digits = 0;
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+    HANDLE rd = NULL, wr = NULL;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD code = 26, n;
+    const char *why;
+    if (!save_identity()) return;
+    if (!ask_recover(tag, sizeof tag, num, sizeof num)) { SecureZeroMemory(num, sizeof num); return; }
+    for (i = 0; num[i]; i++) if (num[i] >= '0' && num[i] <= '9') digits++;
+    if (!tag[0] || digits != 16) {
+        SecureZeroMemory(num, sizeof num);
+        tell("Enter your gamertag and the full 16-digit number from your insignia.live Web Dashboard.", MB_ICONWARNING);
+        return;
+    }
+    if (!GetModuleFileNameA(NULL, exe, sizeof exe) || !(sl = strrchr(exe, '\\'))) { SecureZeroMemory(num, sizeof num); return; }
+    strcpy_s(sl + 1, sizeof exe - (size_t)(sl + 1 - exe), "cs2_xbox_recomp.exe");
+    strcpy_s(dir, sizeof dir, exe);
+    *strrchr(dir, '\\') = 0;
+    if (getenv("CS_GAME_CWD")) strcpy_s(dir, sizeof dir, getenv("CS_GAME_CWD"));   /* a development build */
+    if (!CreatePipe(&rd, &wr, &sa, 0)) { SecureZeroMemory(num, sizeof num); tell("Could not start the recovery.", MB_ICONERROR); return; }
+    SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
+    snprintf(line, sizeof line, "%llu", (unsigned long long)(uintptr_t)rd);
+    SetEnvironmentVariableA("CS_ACCT", "recover");
+    SetEnvironmentVariableA("CS_ACCT_INPUT", line);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWMINNOACTIVE;
+    if (!CreateProcessA(exe, NULL, NULL, NULL, TRUE, 0, NULL, dir, &si, &pi)) {
+        SetEnvironmentVariableA("CS_ACCT", NULL); SetEnvironmentVariableA("CS_ACCT_INPUT", NULL);
+        CloseHandle(rd); CloseHandle(wr); SecureZeroMemory(num, sizeof num);
+        tell("Could not start Counter-Strike (cs2_xbox_recomp.exe beside this program).", MB_ICONERROR);
+        return;
+    }
+    SetEnvironmentVariableA("CS_ACCT", NULL);
+    SetEnvironmentVariableA("CS_ACCT_INPUT", NULL);
+    CloseHandle(rd);
+    snprintf(line, sizeof line, "%s\n%s\n", tag, num);
+    WriteFile(wr, line, (DWORD)strlen(line), &n, NULL);
+    CloseHandle(wr);
+    SecureZeroMemory(line, sizeof line);
+    SecureZeroMemory(num, sizeof num);
+    CloseHandle(pi.hThread);
+    say(s_status, "Recovering your account through Insignia (up to two minutes)...");
+    EnableWindow(s_main, FALSE);
+    {
+        DWORD start = GetTickCount();
+        MSG msg;
+        while (MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, 500, QS_ALLINPUT) != WAIT_OBJECT_0) {
+            while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+            if (GetTickCount() - start > 180000) { TerminateProcess(pi.hProcess, 26); break; }
+        }
+    }
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    EnableWindow(s_main, TRUE);
+    SetForegroundWindow(s_main);
+    why = recover_result(code);
+    if (why) { say(s_status, "The account was not recovered."); tell(why, MB_ICONERROR); return; }
+    snprintf(line, sizeof line, "OK: %s recovered from Insignia", tag);
+    say(s_acc_st, line);
     say(s_status, "Saved. Start Counter-Strike, choose Xbox Live, and sign in.");
-    tell("Your console identity and Xbox Live account are set up.\n\n"
-         "Start Counter-Strike, choose Xbox Live, and pick your gamertag to sign in to Insignia.", MB_ICONINFORMATION);
+    tell("Your account is on this PC now.\n\nStart Counter-Strike, choose Xbox Live, and pick your gamertag to sign in.",
+         MB_ICONINFORMATION);
 }
 
 /* Load what was saved before, so the window shows the current setup. */
@@ -487,15 +665,13 @@ static void make_ui(void)
     s_key_st = mk("STATIC", "Needed: 32 hex digits (UnleashX, EvoX hddinfo.txt, XBlast or xemu show it).", SS_LEFT, 24, y + 56, 546, 20, ID_KEY_STATUS);
     y += 96;
     mk("BUTTON", "3. Your Xbox Live account", BS_GROUPBOX, 10, y, 572, 128, 0);
-    mk("STATIC", "Load it from a dump of your console's drive (the first 1 MB is enough), a raw drive image, or your xemu drive (.qcow2):",
-       SS_LEFT, 24, y + 22, 546, 32, 0);
+    mk("STATIC", "Recover it from Insignia with your gamertag and the 16-digit number on your insignia.live Web "
+       "Dashboard, or load it from a dump of your console's drive, a raw drive image, or your xemu drive (.qcow2):",
+       SS_LEFT, 24, y + 20, 546, 32, 0);
     s_acc = mk("EDIT", "", ES_AUTOHSCROLL | ES_READONLY, 24, y + 56, 440, 23, ID_ACC_EDIT);
     mk("BUTTON", "Browse...", BS_PUSHBUTTON | WS_TABSTOP, 474, y + 55, 96, 25, ID_ACC_BROWSE);
-    s_acc_st = mk("STATIC", "Needed: the drive with the account you signed in with on your console.", SS_LEFT, 24, y + 88, 360, 20, ID_ACC_STATUS);
-    {
-        HWND c = mk("BUTTON", "Create a new account...", BS_PUSHBUTTON | WS_TABSTOP, 394, y + 84, 176, 25, ID_CREATE);
-        EnableWindow(c, FALSE);       /* needs the dashboard's sign-up: not available yet */
-    }
+    s_acc_st = mk("STATIC", "Optional: an account from a drive, or recover one from Insignia.", SS_LEFT, 24, y + 88, 360, 20, ID_ACC_STATUS);
+    mk("BUTTON", "Recover from Insignia...", BS_PUSHBUTTON | WS_TABSTOP, 394, y + 84, 176, 25, ID_CREATE);
     y += 140;
     s_status = mk("STATIC", "", SS_LEFT, 16, y + 6, 360, 20, ID_STATUS);
     mk("BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 386, y, 92, 28, ID_SAVE);
@@ -545,6 +721,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 check_accounts(path);
             }
             return 0;
+        case ID_CREATE: recover(); return 0;
         case ID_SAVE: save(); return 0;
         case ID_CLOSE: DestroyWindow(h); return 0;
         }
@@ -576,19 +753,19 @@ static int run_args(void)
     }
     s_cli = 1;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) freopen("CONOUT$", "w", stderr);
-    if (!ee || !drive || (!key && !info && !(bios && mcpx))) {
-        fprintf(stderr, "usage: insignia_setup --eeprom FILE (--hdd-key HEX | --hddinfo FILE) --drive FILE\n");
+    if (!ee || (!key && !info && !(bios && mcpx))) {
+        fprintf(stderr, "usage: insignia_setup --eeprom FILE (--hdd-key HEX | --hddinfo FILE) [--drive FILE]\n");
         return 2;
     }
     check_eeprom(ee);
     if (key) { SetWindowTextA(s_key, key); check_key(); }
     else if (info) key_from_hddinfo(info);
     else { key_from_bios(bios, mcpx); GetWindowTextA(s_key_st, t, sizeof t); fprintf(stderr, "%s\n", t); }
-    check_accounts(drive);
+    if (drive) check_accounts(drive);
     GetWindowTextA(s_ee_st, t, sizeof t);
     if (!s_ee_ok) { tell(t, MB_ICONERROR); return 3; }
     GetWindowTextA(s_acc_st, t, sizeof t);
-    if (!s_acc_ok) { tell(t, MB_ICONERROR); return 4; }
+    if (drive && !s_acc_ok) { tell(t, MB_ICONERROR); return 4; }
     save();
     GetWindowTextA(s_status, t, sizeof t);
     return strncmp(t, "Saved", 5) == 0 ? 0 : 5;
