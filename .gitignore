@@ -44,3 +44,5 @@ eeprom.bin
 /insignia-setup-assistant/
 # Microsoft's Xbox dashboard (xboxdash.xbe and its data), player-supplied: studied, never committed
 /msdash/
+# Local task notes for helper sessions: never on GitHub
+/smalltask.md
