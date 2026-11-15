@@ -34,3 +34,8 @@ installer/wizard_small_*.bmp
 
 # Files copied from a console hard drive (title update, downloads, saves)
 /E/
+
+# A console EEPROM dump: private keys, each player supplies their own
+/eeprom/
+*.eeprom
+eeprom.bin

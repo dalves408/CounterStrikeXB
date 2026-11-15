@@ -580,3 +580,13 @@ David's report on 0.9.5: buy menu dark or missing, team select not right, the A/
 - Office crashed on load: the guest heap (47 MB, 0x01090000-0x04000000) ran out at 49.4 MB, a NULL allocation was written through, the main thread's TIB at 0x4000 was overwritten and XAPI's SetLastError faulted on fs:[4] = 0. main.c now calls xbox_SetMapSize(128 MB): the heap runs to 0x08000000 (111 MB) while the game still sees a 64 MB console. Office and Inferno both load and play.
 - The game also opens t:\$u\contentmeta.xbx (the title update's own package; absent here). Look at it when Insignia comes up.
 - Test build 0.9.10 on champ and hpvictus.
+
+## Insignia groundwork (2026-11-14)
+- David's console is registered with Insignia. Each player supplies their own console's EEPROM (never in git: /eeprom/ and *.eeprom are ignored). David's: factory and user checksums valid.
+- Toolkit patch 0029 (pin 8ef7989, reproduced):
+  - console_id.c: eeprom.bin (RECOMP_XBOX_EEPROM, used only when both checksums are right) answers the factory queries (serial, MAC, online key, AV/game region) and the block reads XNet makes (XC_MAX_FACTORY, XC_ENCRYPTED_SECTION, XC_MAX_ALL with this runtime's user settings and a fresh checksum); the NIC's MAC comes from it. XboxHDKey from RECOMP_XBOX_HDKEY, or decrypted from the EEPROM with the player's BIOS EEPROM key (RECOMP_XBOX_EEPROM_KEY); Microsoft's key is not in the project. Nothing secret is logged.
+  - nvnet_nat.c: a router at 10.0.0.1. DHCP now hands out 10.x.y.z/8 from the MAC with Insignia's DNS (46.101.64.175, then 1.1.1.1; RECOMP_NET_DNS). UDP relayed through host sockets (same port when free), IP fragments both ways, ARP/ping for the router; TCP refused for now. Frames to other consoles still take the system link (re-tested: two instances host and join).
+  - RtlNtStatusToDosError: facility-7 statuses map to their low word. XboxKrnlVersion 1.0.5838.1 (retail; RECOMP_XBOX_KERNEL_BUILD).
+- Game: eeprom.bin in %LOCALAPPDATA%\CounterStrikeXB and settings.ini [insignia] hdd_key= are passed to the toolkit.
+- Verified: David's identity loads; Xbox Live > Sign-In shows only "New Account" (no account on the drive yet), and no Xbox Live traffic happens before an account exists.
+- Next: the HDD key (from the player), and an Xbox Live account on the emulated drive (partition 0 sectors 8+). Creating or recovering one is the dashboard's job; the CS disc's dashupdate.xbe carries the online dashboard.

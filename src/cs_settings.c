@@ -108,6 +108,21 @@ void cs_settings_startup(void)
     if (!getenv("RECOMP_KEYMAP") && cs_settings_path("keymap.ini", path, sizeof path, 0)
         && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
         _putenv_s("RECOMP_KEYMAP", path);
+    /* Xbox Live (Insignia) identity: the player's own console's EEPROM, copied
+     * to eeprom.bin in the data folder (the configurator does it), and the
+     * console's hard-drive key, [insignia] hdd_key= in settings.ini. The
+     * toolkit's console_id.c checks and uses them; neither is ever logged. */
+    if (!getenv("RECOMP_XBOX_EEPROM") && cs_settings_path("eeprom.bin", path, sizeof path, 0)
+        && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        _putenv_s("RECOMP_XBOX_EEPROM", path);
+    if (!getenv("RECOMP_XBOX_HDKEY")) {
+        char ini[MAX_PATH], key[80];
+        if (cs_settings_path("settings.ini", ini, sizeof ini, 0)) {
+            GetPrivateProfileStringA("insignia", "hdd_key", "", key, sizeof key, ini);
+            if (key[0]) _putenv_s("RECOMP_XBOX_HDKEY", key);
+            SecureZeroMemory(key, sizeof key);
+        }
+    }
     /* [network] peers=host[,host...]: system link partners the LAN broadcast
      * does not reach (another subnet, a VPN such as Tailscale). The toolkit's
      * NIC link sends each frame to them too (nvnet_link.c). */

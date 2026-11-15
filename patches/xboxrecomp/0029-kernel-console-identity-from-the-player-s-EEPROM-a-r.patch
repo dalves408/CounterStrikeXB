@@ -1,0 +1,895 @@
+From 8ef798995cedf2ddefe3eb616a26856f82590411 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel: console identity from the player's EEPROM; a router
+ behind the NIC (CounterStrikeXB2 local patch)
+
+console_id.c loads the player's eeprom.bin (checksums checked) for the factory EEPROM queries and the whole-EEPROM block reads XNet makes, the NIC's MAC, and XboxHDKey from RECOMP_XBOX_HDKEY or decrypted with the player's BIOS EEPROM key; nothing secret is logged. nvnet_nat.c is a router at 10.0.0.1: the NIC's DHCP hands out 10.x.y.z/8, Insignia's DNS first; UDP is relayed through host sockets (same port when free), IP fragments both ways, ARP and ping for the router; TCP is refused for now. Frames to other consoles still take the system link. RtlNtStatusToDosError maps facility-7 statuses to their low word (XOnline waits on ERROR_IO_PENDING). XboxKrnlVersion reports the retail 1.0.5838.1.
+---
+ src/kernel/CMakeLists.txt  |   2 +
+ src/kernel/console_id.c    | 155 ++++++++++++++++
+ src/kernel/console_id.h    |  42 +++++
+ src/kernel/kernel_bridge.c |  29 ++-
+ src/kernel/kernel_xbox.c   |  58 +++++-
+ src/kernel/nvnet.c         |  42 ++++-
+ src/kernel/nvnet_nat.c     | 367 +++++++++++++++++++++++++++++++++++++
+ src/kernel/nvnet_nat.h     |  26 +++
+ 8 files changed, 710 insertions(+), 11 deletions(-)
+ create mode 100644 src/kernel/console_id.c
+ create mode 100644 src/kernel/console_id.h
+ create mode 100644 src/kernel/nvnet_nat.c
+ create mode 100644 src/kernel/nvnet_nat.h
+
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 9d7dc7d..52caa7e 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -33,6 +33,8 @@ set(KERNEL_SOURCES
+     nv2a_combiner.c
+     nvnet.c
+     nvnet_link.c
++    console_id.c
++    nvnet_nat.c
+ )
+ 
+ add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+diff --git a/src/kernel/console_id.c b/src/kernel/console_id.c
+new file mode 100644
+index 0000000..6838557
+--- /dev/null
++++ b/src/kernel/console_id.c
+@@ -0,0 +1,155 @@
++/*
++ * console_id.c -- see console_id.h.
++ *
++ * EEPROM layout (256 bytes):
++ *   0x00 HMAC-SHA1 of the decrypted 0x14..0x2F, under the BIOS's EEPROM key
++ *   0x14 confounder (8), 0x1C hard-drive key (16), 0x2C game region (4):
++ *        RC4-encrypted, key = HMAC-SHA1(EEPROM key, the 20-byte hash)
++ *   0x30 factory checksum over 0x34..0x5F
++ *   0x34 serial number (12 ASCII digits), 0x40 Ethernet address (6),
++ *   0x48 online key (16), 0x58 AV region (video standard)
++ *   0x60 user checksum over 0x64..0xBF, then the user settings
++ */
++#include "console_id.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#if defined(_WIN32)
++#include <windows.h>
++#include <bcrypt.h>
++#pragma comment(lib, "bcrypt.lib")
++#endif
++
++static int s_done, s_have_eeprom, s_have_hdkey;
++static uint8_t s_eeprom[256], s_hdkey[16];
++static uint32_t s_game_region;
++
++uint32_t xbox_EepromChecksum(const uint8_t *p, unsigned bytes)
++{
++    uint32_t high = 0, low = 0;
++    unsigned i;
++    for (i = 0; i + 4 <= bytes; i += 4) {
++        uint64_t sum = ((uint64_t)high << 32 | low) + ((uint32_t)p[i] | (uint32_t)p[i + 1] << 8 |
++                                                     (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24);
++        high = (uint32_t)(sum >> 32);
++        low = (uint32_t)sum;
++    }
++    return ~(high + low);
++}
++
++static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++
++static int hex16(const char *s, uint8_t out[16])
++{
++    int i = 0;
++    while (s && *s && i < 32) {
++        int c = *s++, v;
++        if (c == ' ' || c == '-' || c == ':') continue;
++        if (c >= '0' && c <= '9') v = c - '0';
++        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
++        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
++        else return 0;
++        if (i & 1) out[i / 2] |= (uint8_t)v; else out[i / 2] = (uint8_t)(v << 4);
++        i++;
++    }
++    return i == 32;
++}
++
++#if defined(_WIN32)
++static int hmac_sha1(const uint8_t *key, unsigned klen, const uint8_t *d, unsigned n, uint8_t out[20])
++{
++    BCRYPT_ALG_HANDLE alg;
++    NTSTATUS st;
++    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG))
++        return 0;
++    st = BCryptHash(alg, (PUCHAR)key, klen, (PUCHAR)d, n, out, 20);
++    BCryptCloseAlgorithmProvider(alg, 0);
++    return st == 0;
++}
++
++static void rc4(const uint8_t *key, unsigned klen, uint8_t *d, unsigned n)
++{
++    uint8_t s[256], t;
++    unsigned i, j = 0, k;
++    for (i = 0; i < 256; i++) s[i] = (uint8_t)i;
++    for (i = 0; i < 256; i++) { j = (j + s[i] + key[i % klen]) & 255; t = s[i]; s[i] = s[j]; s[j] = t; }
++    i = j = 0;
++    for (k = 0; k < n; k++) {
++        i = (i + 1) & 255; j = (j + s[i]) & 255;
++        t = s[i]; s[i] = s[j]; s[j] = t;
++        d[k] ^= s[(s[i] + s[j]) & 255];
++    }
++}
++
++/* The encrypted section, with the BIOS's EEPROM key the player supplied. */
++static int decrypt_section(const uint8_t key[16])
++{
++    uint8_t rkey[20], sec[28], check[20];
++    if (!hmac_sha1(key, 16, s_eeprom, 20, rkey))
++        return 0;
++    memcpy(sec, s_eeprom + 0x14, sizeof sec);
++    rc4(rkey, 20, sec, sizeof sec);
++    if (!hmac_sha1(key, 16, sec, sizeof sec, check) || memcmp(check, s_eeprom, 20))
++        return 0;
++    memcpy(s_hdkey, sec + 8, 16);
++    s_game_region = rd32(sec + 24);
++    return 1;
++}
++#else
++static int decrypt_section(const uint8_t key[16]) { (void)key; return 0; }
++#endif
++
++void xbox_ConsoleIdInit(void)
++{
++    const char *path, *v;
++    FILE *f;
++    if (s_done) return;
++    s_done = 1;
++
++    path = getenv("RECOMP_XBOX_EEPROM");
++    if (path && *path && (f = fopen(path, "rb")) != NULL) {
++        size_t n = fread(s_eeprom, 1, sizeof s_eeprom, f);
++        fclose(f);
++        if (n != sizeof s_eeprom)
++            fprintf(stderr, "  [CONSOLE] eeprom.bin is %u bytes, not 256: not used\n", (unsigned)n);
++        else if (xbox_EepromChecksum(s_eeprom + 0x34, 0x2C) != rd32(s_eeprom + 0x30) ||
++                 xbox_EepromChecksum(s_eeprom + 0x64, 0x5C) != rd32(s_eeprom + 0x60))
++            fprintf(stderr, "  [CONSOLE] eeprom.bin checksums are wrong: not used\n");
++        else
++            s_have_eeprom = 1;
++    } else if (path && *path) {
++        fprintf(stderr, "  [CONSOLE] cannot open the EEPROM file\n");
++    }
++
++    if ((v = getenv("RECOMP_XBOX_HDKEY")) != NULL && *v) {
++        if (hex16(v, s_hdkey)) s_have_hdkey = 1;
++        else fprintf(stderr, "  [CONSOLE] RECOMP_XBOX_HDKEY is not 32 hex digits: not used\n");
++    }
++    if (!s_have_hdkey && s_have_eeprom && (v = getenv("RECOMP_XBOX_EEPROM_KEY")) != NULL && *v) {
++        uint8_t k[16];
++        if (!hex16(v, k))
++            fprintf(stderr, "  [CONSOLE] RECOMP_XBOX_EEPROM_KEY is not 32 hex digits: not used\n");
++        else if (decrypt_section(k))
++            s_have_hdkey = 1;
++        else
++            fprintf(stderr, "  [CONSOLE] the EEPROM key does not decrypt this EEPROM\n");
++        memset(k, 0, sizeof k);
++    }
++    fprintf(stderr, "  [CONSOLE] identity: %s, hard-drive key %s\n",
++            s_have_eeprom ? "the player's EEPROM" : "none (no EEPROM)",
++            s_have_hdkey ? (getenv("RECOMP_XBOX_HDKEY") ? "given" : "decrypted from the EEPROM") : "none");
++}
++
++int xbox_ConsoleHasEeprom(void) { xbox_ConsoleIdInit(); return s_have_eeprom; }
++const uint8_t *xbox_ConsoleEeprom(void) { xbox_ConsoleIdInit(); return s_eeprom; }
++uint32_t xbox_ConsoleGameRegion(void) { xbox_ConsoleIdInit(); return s_game_region; }
++
++int xbox_ConsoleHdKey(uint8_t out[16])
++{
++    xbox_ConsoleIdInit();
++    if (!s_have_hdkey) return 0;
++    memcpy(out, s_hdkey, 16);
++    return 1;
++}
+diff --git a/src/kernel/console_id.h b/src/kernel/console_id.h
+new file mode 100644
+index 0000000..3d0e6f7
+--- /dev/null
++++ b/src/kernel/console_id.h
+@@ -0,0 +1,42 @@
++/*
++ * console_id.h -- the player's own console identity, for Xbox Live (Insignia).
++ *
++ * Xbox Live knows a console by its EEPROM: the factory section (serial number,
++ * Ethernet address, online key, AV region) and the hard-drive key in its
++ * encrypted section, which also signs the accounts stored on the drive. A
++ * player supplies their own console's eeprom.bin; nothing here invents one.
++ *
++ *   RECOMP_XBOX_EEPROM      path of eeprom.bin (256 bytes; used only when the
++ *                           factory and user checksums are right)
++ *   RECOMP_XBOX_HDKEY       the hard-drive key, 32 hex digits, as console tools
++ *                           show it (EvoX hddinfo.txt, UnleashX, ...)
++ *   RECOMP_XBOX_EEPROM_KEY  or: the console BIOS's EEPROM key, 32 hex digits,
++ *                           to decrypt the hard-drive key from the EEPROM
++ *
++ * Without an EEPROM every query answers as before. Keys, serials and addresses
++ * are never logged.
++ */
++#ifndef CONSOLE_ID_H
++#define CONSOLE_ID_H
++
++#include <stdint.h>
++
++/* Load and check what the environment names. Safe to call more than once. */
++void xbox_ConsoleIdInit(void);
++
++/* 1 when a valid eeprom.bin is loaded. */
++int xbox_ConsoleHasEeprom(void);
++
++/* The 256 EEPROM bytes (valid only when xbox_ConsoleHasEeprom). */
++const uint8_t *xbox_ConsoleEeprom(void);
++
++/* The hard-drive key: 1 and out filled when one is known. */
++int xbox_ConsoleHdKey(uint8_t out[16]);
++
++/* The game region from the encrypted section (0 when not decrypted). */
++uint32_t xbox_ConsoleGameRegion(void);
++
++/* The EEPROM checksum: ~(high + low) of the 64-bit sum of the dwords. */
++uint32_t xbox_EepromChecksum(const uint8_t *p, unsigned bytes);
++
++#endif
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 0e7bd22..15e69c6 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -28,6 +28,7 @@
+ #include "kernel.h"
+ #include "guest_vmem.h"
+ #include "kernel_missing.h"
++#include "console_id.h"
+ #include "xbox_memory_layout.h"
+ #include "platform/host_time.h"
+ #include "recomp_icall_feedback.h"
+@@ -213,13 +214,17 @@ static void kernel_data_init(void)
+     /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
+      *   +0: USHORT Major (1)
+      *   +2: USHORT Minor (0)
+-     *   +4: USHORT Build (5849 = XDK version)
+-     *   +6: USHORT Qfe (0)
++     *   +4: USHORT Build
++     *   +6: USHORT Qfe
++     * 1.0.5838.1, the retail kernel most consoles run (and the one Xbox Live
++     * services see from them); 5849 was an SDK build no retail console had.
++     * RECOMP_XBOX_KERNEL_BUILD overrides the build number.
+      */
+     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
+     BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
+-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
+-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
++    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) =
++        (uint16_t)(getenv("RECOMP_XBOX_KERNEL_BUILD") ? atoi(getenv("RECOMP_XBOX_KERNEL_BUILD")) : 5838);
++    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 1;
+ 
+     /* KeTickCount (ordinal 156) - initialized to current tick count.
+      * A background thread in main.c updates this every ~1ms. */
+@@ -316,8 +321,11 @@ static void kernel_data_init(void)
+     /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
+     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
+ 
+-    /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
++    /* XboxHDKey (ordinal 323) - the player's console's key when one is given
++     * (console_id.c), else 16 bytes of zeros. It signs the Xbox Live accounts
++     * and downloaded content on the drive. */
+     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
++    xbox_ConsoleHdKey((uint8_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset));
+ 
+     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
+     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
+@@ -4055,7 +4063,16 @@ static void bridge_RtlNtStatusToDosError(void)
+      * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
+     case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
+ 
+-    default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
++    default:
++        /* A Win32 error wrapped as a status (facility 7, 0x8007xxxx /
++         * 0xC007xxxx): its low word, as NT does. XNet reports "would block"
++         * as 0x800703E5, and XOnline waits on 997 (ERROR_IO_PENDING) for an
++         * Xbox Live reply; with 317 it gave up before the reply came. */
++        if (((status >> 16) & 0x0FFFu) == 7u)
++            g_eax = status & 0xFFFFu;
++        else
++            g_eax = 317;                         /* ERROR_MR_MID_NOT_FOUND (generic) */
++        break;
+     }
+ }
+ 
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index 7594828..f7548a2 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -11,6 +11,7 @@
+ 
+ #include "kernel.h"
+ #include "nvnet.h"
++#include "console_id.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -37,7 +38,7 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
+ XBOX_KRNL_VERSION xbox_KrnlVersion = {
+     .Major = 1,
+     .Minor = 0,
+-    .Build = 5849,
++    .Build = 5838,
+     .Qfe   = 1
+ };
+ 
+@@ -336,6 +337,61 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+         }
+         break;
+ 
++    /* The factory section and the block reads, from the player's own EEPROM
++     * (console_id.c): Xbox Live identifies a console by them. XNet reads the
++     * whole EEPROM (XC_MAX_ALL) at start-up for its identity. Without an
++     * EEPROM these fall to the default below as before. */
++    case 0x100:     /* XC_FACTORY_SERIAL_NUMBER */
++    case 0x102:     /* XC_FACTORY_ONLINE_KEY */
++    case 0x103:     /* XC_FACTORY_AV_REGION */
++    case 0x104:     /* XC_FACTORY_GAME_REGION */
++    case 0x1FF:     /* XC_MAX_FACTORY */
++    case 0xFFFE:    /* XC_ENCRYPTED_SECTION */
++    case 0xFFFF:    /* XC_MAX_ALL */
++        if (xbox_ConsoleHasEeprom()) {
++            const uint8_t *ee = xbox_ConsoleEeprom();
++            uint8_t all[256];
++            const uint8_t *src = NULL;
++            ULONG need = 0, type = 3;
++            uint32_t region;
++            switch (ValueIndex) {
++            case 0x100: src = ee + 0x34; need = 12; break;
++            case 0x102: src = ee + 0x48; need = 16; break;
++            case 0x103: src = ee + 0x58; need = 4; type = 4; break;
++            case 0x104:
++                region = xbox_ConsoleGameRegion();
++                if (!region) region = 1;                 /* North America, the disc's */
++                memcpy(all, &region, 4); src = all; need = 4; type = 4;
++                break;
++            case 0x1FF: src = ee + 0x30; need = 0x30; break;
++            case 0xFFFE: src = ee; need = 0x30; break;
++            default: {
++                /* the EEPROM with this runtime's user settings over 0x60..0xBF */
++                ULONG rl = 0;
++                memcpy(all, ee, 256);
++                if (xbox_ExQueryNonVolatileSetting(XC_MAX_OS, NULL, all + 0x60, 0x60, &rl) == STATUS_SUCCESS) {
++                    uint32_t c = xbox_EepromChecksum(all + 0x64, 0x5C);
++                    memcpy(all + 0x60, &c, 4);
++                }
++                src = all; need = 256;
++                break;
++            }
++            }
++            if (Type) *Type = type;
++            if (ResultLength) *ResultLength = need;
++            if (ValueLength < need)
++                return 0xC0000023L;                      /* STATUS_BUFFER_TOO_SMALL */
++            memcpy(Value, src, need);
++            break;
++        }
++        /* no EEPROM: as before */
++        xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
++            "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
++        memset(Value, 0, ValueLength);
++        if (Type) *Type = 4;
++        if (ResultLength) *ResultLength = ValueLength;
++        break;
++
+     default:
+         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
+             "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);
+diff --git a/src/kernel/nvnet.c b/src/kernel/nvnet.c
+index ad1252c..1542c28 100644
+--- a/src/kernel/nvnet.c
++++ b/src/kernel/nvnet.c
+@@ -17,6 +17,8 @@
+  */
+ #include "nvnet.h"
+ #include "nvnet_link.h"
++#include "console_id.h"
++#include "nvnet_nat.h"
+ #include "../platform/mmio_decode.h"
+ #include "xbox_memory_layout.h"
+ #include "kernel.h"
+@@ -179,6 +181,10 @@ void xbox_ConsoleMac(uint8_t mac[6])
+         for (i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
+         return;
+     }
++    if (xbox_ConsoleHasEeprom()) {          /* the player's console's (console_id.c) */
++        memcpy(mac, xbox_ConsoleEeprom() + 0x40, 6);
++        return;
++    }
+     {
+         char name[256];
+         DWORD n = sizeof name;
+@@ -282,8 +288,15 @@ static int dhcp_answer(const uint8_t *f, int len)
+     }
+     if (type != 1 && type != 3)             /* DISCOVER, REQUEST */
+         return type != 0;                   /* other DHCP: swallow */
+-    yi[0] = 169; yi[1] = 254;
+-    yi[2] = (uint8_t)(1 + s_mac[4] % 253); yi[3] = (uint8_t)(1 + (s_mac[5] ^ s_mac[3]) % 253);
++    if (nat_enabled()) {
++        /* behind the router (nvnet_nat.c): 10.x.y.z/8 from the MAC, every
++         * console on one subnet for system link, 10.0.0.1 the way out */
++        yi[0] = 10; yi[1] = s_mac[3]; yi[2] = s_mac[4]; yi[3] = (uint8_t)(2 + s_mac[5] % 252);
++        sv[0] = 10; sv[1] = 0; sv[2] = 0; sv[3] = 1;
++    } else {
++        yi[0] = 169; yi[1] = 254;
++        yi[2] = (uint8_t)(1 + s_mac[4] % 253); yi[3] = (uint8_t)(1 + (s_mac[5] ^ s_mac[3]) % 253);
++    }
+ 
+     memset(r, 0, sizeof r);
+     memset(r, 0xFF, 6); memcpy(r + 6, srv_mac, 6); r[12] = 0x08; r[13] = 0x00;
+@@ -299,7 +312,18 @@ static int dhcp_answer(const uint8_t *f, int len)
+     *o++ = 53; *o++ = 1; *o++ = (uint8_t)(type == 1 ? 2 : 5);   /* OFFER / ACK */
+     *o++ = 54; *o++ = 4; memcpy(o, sv, 4); o += 4;
+     *o++ = 51; *o++ = 4; *o++ = 0xFF; *o++ = 0xFF; *o++ = 0xFF; *o++ = 0xFF;
+-    *o++ = 1;  *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 0; *o++ = 0;
++    if (nat_enabled()) {
++        uint32_t dns[2];
++        int nd = nat_dns_servers(dns), k;
++        *o++ = 1; *o++ = 4; *o++ = 255; *o++ = 0; *o++ = 0; *o++ = 0;          /* 255.0.0.0 */
++        *o++ = 3; *o++ = 4; memcpy(o, sv, 4); o += 4;                         /* router */
++        if (nd) {
++            *o++ = 6; *o++ = (uint8_t)(4 * nd);                               /* DNS */
++            for (k = 0; k < nd; k++) { memcpy(o, &dns[k], 4); o += 4; }
++        }
++    } else {
++        *o++ = 1;  *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 0; *o++ = 0;
++    }
+     *o++ = 255;
+     blen = (int)(o - rb);
+     if (blen < 300) blen = 300;
+@@ -322,6 +346,15 @@ static int dhcp_answer(const uint8_t *f, int len)
+ 
+ static int s_dhcp_local = 1;
+ 
++/* A frame from the router (nvnet_nat.c) for the console: into the receive
++ * queue. The lock is the NIC's; a transmit already holding it re-enters. */
++static void nic_inject(const uint8_t *f, int len)
++{
++    EnterCriticalSection(&s_lock);
++    rxq_push(f, len);
++    LeaveCriticalSection(&s_lock);
++}
++
+ static void tx_kick(void)
+ {
+     uint32_t n = ring_entries(1), i;
+@@ -357,7 +390,7 @@ static void tx_kick(void)
+                 frame_desc(s_txbuf, s_txlen, dsc, sizeof dsc);
+                 fprintf(stderr, "  [NVNET] tx %s\n", dsc);
+             }
+-            if (!(s_dhcp_local && dhcp_answer(s_txbuf, s_txlen)))
++            if (!(s_dhcp_local && dhcp_answer(s_txbuf, s_txlen)) && !nat_from_console(s_txbuf, s_txlen))
+                 nvlink_send(s_txbuf, s_txlen);
+             s_tx_frames++;
+             s_txlen = 0;
+@@ -707,6 +740,7 @@ void xbox_NvnetInit(void)
+         }
+     }
+     s_enabled = 1;
++    nat_init(nic_inject);
+     if (nvlink_open(s_mac) != 0)
+         fprintf(stderr, "  [NVNET] no network link; the NIC sends nowhere\n");
+     fprintf(stderr, "  [NVNET] NIC at 0x%08X, MAC %02X:%02X:%02X:%02X:%02X:%02X\n", NIC_BASE,
+diff --git a/src/kernel/nvnet_nat.c b/src/kernel/nvnet_nat.c
+new file mode 100644
+index 0000000..54d19cf
+--- /dev/null
++++ b/src/kernel/nvnet_nat.c
+@@ -0,0 +1,367 @@
++/*
++ * nvnet_nat.c -- a small router behind the NIC model (nvnet.c): the
++ * console's way to the internet, for Xbox Live on Insignia.
++ *
++ * The NIC's DHCP answer puts the console at 10.x.y.z/8 with this router at
++ * 10.0.0.1 and Insignia's DNS server first. Frames the console addresses to
++ * the router's MAC come here; everything else still goes out on the system
++ * link (nvnet_link.c), so system link and Xbox Live work side by side.
++ *
++ *   ARP for 10.0.0.1          answered here
++ *   ICMP echo to 10.0.0.1     answered here
++ *   UDP to anywhere           one host socket per console port, bound to the
++ *                             same port when it is free (3074 leaves as 3074);
++ *                             replies from any host come back (endpoint-
++ *                             independent mapping, which XNet's NAT test likes)
++ *   IP fragments              reassembled on the way out, made on the way in
++ *   TCP                       refused with a reset for now (logged), so a
++ *                             connect fails at once instead of timing out
++ *
++ * Xbox Live's sign-in (Kerberos, UDP 88) and its security gateway (UDP 3074)
++ * are UDP. RECOMP_NET_NAT=0 turns the router off; RECOMP_NET_DNS sets the DNS
++ * servers (comma-separated; default 46.101.64.175, Insignia's, then 1.1.1.1).
++ * The log names the first DNS lookups and the first host each way, never
++ * payloads.
++ */
++#include "nvnet_nat.h"
++
++#if defined(_WIN32)
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++const uint8_t g_nat_router_mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
++
++#define MAX_UDP     64
++#define UDP_IDLE_MS 300000u
++#define MTU         1500
++
++typedef struct {
++    SOCKET s;
++    uint16_t cport;         /* the console's source port */
++    DWORD used;
++} UdpMap;
++
++typedef struct {            /* one datagram being reassembled */
++    uint32_t src, dst;
++    uint16_t id;
++    uint8_t proto;
++    int have, total;        /* bytes held, total once the last fragment came */
++    DWORD started;
++    uint8_t got[8192 / 8];  /* which 8-byte units arrived */
++    uint8_t data[8192];
++} Frag;
++
++static int s_on = -1;
++static void (*s_inject)(const uint8_t *frame, int len);
++static CRITICAL_SECTION s_lock;
++static UdpMap s_udp[MAX_UDP];
++static Frag s_frag;
++static uint8_t s_console_mac[6];
++static uint32_t s_console_ip;           /* host order, learned from its frames */
++static uint32_t s_dns[2];               /* network order */
++static int s_ndns;
++static uint16_t s_ip_id = 1;
++static unsigned s_log_dns, s_log_hosts, s_log_tcp;
++static unsigned long s_out, s_in;
++
++static uint16_t csum(const uint8_t *p, int n, uint32_t s)
++{
++    int i;
++    for (i = 0; i + 1 < n; i += 2) s += (uint32_t)(p[i] << 8 | p[i + 1]);
++    if (n & 1) s += (uint32_t)p[n - 1] << 8;
++    while (s >> 16) s = (s & 0xFFFFu) + (s >> 16);
++    return (uint16_t)~s;
++}
++
++static void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++static uint32_t get32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
++
++static void ipstr(uint32_t ip, char *out) { sprintf(out, "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255); }
++
++/* An IPv4 packet to the console, split into fragments when it does not fit. */
++static void send_ip(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *payload, int plen)
++{
++    uint8_t f[14 + MTU];
++    int off = 0;
++    uint16_t id = s_ip_id++;
++    do {
++        int room = MTU - 20, n = plen - off, more = 0;
++        if (n > room) { n = room & ~7; more = 1; }
++        memcpy(f, s_console_mac, 6);
++        memcpy(f + 6, g_nat_router_mac, 6);
++        f[12] = 0x08; f[13] = 0x00;
++        memset(f + 14, 0, 20);
++        f[14] = 0x45;
++        put16(f + 16, (uint32_t)(20 + n));
++        put16(f + 18, id);
++        put16(f + 20, (uint32_t)((more ? 0x2000 : 0) | (off / 8)));
++        f[22] = 64; f[23] = proto;
++        put32(f + 26, src); put32(f + 30, dst);
++        put16(f + 24, csum(f + 14, 20, 0));
++        memcpy(f + 34, payload + off, (size_t)n);
++        s_inject(f, 14 + 20 + n);
++        off += n;
++    } while (off < plen);
++}
++
++static void arp_reply(const uint8_t *req)
++{
++    uint8_t f[42];
++    memcpy(f, req + 6, 6);
++    memcpy(f + 6, g_nat_router_mac, 6);
++    f[12] = 0x08; f[13] = 0x06;
++    put16(f + 14, 1); put16(f + 16, 0x0800); f[18] = 6; f[19] = 4; put16(f + 20, 2);
++    memcpy(f + 22, g_nat_router_mac, 6);
++    put32(f + 28, NAT_ROUTER_IP);
++    memcpy(f + 32, req + 22, 10);                       /* the asker's MAC and IP */
++    s_inject(f, 42);
++}
++
++static UdpMap *udp_for(uint16_t cport)
++{
++    int i, free_i = -1;
++    DWORD now = GetTickCount();
++    for (i = 0; i < MAX_UDP; i++) {
++        if (s_udp[i].s != INVALID_SOCKET && s_udp[i].cport == cport) { s_udp[i].used = now; return &s_udp[i]; }
++        if (s_udp[i].s != INVALID_SOCKET && now - s_udp[i].used > UDP_IDLE_MS) {
++            closesocket(s_udp[i].s); s_udp[i].s = INVALID_SOCKET;
++        }
++        if (s_udp[i].s == INVALID_SOCKET && free_i < 0) free_i = i;
++    }
++    if (free_i < 0) return NULL;
++    {
++        SOCKET s = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT);
++        struct sockaddr_in a;
++        u_long nb = 1;
++        if (s == INVALID_SOCKET) return NULL;
++        memset(&a, 0, sizeof a);
++        a.sin_family = AF_INET;
++        a.sin_port = htons(cport);
++        if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) {       /* the same port, else any */
++            a.sin_port = 0;
++            bind(s, (struct sockaddr *)&a, sizeof a);
++        }
++        ioctlsocket(s, FIONBIO, &nb);
++        s_udp[free_i].s = s;
++        s_udp[free_i].cport = cport;
++        s_udp[free_i].used = now;
++        {
++            int len = sizeof a;
++            getsockname(s, (struct sockaddr *)&a, &len);
++            fprintf(stderr, "  [NAT] console UDP port %u -> host port %u\n", cport, ntohs(a.sin_port));
++        }
++        return &s_udp[free_i];
++    }
++}
++
++static void log_dns(const uint8_t *q, int n)
++{
++    char name[128];
++    int i = 12, k = 0;
++    if (n < 13 || s_log_dns >= 48) return;
++    while (i < n && q[i] && k < (int)sizeof name - 2) {
++        int l = q[i++];
++        if (k) name[k++] = '.';
++        while (l-- > 0 && i < n && k < (int)sizeof name - 1) name[k++] = (char)q[i++];
++    }
++    name[k] = 0;
++    s_log_dns++;
++    fprintf(stderr, "  [NAT] DNS lookup: %s\n", name);
++}
++
++/* One whole IPv4 packet from the console, for the router or beyond it. */
++static void ip_out(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *p, int n)
++{
++    char a[20];
++    s_console_ip = src;
++    if (proto == 1 && dst == NAT_ROUTER_IP && n >= 8 && p[0] == 8) {      /* ping the router */
++        uint8_t r[MTU];
++        if (n > (int)sizeof r) return;
++        memcpy(r, p, (size_t)n);
++        r[0] = 0; r[2] = r[3] = 0;
++        put16(r + 2, csum(r, n, 0));
++        send_ip(NAT_ROUTER_IP, src, 1, r, n);
++        return;
++    }
++    if (proto == 17 && n >= 8) {
++        uint16_t sp = get16(p), dp = get16(p + 2);
++        UdpMap *m;
++        struct sockaddr_in to;
++        if (dst == NAT_ROUTER_IP) return;
++        if (dp == 53) log_dns(p + 8, n - 8);
++        if (!(m = udp_for(sp))) return;
++        memset(&to, 0, sizeof to);
++        to.sin_family = AF_INET;
++        to.sin_addr.s_addr = htonl(dst);
++        to.sin_port = htons(dp);
++        sendto(m->s, (const char *)p + 8, n - 8, 0, (struct sockaddr *)&to, sizeof to);
++        s_out++;
++        if (s_log_hosts < 24 && dp != 53) { s_log_hosts++; ipstr(dst, a); fprintf(stderr, "  [NAT] UDP %u -> %s:%u (%d bytes)\n", sp, a, dp, n - 8); }
++        return;
++    }
++    if (proto == 6 && n >= 20) {                                          /* TCP: refuse */
++        uint8_t r[20];
++        uint32_t seq = get32(p + 4), ack = get32(p + 8);
++        uint8_t fl = p[13];
++        uint8_t ph[12];
++        uint32_t s = 0;
++        int i;
++        if (fl & 0x04) return;                                            /* no reset for a reset */
++        if (s_log_tcp < 12) { s_log_tcp++; ipstr(dst, a); fprintf(stderr, "  [NAT] TCP %u -> %s:%u refused (no TCP relay yet)\n", get16(p), a, get16(p + 2)); }
++        memset(r, 0, sizeof r);
++        put16(r, get16(p + 2)); put16(r + 2, get16(p));
++        if (fl & 0x10) { put32(r + 4, ack); r[13] = 0x04; }
++        else { put32(r + 8, seq + 1 + (uint32_t)((n - (p[12] >> 4) * 4) > 0 ? (n - (p[12] >> 4) * 4) : 0)); r[13] = 0x14; }
++        r[12] = 5 << 4;
++        put32(ph, dst); put32(ph + 4, src); ph[8] = 0; ph[9] = 6; put16(ph + 10, 20);
++        for (i = 0; i < 12; i += 2) s += (uint32_t)(ph[i] << 8 | ph[i + 1]);
++        put16(r + 16, csum(r, 20, s));
++        send_ip(dst, src, 6, r, 20);
++    }
++}
++
++int nat_from_console(const uint8_t *f, int len)
++{
++    const uint8_t *ip;
++    int ihl, tot, off;
++    uint32_t src, dst;
++    if (!nat_enabled() || len < 14) return 0;
++    if (f[12] == 0x08 && f[13] == 0x06 && len >= 42) {                    /* ARP */
++        if (get16(f + 20) == 1 && get32(f + 38) == NAT_ROUTER_IP) {
++            EnterCriticalSection(&s_lock);
++            memcpy(s_console_mac, f + 6, 6);
++            arp_reply(f);
++            LeaveCriticalSection(&s_lock);
++            return 1;
++        }
++        return 0;
++    }
++    if (memcmp(f, g_nat_router_mac, 6) || f[12] != 0x08 || f[13] != 0x00 || len < 34)
++        return 0;
++    ip = f + 14;
++    ihl = (ip[0] & 15) * 4;
++    tot = get16(ip + 2);
++    if (ihl < 20 || tot < ihl || 14 + tot > len) return 1;
++    src = get32(ip + 12); dst = get32(ip + 16);
++    off = get16(ip + 6);
++    EnterCriticalSection(&s_lock);
++    memcpy(s_console_mac, f + 6, 6);
++    if ((off & 0x3FFF) == 0) {
++        ip_out(src, dst, ip[9], ip + ihl, tot - ihl);
++    } else {                                                              /* a fragment */
++        Frag *g = &s_frag;
++        int fo = (off & 0x1FFF) * 8, n = tot - ihl, k;
++        if (g->id != get16(ip + 4) || g->src != src || g->dst != dst || g->proto != ip[9] ||
++            GetTickCount() - g->started > 5000) {
++            memset(g->got, 0, sizeof g->got);
++            g->id = get16(ip + 4); g->src = src; g->dst = dst; g->proto = ip[9];
++            g->have = 0; g->total = 0; g->started = GetTickCount();
++        }
++        if (fo + n <= (int)sizeof g->data) {
++            memcpy(g->data + fo, ip + ihl, (size_t)n);
++            for (k = fo / 8; k < (fo + n + 7) / 8; k++) if (!g->got[k]) { g->got[k] = 1; g->have += 8; }
++            if (!(off & 0x2000)) g->total = fo + n;
++            if (g->total && g->have >= ((g->total + 7) & ~7)) {
++                ip_out(src, dst, g->proto, g->data, g->total);
++                g->id = 0; g->total = 0;
++            }
++        }
++    }
++    LeaveCriticalSection(&s_lock);
++    return 1;
++}
++
++/* Replies from the internet, into frames for the console. */
++static DWORD WINAPI nat_thread(LPVOID unused)
++{
++    static uint8_t buf[65536 + 8];
++    (void)unused;
++    /* The router's lock is only held to copy the socket list: injecting takes
++     * the NIC's lock, and a transmit holds the NIC's while it calls in here,
++     * so holding both the other way round would deadlock. */
++    for (;;) {
++        fd_set rs;
++        struct timeval tv = { 0, 5000 };
++        SOCKET socks[MAX_UDP];
++        uint16_t cports[MAX_UDP];
++        int i, n = 0;
++        FD_ZERO(&rs);
++        EnterCriticalSection(&s_lock);
++        for (i = 0; i < MAX_UDP; i++)
++            if (s_udp[i].s != INVALID_SOCKET) {
++                socks[n] = s_udp[i].s; cports[n] = s_udp[i].cport;
++                FD_SET(socks[n], &rs); n++;
++            }
++        LeaveCriticalSection(&s_lock);
++        if (!n) { Sleep(5); continue; }
++        if (select(0, &rs, NULL, NULL, &tv) <= 0) continue;
++        for (i = 0; i < n; i++) {
++            struct sockaddr_in from;
++            int fl = sizeof from, got;
++            if (!FD_ISSET(socks[i], &rs)) continue;
++            while ((got = recvfrom(socks[i], (char *)buf + 8, 65536, 0, (struct sockaddr *)&from, &fl)) > 0) {
++                uint32_t rip = ntohl(from.sin_addr.s_addr);
++                if (s_console_ip) {
++                    put16(buf, ntohs(from.sin_port));
++                    put16(buf + 2, cports[i]);
++                    put16(buf + 4, (uint32_t)(8 + got));
++                    buf[6] = buf[7] = 0;                                  /* no UDP checksum */
++                    send_ip(rip, s_console_ip, 17, buf, 8 + got);
++                    s_in++;
++                }
++                fl = sizeof from;
++            }
++        }
++    }
++}
++
++int nat_enabled(void)
++{
++    if (s_on < 0) { const char *e = getenv("RECOMP_NET_NAT"); s_on = !(e && e[0] == '0'); }
++    return s_on && s_inject != NULL;
++}
++
++int nat_dns_servers(uint32_t out[2])
++{
++    int i;
++    for (i = 0; i < s_ndns; i++) out[i] = s_dns[i];
++    return s_ndns;
++}
++
++void nat_init(void (*inject)(const uint8_t *frame, int len))
++{
++    const char *d = getenv("RECOMP_NET_DNS");
++    char buf[256], *tok, *ctx = NULL;
++    int i;
++    if (s_inject) return;
++    {   const char *e = getenv("RECOMP_NET_NAT"); if (e && e[0] == '0') { s_on = 0; return; } }
++    InitializeCriticalSection(&s_lock);
++    for (i = 0; i < MAX_UDP; i++) s_udp[i].s = INVALID_SOCKET;
++    strncpy(buf, d && *d ? d : "46.101.64.175,1.1.1.1", sizeof buf - 1);
++    buf[sizeof buf - 1] = 0;
++    for (tok = strtok_s(buf, ", ", &ctx); tok && s_ndns < 2; tok = strtok_s(NULL, ", ", &ctx)) {
++        struct in_addr a;
++        if (inet_pton(AF_INET, tok, &a) == 1) s_dns[s_ndns++] = a.s_addr;
++    }
++    s_inject = inject;
++    s_on = 1;
++    {
++        HANDLE th = CreateThread(NULL, 0, nat_thread, NULL, 0, NULL);
++        if (th) CloseHandle(th);
++    }
++    fprintf(stderr, "  [NAT] router at 10.0.0.1, %d DNS server(s)\n", s_ndns);
++}
++
++#else
++#include <string.h>
++const uint8_t g_nat_router_mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
++void nat_init(void (*inject)(const uint8_t *frame, int len)) { (void)inject; }
++int  nat_enabled(void) { return 0; }
++int  nat_dns_servers(uint32_t out[2]) { (void)out; return 0; }
++int  nat_from_console(const uint8_t *frame, int len) { (void)frame; (void)len; return 0; }
++#endif
+diff --git a/src/kernel/nvnet_nat.h b/src/kernel/nvnet_nat.h
+new file mode 100644
+index 0000000..3a60447
+--- /dev/null
++++ b/src/kernel/nvnet_nat.h
+@@ -0,0 +1,26 @@
++/* nvnet_nat.h -- the router behind the NIC model: the console's way to the
++ * internet (Xbox Live / Insignia). See nvnet_nat.c. */
++#ifndef NVNET_NAT_H
++#define NVNET_NAT_H
++
++#include <stdint.h>
++
++/* Router and console addressing handed out by the NIC's DHCP answer. */
++#define NAT_ROUTER_IP   0x0A000001u     /* 10.0.0.1 */
++#define NAT_NETMASK     0xFF000000u     /* 255.0.0.0 */
++
++extern const uint8_t g_nat_router_mac[6];
++
++/* Start the router; inject(frame, len) hands a frame to the console (the NIC's
++ * receive queue, taking its own lock). Off unless RECOMP_NET_NAT is not 0. */
++void nat_init(void (*inject)(const uint8_t *frame, int len));
++int  nat_enabled(void);
++
++/* The DNS servers DHCP gives the console (network order, up to 2). */
++int  nat_dns_servers(uint32_t out[2]);
++
++/* A frame the console sent. Returns 1 if the router took it (it was for the
++ * router or the internet), 0 to send it on the system link. */
++int  nat_from_console(const uint8_t *frame, int len);
++
++#endif
+-- 
+2.51.0.windows.2
+
