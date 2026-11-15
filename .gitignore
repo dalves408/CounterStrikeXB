@@ -42,3 +42,5 @@ installer/texture_parts_code.iss
 *.eeprom
 eeprom.bin
 /insignia-setup-assistant/
+# Microsoft's Xbox dashboard (xboxdash.xbe and its data), player-supplied: studied, never committed
+/msdash/
