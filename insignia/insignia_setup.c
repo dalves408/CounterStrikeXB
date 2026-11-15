@@ -518,7 +518,7 @@ static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 430, 196 };
+    RECT r = { 0, 0, 460, 262 };
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = rec_proc;
     wc.hInstance = GetModuleHandleA(NULL);
@@ -531,16 +531,20 @@ static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
                             WS_POPUP | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT,
                             r.right - r.left, r.bottom - r.top, s_main, NULL, wc.hInstance, NULL);
     rec_mk("STATIC", "Sign in to your Web Dashboard at insignia.live and press Reveal to see your account's "
-           "16-digit number. Don't share it: it lets anyone recover your account.", SS_LEFT, 14, 10, 402, 44, 0);
-    rec_mk("STATIC", "Gamertag:", SS_LEFT, 14, 66, 110, 20, 0);
-    s_rec_tag = rec_mk("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, 130, 62, 286, 23, ID_REC_TAG);
-    rec_mk("STATIC", "16-digit number:", SS_LEFT, 14, 102, 110, 20, 0);
-    rec_mk("STATIC", "Paste it as shown (0000-0000-0000-0000): the dashes are dropped.", SS_LEFT, 130, 124, 286, 18, 0);
-    s_rec_num = rec_mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 130, 98, 286, 23, ID_REC_NUM);
+           "16-digit number. Don't share it: it lets anyone recover your account.", SS_LEFT, 14, 10, 432, 44, 0);
+    rec_mk("STATIC", "Gamertag:", SS_LEFT, 14, 66, 120, 20, 0);
+    s_rec_tag = rec_mk("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, 140, 62, 306, 23, ID_REC_TAG);
+    rec_mk("STATIC", "16-digit number:", SS_LEFT, 14, 102, 120, 20, 0);
+    s_rec_num = rec_mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 140, 98, 306, 23, ID_REC_NUM);
+    rec_mk("STATIC", "Paste it as shown (0000-0000-0000-0000): the dashes are dropped.",
+           SS_LEFT, 140, 126, 306, 32, 0);
+    rec_mk("STATIC", "Recover starts Counter-Strike in a small window. Once the game reaches its title screen "
+           "(about half a minute) it signs this console in to Insignia, fetches your account and closes by itself.",
+           SS_LEFT, 14, 164, 432, 44, 0);
     SendMessageA(s_rec_tag, EM_LIMITTEXT, 15, 0);
     SendMessageA(s_rec_num, EM_LIMITTEXT, 32, 0);   /* room for a pasted 0000-0000-0000-0000; trimmed to 16 digits */
-    rec_mk("BUTTON", "Recover", BS_DEFPUSHBUTTON | WS_TABSTOP, 222, 150, 94, 28, ID_REC_OK);
-    rec_mk("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 322, 150, 94, 28, ID_REC_CANCEL);
+    rec_mk("BUTTON", "Recover", BS_DEFPUSHBUTTON | WS_TABSTOP, 252, 222, 94, 28, ID_REC_OK);
+    rec_mk("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 352, 222, 94, 28, ID_REC_CANCEL);
     EnableWindow(s_main, FALSE);
     ShowWindow(s_rec, SW_SHOW);
     SetFocus(s_rec_tag);
@@ -624,7 +628,7 @@ static void recover(void)
     SecureZeroMemory(line, sizeof line);
     SecureZeroMemory(num, sizeof num);
     CloseHandle(pi.hThread);
-    say(s_status, "Recovering your account through Insignia (up to two minutes)...");
+    say(s_status, "Counter-Strike is fetching your account (closes by itself)...");
     EnableWindow(s_main, FALSE);
     {
         DWORD start = GetTickCount();
@@ -675,7 +679,7 @@ static void make_ui(void)
 {
     int y = 12;
     mk("STATIC", "Play Counter-Strike on Xbox Live through Insignia with your own Xbox console's identity and account. "
-       "Your console must already be registered with Insignia (its Setup Assistant), with an Xbox Live account on it.",
+       "Your console must already be registered with Insignia (its Setup Assistant); your account can come from Insignia.",
        SS_LEFT, 16, y, 560, 44, 0);
     y += 56;
     mk("BUTTON", "1. Your console's EEPROM (eeprom.bin)", BS_GROUPBOX, 10, y, 572, 86, 0);
