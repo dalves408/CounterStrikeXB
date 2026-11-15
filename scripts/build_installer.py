@@ -100,12 +100,12 @@ def main():
     iscc = find_iscc()
     print(f'Inno Setup: {iscc}', flush=True)
 
-    for rc in ('cs.rc', 'config.rc'):
+    for rc in ('cs.rc', 'config.rc', 'insignia.rc'):
         set_rc_version(ROOT / 'resources' / rc, args.version)
     if not args.skip_build:
         run('cmake', '-S', ROOT, '-B', BUILD, '-DCS_RELEASE=ON')
         run('cmake', '--build', BUILD, '--config', CONFIG, '-j', '12',
-            '--target', 'cs2_xbox_recomp', 'cs_import', 'config')
+            '--target', 'cs2_xbox_recomp', 'cs_import', 'config', 'insignia_setup')
     # The title update as a patch from the disc's default.xbe (scripts/tu_patch.py): installed beside the
     # game, which applies it when an install still has the disc's file, and used by cs_import.
     run(sys.executable, ROOT / 'scripts' / 'tu_patch.py', 'make', '--out', BUILD / CONFIG / 'cs_tu.xbepatch')

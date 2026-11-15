@@ -1,0 +1,213 @@
+From 04912b302e2b553c9fb488cb96532cdf0e52ec31 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] kernel: ObReferenceObjectByHandle gives event handles a guest
+ object; crypto trace (CounterStrikeXB2 local patch)
+
+Non-thread handles got STATUS_SUCCESS with a NULL object. XNet's DNS lookup references its caller's event this way and dropped every lookup on NULL, so Xbox Live sign-in failed without sending a packet. A handle backed by a host object now gets a 16-byte guest body registered as its KE shadow, so KeSetEvent on it sets the host event (reused per handle). With it, Counter-Strike signs in to Insignia (Kerberos AS/TGS, then the security gateway). RECOMP_XC_TRACE=1 logs each kernel crypto call and EEPROM query by name and length, and whether an HMAC matches a signature stored beside its data; never data or keys.
+---
+ src/kernel/kernel_bridge.c | 38 +++++++++++++++++++++++++++++++++++---
+ src/kernel/kernel_crypto.c | 33 +++++++++++++++++++++++++++++++++
+ src/kernel/kernel_xbox.c   |  3 +++
+ 3 files changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 15e69c6..8089aea 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -5491,9 +5491,41 @@ static void bridge_ObReferenceObjectByHandle(void)
+         g_eax = 0;
+         return;
+     }
+-    /* Other objects still have no guest body. */
+-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+-    g_eax = 0;  /* STATUS_SUCCESS */
++    /* An event (or anything else backed by a host handle): a small guest
++     * body registered as that handle's shadow, so KeSetEvent on it -- the
++     * way a kernel-mode caller signals what it was given -- sets the host
++     * event the title waits on. XNet's DNS lookup takes its caller's event
++     * like this, and with no object it dropped every lookup before sending
++     * one: Xbox Live sign-in failed without a packet. One body per handle,
++     * reused; a closed handle's token coming back with a new host event
++     * re-points it. */
++    {
++        static struct { uint32_t token, body; HANDLE host; } objs[128];
++        HANDLE host = handle ? bridge_resolve_handle(handle) : NULL;
++        uint32_t body = 0;
++        int i, free_i = -1;
++        if (host) {
++            for (i = 0; i < 128; i++) {
++                if (objs[i].body && objs[i].token == handle) { body = objs[i].body; break; }
++                if (!objs[i].body && free_i < 0) free_i = i;
++            }
++            if (!body && free_i >= 0 && (body = xbox_HeapAlloc(16, 16)) != 0) {
++                BRIDGE_MEM32(body + 0) = 0x00040000u;      /* Type 0 (event), Size 4 dwords */
++                BRIDGE_MEM32(body + 4) = 0;                /* SignalState */
++                BRIDGE_MEM32(body + 8) = body + 8;         /* empty wait list */
++                BRIDGE_MEM32(body + 12) = body + 8;
++                objs[free_i].token = handle;
++                objs[free_i].body = body;
++                i = free_i;
++            }
++            if (body && objs[i].host != host) {
++                objs[i].host = host;
++                ke_shadow_insert(body, host);
++            }
++        }
++        if (object_ptr) BRIDGE_MEM32(object_ptr) = body;
++        g_eax = 0;      /* STATUS_SUCCESS; an unresolvable handle keeps the old NULL answer */
++    }
+ }
+ 
+ /* ── RtlRaiseException (ordinal 302) ─────────────────────
+diff --git a/src/kernel/kernel_crypto.c b/src/kernel/kernel_crypto.c
+index c2342f7..7a9860e 100644
+--- a/src/kernel/kernel_crypto.c
++++ b/src/kernel/kernel_crypto.c
+@@ -20,6 +20,18 @@
+ #include <string.h>
+ #include <stdint.h>
+ 
++/* RECOMP_XC_TRACE=1: one line per kernel crypto call -- what was called and
++ * with what lengths, never the data or keys. */
++#include <stdio.h>
++#include <stdlib.h>
++static int xc_trace_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("RECOMP_XC_TRACE"); on = e && e[0] == '1'; }
++    return on;
++}
++#define XC_TRACE(...) do { if (xc_trace_on()) { fprintf(stderr, "  [XC] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
++
+ /* SHA-1 / RC4 / HMAC below are portable software implementations, so the
+  * only platform dependency is BCrypt's types in the (unused) SHA_INTERNAL
+  * struct. Keep it Windows-only. */
+@@ -115,6 +127,7 @@ static void sha1_transform(ULONG state[5], const UCHAR buffer[64])
+ 
+ VOID __stdcall xbox_XcSHAInit(PXBOX_SHA_CONTEXT ShaContext)
+ {
++    XC_TRACE("SHAInit");
+     if (!ShaContext)
+         return;
+ 
+@@ -205,6 +218,7 @@ VOID __stdcall xbox_XcSHAFinal(PXBOX_SHA_CONTEXT ShaContext, UCHAR* Digest)
+ 
+ VOID __stdcall xbox_XcRC4Key(PXBOX_RC4_CONTEXT Rc4Context, ULONG KeyLength, const UCHAR* Key)
+ {
++    XC_TRACE("RC4Key len %lu", (unsigned long)KeyLength);
+     UCHAR temp;
+     ULONG i;
+     UCHAR j = 0;
+@@ -261,6 +275,7 @@ VOID __stdcall xbox_XcHMAC(
+     const UCHAR* Data2, ULONG Data2Length,
+     UCHAR* Digest)
+ {
++    XC_TRACE("HMAC key %lu data %lu+%lu", (unsigned long)KeyLength, (unsigned long)Data1Length, (unsigned long)Data2Length);
+     XBOX_SHA_CONTEXT sha;
+     UCHAR key_block[64];
+     UCHAR ipad[64];
+@@ -304,6 +319,16 @@ VOID __stdcall xbox_XcHMAC(
+     xbox_XcSHAUpdate(&sha, inner_digest, 20);
+     xbox_XcSHAFinal(&sha, Digest);
+ 
++    /* A signed record usually keeps its signature beside the data: say whether
++     * this digest matches the 12 bytes before Data1 or the 8 after it (neither
++     * is printed). That is how a key that does not verify shows up. */
++    if (xc_trace_on() && Data1 && Data1Length >= 16) {
++        int before = memcmp(Digest, Data1 - 12, 12) == 0;
++        int after = memcmp(Digest, Data1 + Data1Length, 8) == 0;
++        if (before || after)
++            XC_TRACE("HMAC result matches the signature %s the data", before ? "before" : "after");
++    }
++
+     /* Clean up sensitive data */
+     SecureZeroMemory(key_block, sizeof(key_block));
+     SecureZeroMemory(ipad, sizeof(ipad));
+@@ -321,12 +346,14 @@ VOID __stdcall xbox_XcHMAC(
+ 
+ ULONG __stdcall xbox_XcPKGetKeyLen(PVOID PublicKey)
+ {
++    XC_TRACE("PKGetKeyLen (stub: 0)");
+     (void)PublicKey;
+     return 0;
+ }
+ 
+ ULONG __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output)
+ {
++    XC_TRACE("PKDecPrivate (stub: fails)");
+     (void)PrivateKey;
+     (void)Input;
+     (void)Output;
+@@ -336,6 +363,7 @@ ULONG __stdcall xbox_XcPKDecPrivate(PVOID PrivateKey, PVOID Input, PVOID Output)
+ 
+ ULONG __stdcall xbox_XcPKEncPublic(PVOID PublicKey, PVOID Input, PVOID Output)
+ {
++    XC_TRACE("PKEncPublic (stub: fails)");
+     (void)PublicKey;
+     (void)Input;
+     (void)Output;
+@@ -345,6 +373,7 @@ ULONG __stdcall xbox_XcPKEncPublic(PVOID PublicKey, PVOID Input, PVOID Output)
+ 
+ BOOLEAN __stdcall xbox_XcVerifyPKCS1Signature(PVOID Hash, PVOID PublicKey, PVOID Signature)
+ {
++    XC_TRACE("VerifyPKCS1Signature (stub: TRUE)");
+     (void)Hash;
+     (void)PublicKey;
+     (void)Signature;
+@@ -428,6 +457,7 @@ static void bn_mulmod(uint32_t *out, const uint32_t *a, const uint32_t *b, const
+ 
+ ULONG __stdcall xbox_XcModExp(PULONG Result, PULONG Base, PULONG Exponent, PULONG Modulus, ULONG ModulusLength)
+ {
++    XC_TRACE("ModExp %lu dwords", (unsigned long)ModulusLength);
+     uint32_t m[MODEXP_MAX], b[MODEXP_MAX], r[MODEXP_MAX], one[MODEXP_MAX];
+     ULONG n = ModulusLength, top;
+     int bit;
+@@ -492,6 +522,7 @@ typedef struct { uint32_t tag, cipher; UCHAR key[24]; } DesTable;
+ 
+ VOID __stdcall xbox_XcKeyTable(ULONG CipherSelect, PVOID KeyTable, const UCHAR* Key)
+ {
++    XC_TRACE("KeyTable cipher %lu", (unsigned long)CipherSelect);
+     DesTable *t = (DesTable *)KeyTable;
+     if (!t || !Key)
+         return;
+@@ -572,6 +603,7 @@ VOID __stdcall xbox_XcBlockCryptCBC(
+     ULONG CipherSelect, ULONG OutputLength, PVOID Output, PVOID Input,
+     PVOID KeyTable, ULONG Operation, PVOID FeedbackVector)
+ {
++    XC_TRACE("BlockCryptCBC cipher %lu len %lu op %lu", (unsigned long)CipherSelect, (unsigned long)OutputLength, (unsigned long)Operation);
+     UCHAR *out = (UCHAR *)Output, *fb = (UCHAR *)FeedbackVector;
+     const UCHAR *in = (const UCHAR *)Input;
+     const DesTable *t = (const DesTable *)KeyTable;
+@@ -596,6 +628,7 @@ VOID __stdcall xbox_XcBlockCryptCBC(
+ 
+ VOID __stdcall xbox_XcCryptService(ULONG Operation, PVOID Param)
+ {
++    XC_TRACE("CryptService op %lu (stub)", (unsigned long)Operation);
+     (void)Operation;
+     (void)Param;
+ }
+diff --git a/src/kernel/kernel_xbox.c b/src/kernel/kernel_xbox.c
+index f7548a2..f453090 100644
+--- a/src/kernel/kernel_xbox.c
++++ b/src/kernel/kernel_xbox.c
+@@ -13,6 +13,7 @@
+ #include "nvnet.h"
+ #include "console_id.h"
+ #include <stdlib.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <time.h>
+ 
+@@ -211,6 +212,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
+ 
+     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
+         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
++    if (getenv("RECOMP_XC_TRACE") && getenv("RECOMP_XC_TRACE")[0] == '1')
++        fprintf(stderr, "  [XC] ExQueryNonVolatileSetting 0x%X len %lu\n", (unsigned)ValueIndex, (unsigned long)ValueLength);
+ 
+     switch (ValueIndex) {
+     case XC_LANGUAGE:
+-- 
+2.51.0.windows.2
+

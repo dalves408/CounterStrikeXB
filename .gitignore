@@ -39,3 +39,4 @@ installer/wizard_small_*.bmp
 /eeprom/
 *.eeprom
 eeprom.bin
+/insignia-setup-assistant/

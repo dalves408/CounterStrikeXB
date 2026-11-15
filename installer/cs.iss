@@ -47,6 +47,7 @@ WelcomeLabel2=This installs the Counter-Strike (Xbox) PC recompilation.%n%nThe g
 [Files]
 Source: "{#BuildDir}\cs2_xbox_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\insignia_setup.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\cs_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 ; the title update, as a patch to the disc's default.xbe: used by cs_import, and by the game when an
@@ -57,6 +58,7 @@ Source: "{#BuildDir}\cs_tu.xbepatch"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\Counter-Strike"; Filename: "{app}\cs2_xbox_recomp.exe"; WorkingDir: "{app}"
 Name: "{autoprograms}\Counter-Strike Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\Counter-Strike Insignia Setup"; Filename: "{app}\insignia_setup.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\Counter-Strike"; Filename: "{app}\cs2_xbox_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]

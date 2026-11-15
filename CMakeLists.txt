@@ -142,6 +142,16 @@ target_link_libraries(config PRIVATE comctl32 shell32 version advapi32 user32)
 
 # The installer's import tool (not installed; Setup runs it from its temp folder) and
 # RecompLauncher's prepare step: copies the game files from the player's own disc.
+# insignia_setup.exe: puts the player's own console identity (EEPROM, hard-drive
+# key) and Xbox Live account into the game's data folder, for Insignia.
+add_executable(insignia_setup WIN32
+    insignia/insignia_setup.c
+    resources/insignia.rc
+    src/cs_settings.c
+)
+target_include_directories(insignia_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(insignia_setup PRIVATE comctl32 comdlg32 shell32 user32 advapi32)
+
 add_executable(cs_import installer/cs_import.c installer/tu_apply.c)
 target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)
 target_link_libraries(cs_import PRIVATE bcrypt shell32 cabinet)
