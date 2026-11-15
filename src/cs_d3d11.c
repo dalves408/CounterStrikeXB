@@ -45,6 +45,7 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <math.h>
 #include <stdint.h>
@@ -55,6 +56,7 @@
 #include "cs_d3d11.h"
 #include "cs_texture_pack.h"
 #include "cs_settings.h"
+#include "cs_overlay.h"
 #include "video/video_player.h"
 #include "nv2a_backend.h"
 #include "cs_vsh_hlsl.h"
@@ -108,6 +110,7 @@ typedef struct {
     size_t replacement_bytes;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
+    int pack_req;                 /* a hi-res replacement loading in the background (cs_pack_request) */
 } TexEnt;
 
 typedef struct { uint32_t key[12]; void *obj; } StateEnt;
@@ -322,6 +325,38 @@ static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uin
 
 /* ---- init ---------------------------------------------------------------- */
 
+/* Laptops with two GPUs (NVIDIA Optimus, AMD switchable graphics) run a
+ * program on the integrated one unless it asks otherwise. These exports are
+ * the drivers' own switch; high_performance_adapter() below is Windows' one
+ * (Settings > Display > Graphics still overrides both). */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
+/* The GPU Windows ranks fastest (the discrete one on a laptop), or NULL for
+ * the default. RECOMP_CS_GPU=default keeps Windows' default choice. */
+static IDXGIAdapter1 *high_performance_adapter(void)
+{
+    const char *pick = getenv("RECOMP_CS_GPU");
+    IDXGIFactory1 *f1 = NULL;
+    IDXGIFactory6 *f6 = NULL;
+    IDXGIAdapter1 *ad = NULL;
+    DXGI_ADAPTER_DESC1 desc;
+    if (pick && !_stricmp(pick, "default")) return NULL;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f1))) return NULL;
+    if (SUCCEEDED(IDXGIFactory1_QueryInterface(f1, &IID_IDXGIFactory6, (void **)&f6))) {
+        if (FAILED(IDXGIFactory6_EnumAdapterByGpuPreference(f6, 0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                            &IID_IDXGIAdapter1, (void **)&ad)))
+            ad = NULL;
+        IDXGIFactory6_Release(f6);
+    }
+    IDXGIFactory1_Release(f1);
+    if (ad && SUCCEEDED(IDXGIAdapter1_GetDesc1(ad, &desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+        IDXGIAdapter1_Release(ad);       /* never the software rasteriser */
+        ad = NULL;
+    }
+    return ad;
+}
+
 static int cs_d3d11_setup(void)
 {
     D3D_FEATURE_LEVEL fl;
@@ -349,8 +384,17 @@ static int cs_d3d11_setup(void)
     {   /* RECOMP_CS_WARP=1: Windows' software rasteriser instead of the GPU, to tell a renderer bug (shows on WARP
          * too) from a driver one (does not) */
         const char *w = getenv("RECOMP_CS_WARP");
-        hr = D3D11CreateDevice(NULL, (w && *w == '1') ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL,
-                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
+        int warp = w && *w == '1';
+        IDXGIAdapter1 *fast = warp ? NULL : high_performance_adapter();
+        hr = E_FAIL;
+        if (fast) {     /* a laptop's discrete GPU, not the integrated one Windows hands out by default */
+            hr = D3D11CreateDevice((IDXGIAdapter *)fast, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
+            IDXGIAdapter1_Release(fast);
+        }
+        if (FAILED(hr))
+            hr = D3D11CreateDevice(NULL, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx);
     }
     if (FAILED(hr)) {
         fprintf(stderr, "[CS-D3D11] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr);
@@ -753,6 +797,27 @@ static void release_texture(TexEnt *entry)
     SAFE_REL(entry->tex);
 }
 
+/* The hi-res replacement for this texture, if it has finished loading: swap it in. */
+static void pack_poll(TexEnt *e)
+{
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    size_t bytes = 0;
+    int r;
+    if (!e->pack_req) return;
+    if (!s_hires) { e->pack_req = 0; return; }
+    r = cs_pack_take(e->pack_req, s_pack_bytes < CS_PACK_BUDGET ? CS_PACK_BUDGET - s_pack_bytes : 0, &tex, &srv, &bytes);
+    if (r == 0) return;
+    e->pack_req = 0;
+    if (r == 1) {
+        s_pack_bytes -= e->replacement_bytes;
+        SAFE_REL(e->srv);
+        SAFE_REL(e->tex);
+        e->tex = tex; e->srv = srv; e->replacement_bytes = bytes;
+        s_pack_bytes += bytes;
+    }
+}
+
 static int pack_source_format(unsigned color)
 {
     switch (color) {
@@ -807,6 +872,7 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
      * full hash under 32 KB) was ~9% of the executor thread. */
     if (e && e->verified == s_frame + 1) {
         e->used = s_tick;
+        pack_poll(e);
         *use_mips = e->replacement_bytes != 0;
         return e->srv;
     }
@@ -816,6 +882,7 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
         if (e->sig == sig) {
             if (hash_bytes(mem + t->offset, n) == e->hash) {
                 e->verified = s_frame + 1;
+                pack_poll(e);
                 *use_mips = e->replacement_bytes != 0;
                 return e->srv;
             }
@@ -832,12 +899,13 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA sd;
         TexEnt *ne = &s_tx[free_i];
+        int req = 0;
         memset(ne, 0, sizeof *ne);
+        /* The original is decoded and drawn now; a hi-res replacement loads in
+         * the background and pack_poll swaps it in when it is there. */
         try_pack = s_hires && pack_source_format(t->color) && cs_pack_enabled() && s_pack_bytes < CS_PACK_BUDGET;
-        if (try_pack && cs_pack_load(s_dev, t->color, t->width, t->height, mem + t->offset, n,
-                                     CS_PACK_BUDGET - s_pack_bytes,
-                                     &ne->tex, &ne->srv, &ne->replacement_bytes))
-            goto cache_texture;
+        if (try_pack)
+            req = cs_pack_request(s_dev, t->color, t->width, t->height, mem + t->offset, n);
 
         argb = malloc((size_t)t->width * t->height * 4);
         if (!argb) return s_white_srv;
@@ -897,12 +965,9 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
             size_t k, np = (size_t)t->width * t->height;
             for (k = 0; k < np; k++) argb[k] |= 0xFF000000u;
         }
-        if (try_pack && cs_pack_load(s_dev, CS_PACK_DECODED_BGRA, t->width, t->height, argb,
-                                     (size_t)t->width * t->height * 4, CS_PACK_BUDGET - s_pack_bytes,
-                                     &ne->tex, &ne->srv, &ne->replacement_bytes)) {
-            free(argb);
-            goto cache_texture;
-        }
+        if (try_pack && !req)
+            req = cs_pack_request(s_dev, CS_PACK_DECODED_BGRA, t->width, t->height, argb,
+                                  (size_t)t->width * t->height * 4);
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE;
@@ -915,12 +980,12 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t, int *opaque, int 
         free(argb);
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)ne->tex, NULL, &ne->srv);
         if (!ne->srv) { SAFE_REL(ne->tex); return s_white_srv; }
-    cache_texture:
-        s_pack_bytes += ne->replacement_bytes;
-        *use_mips = ne->replacement_bytes != 0;
         ne->offset = t->offset; ne->w = t->width; ne->h = t->height; ne->color = t->color; ne->pitch = t->pitch;
         ne->hash = hash_bytes(mem + t->offset, n); ne->sig = sig;
         ne->verified = s_frame + 1; ne->used = s_tick;
+        ne->pack_req = req;
+        pack_poll(ne);                  /* already loaded (seen before): straight in */
+        *use_mips = ne->replacement_bytes != 0;
         st_decodes++;
         return ne->srv;
     }
@@ -2119,6 +2184,7 @@ static void settings_apply(int first)
          * decoded (or its replacement loaded) again at its next bind. */
         for (i = 0; i < MAX_TEX; i++) { release_texture(&s_tx[i]); memset(&s_tx[i], 0, sizeof s_tx[i]); }
         s_hires = g_cs_settings.hires != 0;
+        if (!s_hires) cs_pack_drop();
     }
     if (first || s_log)
         fprintf(stderr, "[CS-D3D11] render scale %dx (%ux%u), msaa %d%s, anisotropy %d, hi-res textures %d\n", s_scale,
@@ -2226,6 +2292,50 @@ static int swapchain_ensure(HWND h)
     return s_bb_rtv != NULL;
 }
 
+/* At most two frames queued for the GPU. Without a limit the commands of
+ * many frames pile up in the driver when the GPU falls behind (an integrated
+ * GPU at a high render scale and MSAA), and the driver then blocks a Flush or
+ * a Map for as long as it takes to drain them -- seen as a freeze with the
+ * executor inside the Intel driver. Here the executor waits, in short sleeps,
+ * for the frame before last to finish, and gives up after 2 s so a GPU that
+ * stopped cannot hang the game on this wait. RECOMP_CS_FRAMES_QUEUED=0 turns
+ * it off. */
+static void frame_latency_limit(void)
+{
+    static ID3D11Query *q[2];
+    static int issued[2], qi, off = -1, tried;
+    if (off < 0) { const char *e = getenv("RECOMP_CS_FRAMES_QUEUED"); off = e && *e == '0'; }
+    if (off) return;
+    if (!tried) {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+        IDXGIDevice1 *dd = NULL;
+        tried = 1;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q[0])) || FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q[1]))) {
+            SAFE_REL(q[0]); SAFE_REL(q[1]);
+        }
+        if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&dd))) {
+            IDXGIDevice1_SetMaximumFrameLatency(dd, 2);
+            IDXGIDevice1_Release(dd);
+        }
+    }
+    if (!q[0]) return;
+    if (issued[qi]) {
+        double t0 = cs_now_ms();
+        BOOL done = FALSE;
+        while (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)q[qi], &done, sizeof done, 0) == S_FALSE) {
+            if (cs_now_ms() - t0 > 2000.0) {
+                static int told;
+                if (told++ < 4) fprintf(stderr, "[CS-D3D11] the GPU has not finished a frame in 2 s\n");
+                break;
+            }
+            Sleep(0);
+        }
+    }
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)q[qi]);
+    issued[qi] = 1;
+    qi ^= 1;
+}
+
 /* The title's front buffer (and the video overlay) on the window. `fresh`:
  * compose the video overlay again (else the last one is drawn). */
 static void present_frame(HWND h, uint32_t fb_va, int fresh)
@@ -2322,7 +2432,16 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     sync = g_cs_settings.vsync ? 1u : 0u;
     flags = (!sync && s_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
-    IDXGISwapChain1_Present(s_sc, sync, flags);
+    {
+        HRESULT hr = IDXGISwapChain1_Present(s_sc, sync, flags);
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            static int told;
+            if (!told++)
+                fprintf(stderr, "[CS-D3D11] the graphics driver stopped the GPU (0x%08lX, reason 0x%08lX)\n",
+                        (unsigned long)hr, (unsigned long)ID3D11Device_GetDeviceRemovedReason(s_dev));
+        }
+    }
+    frame_latency_limit();
 }
 
 /* The frame-rate cap (settings: 30..240, 0 = none): wait out the rest of the frame. */
@@ -2371,6 +2490,7 @@ static void cs_window_present(uint32_t fb_va, uint32_t pitch)
     if (!s_inited || s_failed || !h || !blit_init()) return;
     s_presenting = 1;
     present_frame(h, fb_va, 1);
+    cs_settings_watch();
     if (InterlockedExchange(&s_settings_dirty, 0)) settings_apply(0);
     frame_cap();
 }

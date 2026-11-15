@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <xinput.h>
@@ -112,6 +113,26 @@ static void item_set(int i, int v)
     }
     cs_settings_save(s);
     cs_diag_log_video("settings changed");      /* the log says what a report's picture was drawn with */
+}
+
+/* settings.ini changed while the game runs (config.exe, RecompLauncher): take
+ * the new values the way the F1 menu does. Called between frames, at most
+ * twice a second. */
+void cs_settings_watch(void)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+    CsSettings n;
+    const char *mode;
+    if (now - last < 500) return;
+    last = now;
+    if (!cs_settings_changed_on_disk(&n)) return;
+    mode = getenv("RECOMPLAUNCHER_MODE");
+    if (n.fullscreen != (xbox_FramebufferIsFullscreen() != 0) && !(mode && !_stricmp(mode, "bigpicture")))
+        xbox_FramebufferToggleFullscreen();
+    g_cs_settings = n;
+    cs_d3d11_settings_changed();
+    cs_diag_log_video("settings.ini changed");
 }
 
 /* ---- drawing --------------------------------------------------------------- */

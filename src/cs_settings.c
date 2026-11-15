@@ -84,6 +84,35 @@ static int put(const char *path, const char *key, int v)
     return WritePrivateProfileStringA("display", key, val, path) != 0;
 }
 
+/* settings.ini's last write time as this program last read or wrote it, so a
+ * change made elsewhere (config.exe, RecompLauncher) can be noticed. */
+static FILETIME s_seen;
+
+static int ini_time(FILETIME *t)
+{
+    char path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!cs_settings_path("settings.ini", path, sizeof path, 0) ||
+        !GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
+    *t = a.ftLastWriteTime;
+    return 1;
+}
+
+void cs_settings_mark_seen(void)
+{
+    FILETIME t;
+    if (ini_time(&t)) s_seen = t;
+}
+
+int cs_settings_changed_on_disk(CsSettings *out)
+{
+    FILETIME t;
+    if (!ini_time(&t) || CompareFileTime(&t, &s_seen) == 0) return 0;
+    s_seen = t;
+    cs_settings_load(out);
+    return 1;
+}
+
 int cs_settings_save(const CsSettings *s)
 {
     char path[MAX_PATH];
@@ -98,6 +127,7 @@ int cs_settings_save(const CsSettings *s)
     ok &= put(path, "msaa", s->msaa);
     ok &= put(path, "anisotropy", s->aniso);
     ok &= put(path, "hires_textures", s->hires);
+    cs_settings_mark_seen();
     return ok;
 }
 
@@ -105,6 +135,7 @@ void cs_settings_startup(void)
 {
     char path[MAX_PATH];
     cs_settings_load(&g_cs_settings);
+    cs_settings_mark_seen();
     /* _putenv_s: the toolkit reads these with getenv, the CRT's own copy. */
     /* RecompLauncher's Big Picture mode (RECOMPLAUNCHER_MODE=bigpicture) always
      * starts fullscreen, whatever the setting says; the setting itself is left alone. */

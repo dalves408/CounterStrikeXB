@@ -51,6 +51,10 @@ void cs_settings_defaults(CsSettings *s);
 void cs_settings_load(CsSettings *s);
 /* Write every key; 1 on success. */
 int cs_settings_save(const CsSettings *s);
+/* settings.ini changed since this program last read or wrote it (config.exe or
+ * RecompLauncher while the game runs): loads it into *out and returns 1. */
+int cs_settings_changed_on_disk(CsSettings *out);
+void cs_settings_mark_seen(void);
 /* %LOCALAPPDATA%\CounterStrikeXB\<name>; makes the folder when `make_dir`. */
 int cs_settings_path(const char *name, char *out, unsigned n, int make_dir);
 /* The index of `v` in a choice list, or of the nearest. */

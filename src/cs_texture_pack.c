@@ -217,6 +217,123 @@ static int load_bc7(ID3D11Device *device, const PackEntry *entry, size_t byte_li
     return 1;
 }
 
+/* ---- background loading ------------------------------------------------------
+ * A replacement is several MB read from disk; loading it on the renderer's
+ * thread the first time a texture shows up was a hitch each time, mid-match.
+ * Now the renderer asks for it (cs_pack_request), keeps drawing the original,
+ * and swaps the replacement in once this thread has it (cs_pack_take). The
+ * D3D11 device is free-threaded, so the texture is created here too. */
+typedef struct {
+    volatile LONG state;            /* JOB_IDLE / QUEUED / READY / FAILED */
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+    size_t bytes;
+} PackJob;
+enum { JOB_IDLE, JOB_QUEUED, JOB_READY, JOB_FAILED };
+#define JOB_QUEUE 4096
+static PackJob *jobs;
+static int job_queue[JOB_QUEUE];
+static unsigned job_head, job_tail;
+static CRITICAL_SECTION job_lock;
+static HANDLE job_wake;
+static ID3D11Device *job_device;
+
+static DWORD WINAPI job_thread(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        int id = -1;
+        EnterCriticalSection(&job_lock);
+        if (job_head != job_tail) id = job_queue[job_tail++ % JOB_QUEUE];
+        LeaveCriticalSection(&job_lock);
+        if (id < 0) { WaitForSingleObject(job_wake, INFINITE); continue; }
+        {
+            PackJob *j = &jobs[id];
+            ID3D11Texture2D *tex = NULL;
+            ID3D11ShaderResourceView *srv = NULL;
+            size_t bytes = 0;
+            if (load_bc7(job_device, &entries[id], (size_t)-1, &tex, &srv, &bytes)) {
+                j->tex = tex; j->srv = srv; j->bytes = bytes;
+                InterlockedExchange(&j->state, JOB_READY);
+                if (loaded++ < 16 || getenv("RECOMP_CS_TEXTURE_PACK_LOG"))
+                    fprintf(stderr, "[CS DDS] Loaded %s (%ux%u -> %ux%u)\n", entries[id].file,
+                            entries[id].width, entries[id].height, entries[id].width * 4, entries[id].height * 4);
+            } else {
+                InterlockedExchange(&j->state, JOB_FAILED);
+                if (rejected++ < 8) fprintf(stderr, "[CS DDS] Using original for %s\n", entries[id].file);
+            }
+        }
+    }
+}
+
+int cs_pack_request(ID3D11Device *device, unsigned format, unsigned width, unsigned height,
+                    const void *pixels, size_t length)
+{
+    PackEntry key = {0};
+    const PackEntry *entry;
+    int id;
+    if (!cs_pack_enabled()) return 0;
+    key.format = format;
+    key.width = width;
+    key.height = height;
+    key.hash = content_key(pixels, length);
+    entry = bsearch(&key, entries, count, sizeof *entries, compare_entry);
+    if (!entry) return 0;
+    if (!jobs) {
+        HANDLE t;
+        jobs = (PackJob *)calloc(count, sizeof *jobs);
+        if (!jobs) return 0;
+        InitializeCriticalSection(&job_lock);
+        job_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        job_device = device;
+        ID3D11Device_AddRef(device);
+        t = CreateThread(NULL, 0, job_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    id = (int)(entry - entries);
+    if (InterlockedCompareExchange(&jobs[id].state, JOB_QUEUED, JOB_IDLE) == JOB_IDLE) {
+        EnterCriticalSection(&job_lock);
+        if (job_head - job_tail < JOB_QUEUE) job_queue[job_head++ % JOB_QUEUE] = id;
+        else InterlockedExchange(&jobs[id].state, JOB_IDLE);     /* full: asked again at a later bind */
+        LeaveCriticalSection(&job_lock);
+        SetEvent(job_wake);
+    }
+    return id + 1;
+}
+
+int cs_pack_take(int request, size_t byte_limit, ID3D11Texture2D **texture, ID3D11ShaderResourceView **view,
+                 size_t *bytes)
+{
+    PackJob *j;
+    if (request <= 0 || !jobs || request > (int)count) return -1;
+    j = &jobs[request - 1];
+    switch (j->state) {
+    case JOB_QUEUED: return 0;
+    case JOB_READY:
+        if (j->bytes > byte_limit) return -1;          /* stays loaded until the budget allows it */
+        *texture = j->tex; *view = j->srv; *bytes = j->bytes;
+        j->tex = NULL; j->srv = NULL; j->bytes = 0;
+        InterlockedExchange(&j->state, JOB_IDLE);
+        return 1;
+    case JOB_IDLE: return -1;                           /* taken by another texture with the same content */
+    default: return -1;
+    }
+}
+
+void cs_pack_drop(void)
+{
+    unsigned i;
+    if (!jobs) return;
+    for (i = 0; i < count; i++)
+        if (jobs[i].state == JOB_READY) {
+            if (jobs[i].srv) ID3D11ShaderResourceView_Release(jobs[i].srv);
+            if (jobs[i].tex) ID3D11Texture2D_Release(jobs[i].tex);
+            jobs[i].srv = NULL; jobs[i].tex = NULL; jobs[i].bytes = 0;
+            InterlockedExchange(&jobs[i].state, JOB_IDLE);
+        }
+}
+
 int cs_pack_load(ID3D11Device *device, unsigned format, unsigned width, unsigned height,
                  const void *pixels, size_t length, size_t byte_limit,
                  ID3D11Texture2D **texture, ID3D11ShaderResourceView **view, size_t *bytes)
