@@ -32,11 +32,11 @@
 extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
 extern void xbox_InputSetHold(int on);      /* toolkit input/xinput_device.c */
 
-enum { MODE_QUIT, MODE_SETTINGS };
-enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { MODE_QUIT, MODE_SETTINGS, MODE_INSIGNIA };
+enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_INSIGNIA, IT_CLOSE, IT_QUIT, IT_COUNT };
 static const char *const ITEM_LABEL[IT_COUNT] = {
     "Render scale", "Fullscreen", "Stretch image", "VSync", "Frame rate cap",
-    "Anti-aliasing", "Anisotropic filtering", "Back to the game", "Quit Counter-Strike" };
+    "Anti-aliasing", "Anisotropic filtering", "Run Insignia Setup Assistant", "Back to the game", "Quit Counter-Strike" };
 static const char *const OFFON[2] = { "Off", "On" };
 static const char *const STRETCH[2] = { "Off (4:3)", "On (fill the window)" };
 
@@ -50,6 +50,98 @@ static DWORD s_pad_repeat;
 static int s_pad_seen, s_pad_release;
 
 int cs_overlay_active(void) { return s_active != 0; }
+
+/* ---- Insignia Setup Assistant ------------------------------------------------
+ * Insignia's own Setup Assistant (registers the console with Insignia, shows its
+ * hard-drive key) is a separate program, insignia_assistant.exe beside this one.
+ * Its line is enabled only when the player's own console identity is in place
+ * and complete -- the assistant registers exactly that identity -- and opening
+ * it closes the game, after a warning. */
+static int s_ins_ready;
+static char s_ins_why[64];
+
+static uint32_t rd32le(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+
+static uint32_t ee_sum(const uint8_t *p, unsigned n)
+{
+    uint32_t hi = 0, lo = 0;
+    unsigned i;
+    for (i = 0; i + 4 <= n; i += 4) {
+        uint64_t s = ((uint64_t)hi << 32 | lo) + rd32le(p + i);
+        hi = (uint32_t)(s >> 32); lo = (uint32_t)s;
+    }
+    return ~(hi + lo);
+}
+
+static int assistant_path(char *out, unsigned n)
+{
+    char *sl;
+    if (!GetModuleFileNameA(NULL, out, n)) return 0;
+    sl = strrchr(out, '\\');
+    if (!sl) return 0;
+    strcpy_s(sl + 1, n - (unsigned)(sl + 1 - out), "insignia_assistant.exe");
+    return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+/* Complete means: the player's eeprom.bin with both checksums right, a
+ * 12-digit serial that is not a placeholder, a real Ethernet address, a
+ * non-zero online key, and a 32-digit non-zero hard-drive key in settings.ini
+ * (Insignia rejects an all-zero one). */
+static void insignia_check(void)
+{
+    char path[MAX_PATH], key[80];
+    uint8_t ee[256];
+    FILE *f;
+    size_t n = 0;
+    int i, digits = 1, same = 1, mac = 0, online = 0, hd = 0, kn = 0;
+    s_ins_ready = 0;
+    if (!cs_settings_path("eeprom.bin", path, sizeof path, 0) || !(f = fopen(path, "rb"))) {
+        strcpy(s_ins_why, "needs your EEPROM (Insignia Setup)"); return;
+    }
+    n = fread(ee, 1, sizeof ee, f);
+    fclose(f);
+    if (n != 256 || ee_sum(ee + 0x34, 0x2C) != rd32le(ee + 0x30) || ee_sum(ee + 0x64, 0x5C) != rd32le(ee + 0x60)) {
+        strcpy(s_ins_why, "EEPROM is damaged"); return;
+    }
+    for (i = 0; i < 12; i++) {
+        if (ee[0x34 + i] < '0' || ee[0x34 + i] > '9') digits = 0;
+        if (ee[0x34 + i] != ee[0x34]) same = 0;
+    }
+    for (i = 0; i < 6; i++) if (ee[0x40 + i] != 0 && ee[0x40 + i] != 0xFF) mac = 1;
+    for (i = 0; i < 16; i++) if (ee[0x48 + i]) online = 1;
+    if (!digits || same) { strcpy(s_ins_why, "EEPROM serial number is not valid"); return; }
+    if (!mac) { strcpy(s_ins_why, "EEPROM has no network address"); return; }
+    if (!online) { strcpy(s_ins_why, "EEPROM has no online key"); return; }
+    if (cs_settings_path("settings.ini", path, sizeof path, 0)) {
+        GetPrivateProfileStringA("insignia", "hdd_key", "", key, sizeof key, path);
+        for (i = 0; key[i]; i++) {
+            char c = key[i];
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) { kn++; if (c != '0') hd = 1; }
+            else if (c != ' ') { kn = -100; break; }
+        }
+        SecureZeroMemory(key, sizeof key);
+    }
+    if (kn != 32 || !hd) { strcpy(s_ins_why, "needs your hard-drive key (Insignia Setup)"); return; }
+    if (!assistant_path(path, sizeof path)) { strcpy(s_ins_why, "assistant not installed"); return; }
+    s_ins_ready = 1;
+    s_ins_why[0] = 0;
+}
+
+/* Start the assistant, then close the game the usual way. */
+static int launch_assistant(void)
+{
+    char exe[MAX_PATH], dir[MAX_PATH], *sl;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    if (!assistant_path(exe, sizeof exe)) return 0;
+    strcpy_s(dir, sizeof dir, exe);
+    if ((sl = strrchr(dir, '\\')) != NULL) *sl = 0;
+    memset(&si, 0, sizeof si); si.cb = sizeof si;
+    if (!CreateProcessA(exe, NULL, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, dir, &si, &pi)) return 0;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    fprintf(stderr, "[CS2] opening the Insignia Setup Assistant; closing the game\n");
+    return 1;
+}
 
 /* ---- the settings ----------------------------------------------------------- */
 static int item_count(int i)
@@ -195,10 +287,11 @@ static void draw(void)
             y = panel.top + rh * 13 / 10 + i * rh;
             SetRect(&s_row[i], x, y, panel.right - rh / 3, y + rh * 84 / 100);
             fill(dc, &s_row[i], sel ? C_FRAME : C_ROW);
-            SetTextColor(dc, sel ? RGB(16, 16, 16) : C_TEXT);
+            SetTextColor(dc, sel ? RGB(16, 16, 16) : (i == IT_INSIGNIA && !s_ins_ready) ? C_DIM : C_TEXT);
             r = s_row[i]; r.left += rh / 3;
             DrawTextA(dc, ITEM_LABEL[i], -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             if (item_count(i)) snprintf(buf, sizeof buf, "<  %s  >", item_text(i));
+            else if (i == IT_INSIGNIA && !s_ins_ready) snprintf(buf, sizeof buf, "%s", s_ins_why);
             else if (i == IT_QUIT && s_armed) snprintf(buf, sizeof buf, "press again to quit");
             else buf[0] = 0;
             r = s_row[i]; r.right -= rh / 3;
@@ -214,7 +307,14 @@ static void draw(void)
     } else {
         int bw = pw * 3 / 10, bh = rh * 9 / 10, by = panel.top + rh * 2;
         SetRect(&r, panel.left, panel.top + rh / 3, panel.right, panel.top + rh * 3 / 2);
-        DrawTextA(dc, "Quit Counter-Strike?", -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (s_mode == MODE_INSIGNIA) {
+            HFONT prev = SelectObject(dc, fr);
+            SetRect(&r, panel.left + rh / 3, panel.top + rh / 6, panel.right - rh / 3, panel.top + rh * 19 / 10);
+            DrawTextA(dc, "Counter-Strike will close and the Insignia Setup Assistant will open. Continue?",
+                      -1, &r, DT_CENTER | DT_WORDBREAK);
+            SelectObject(dc, prev);
+        } else
+            DrawTextA(dc, "Quit Counter-Strike?", -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SetRect(&s_btn[0], panel.left + pw / 2 - bw - pw / 24, by, panel.left + pw / 2 - pw / 24, by + bh);
         SetRect(&s_btn[1], panel.left + pw / 2 + pw / 24, by, panel.left + pw / 2 + pw / 24 + bw, by + bh);
         SelectObject(dc, fr);
@@ -290,6 +390,7 @@ static void menu_open(HWND game, int mode)
         if (!s_ov) return;
     }
     s_mode = mode; s_sel = 0; s_quit_sel = 0; s_armed = 0;
+    insignia_check();
     if (!s_active) {
         xbox_InputKeysClear();                   /* nothing the game saw held stays held */
         xbox_InputSetHold(1);
@@ -325,6 +426,10 @@ static void settings_change(int dir)
         s_armed = 0;
     } else if (dir == 0) {
         if (s_sel == IT_CLOSE) { menu_close(); return; }
+        if (s_sel == IT_INSIGNIA) {
+            insignia_check();
+            if (s_ins_ready) { s_mode = MODE_INSIGNIA; s_quit_sel = 0; }
+        }
         if (s_sel == IT_QUIT) { if (s_armed) { quit_game(); return; } s_armed = 1; }
     }
     draw();
@@ -347,10 +452,15 @@ static void menu_key(WPARAM w, int repeat)
     if (w == VK_LEFT || w == VK_RIGHT || w == VK_TAB) {
         s_quit_sel = w == VK_LEFT ? 0 : w == VK_RIGHT ? 1 : !s_quit_sel;
         draw();
-    } else if (!repeat && (w == VK_RETURN || w == VK_SPACE)) {
-        if (s_quit_sel) quit_game(); else menu_close();
-    } else if (!repeat && w == 'Y') quit_game();
-    else if (!repeat && w == 'N') menu_close();
+    } else if (!repeat && (w == VK_RETURN || w == VK_SPACE || w == 'Y' || w == 'N')) {
+        int yes = (w == 'Y') || (w != 'N' && s_quit_sel);
+        if (s_mode == MODE_INSIGNIA) {
+            if (yes && launch_assistant()) { quit_game(); return; }
+            s_mode = MODE_SETTINGS;
+            draw();
+        } else if (yes) quit_game();
+        else menu_close();
+    }
 }
 
 /* The toolkit's key filter (window thread): 1 keeps the key from the game. */

@@ -34,7 +34,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 
-enum { ID_EE_EDIT = 100, ID_EE_BROWSE, ID_EE_STATUS, ID_KEY_EDIT, ID_KEY_SHOW, ID_KEY_FILE, ID_KEY_STATUS,
+enum { ID_EE_EDIT = 100, ID_EE_BROWSE, ID_EE_STATUS, ID_KEY_EDIT, ID_KEY_SHOW, ID_KEY_FILE, ID_KEY_BIOS, ID_KEY_STATUS,
        ID_ACC_EDIT, ID_ACC_BROWSE, ID_ACC_STATUS, ID_CREATE, ID_SAVE, ID_CLOSE, ID_STATUS };
 
 static HWND s_main, s_ee, s_ee_st, s_key, s_key_st, s_acc, s_acc_st, s_status;
@@ -42,6 +42,8 @@ static uint8_t s_eeprom[256];
 static int s_ee_ok, s_acc_ok;
 static uint8_t s_sectors[7][512];          /* the drive's sectors 9..15 */
 static char s_gamertags[256];
+static void say(HWND w, const char *t);
+static void check_key(void);
 static int s_cli;                           /* run from the command line: no message boxes */
 
 /* A message box, or with arguments a line on the calling console. */
@@ -96,6 +98,149 @@ static int hex_key(const char *s, uint8_t out[16])
         n++;
     }
     return n == 32 && !*s;
+}
+
+/* ---- the hard-drive key from the console's own BIOS and MCPX ROM ------------------------------ */
+/* The EEPROM's hard-drive key is encrypted with the "EEPROM key", which every
+ * console keeps in its BIOS's second-stage loader (2BL), itself encrypted:
+ *   MCPX 1.0 (Xbox 1.0): RC4 with the 16-byte key at MCPX ROM offset 0x1A5,
+ *     over the 0x6000-byte 2BL at flash 0xFFFF9E00;
+ *   MCPX 1.1 (Xbox 1.1-1.6): RC4 with SHA-1(MCPX key at ROM 0x19C | flash key
+ *     at 0xFFFFFDF0 | MCPX key ^ 0x5C), 20 bytes, over the 2BL up to the flash
+ *     boot loader at 0xFFFFD400.
+ * (xboxdevwiki, Boot Process.) The EEPROM key is then whichever 16 bytes of
+ * the decrypted 2BL reproduce the EEPROM's own HMAC-SHA1 -- found by trying
+ * each, so no offset is assumed, and a mismatched BIOS, ROM or EEPROM simply
+ * finds nothing. Player-supplied files only; no key is built in. */
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+
+static BCRYPT_ALG_HANDLE s_hmac_alg, s_sha_alg;
+
+static int hmac_sha1(const uint8_t *key, ULONG kl, const uint8_t *d, ULONG n, uint8_t out[20])
+{
+    if (!s_hmac_alg && BCryptOpenAlgorithmProvider(&s_hmac_alg, BCRYPT_SHA1_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG))
+        return 0;
+    return BCryptHash(s_hmac_alg, (PUCHAR)key, kl, (PUCHAR)d, n, out, 20) == 0;
+}
+
+static int sha1(const uint8_t *d, ULONG n, uint8_t out[20])
+{
+    if (!s_sha_alg && BCryptOpenAlgorithmProvider(&s_sha_alg, BCRYPT_SHA1_ALGORITHM, NULL, 0))
+        return 0;
+    return BCryptHash(s_sha_alg, NULL, 0, (PUCHAR)d, n, out, 20) == 0;
+}
+
+static void rc4(const uint8_t *key, unsigned kl, uint8_t *d, unsigned n)
+{
+    uint8_t s[256], t;
+    unsigned i, j = 0, k;
+    for (i = 0; i < 256; i++) s[i] = (uint8_t)i;
+    for (i = 0; i < 256; i++) { j = (j + s[i] + key[i % kl]) & 255; t = s[i]; s[i] = s[j]; s[j] = t; }
+    i = j = 0;
+    for (k = 0; k < n; k++) {
+        i = (i + 1) & 255; j = (j + s[i]) & 255;
+        t = s[i]; s[i] = s[j]; s[j] = t;
+        d[k] ^= s[(s[i] + s[j]) & 255];
+    }
+}
+
+/* With candidate EEPROM key k: 1 and the hard-drive key when the EEPROM's
+ * encrypted section decrypts and its HMAC checks. */
+static int try_eeprom_key(const uint8_t *k, uint8_t hd[16])
+{
+    uint8_t rk[20], sec[28], check[20];
+    if (!hmac_sha1(k, 16, s_eeprom, 20, rk)) return 0;
+    memcpy(sec, s_eeprom + 0x14, sizeof sec);
+    rc4(rk, 20, sec, sizeof sec);
+    if (!hmac_sha1(k, 16, sec, sizeof sec, check) || memcmp(check, s_eeprom, 20)) return 0;
+    memcpy(hd, sec + 8, 16);
+    SecureZeroMemory(sec, sizeof sec);
+    return 1;
+}
+
+static int search_2bl(const uint8_t *dec, unsigned n, uint8_t hd[16])
+{
+    unsigned p;
+    for (p = 0; p + 16 <= n; p++)
+        if (try_eeprom_key(dec + p, hd)) return 1;
+    return 0;
+}
+
+static uint8_t *read_file(const char *path, size_t *n)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *b;
+    long sz;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 16 * 1024 * 1024 || !(b = (uint8_t *)malloc((size_t)sz))) { fclose(f); return NULL; }
+    *n = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    return b;
+}
+
+/* 0: decrypted (hd filled; *rev names the MCPX revision that worked);
+ * 1: files unreadable or the wrong size; 2: they do not unlock this EEPROM. */
+static int hdkey_from_bios(const char *bios_path, const char *mcpx_path, uint8_t hd[16], const char **rev)
+{
+    size_t bn = 0, mn = 0;
+    uint8_t *bios = read_file(bios_path, &bn), *mcpx = read_file(mcpx_path, &mn);
+    const uint8_t *im;
+    uint8_t *dec = NULL;
+    int r = 1;
+    if (!bios || !mcpx || bn < 0x40000 || mn != 512) goto out;
+    im = bios + bn - 0x40000;                    /* flash is mirrored up to the top of memory */
+    dec = (uint8_t *)malloc(0x6000);
+    if (!dec) goto out;
+    r = 2;
+    {   /* MCPX 1.1 */
+        uint8_t blk[48], rk[20];
+        int i;
+        memcpy(blk, mcpx + 0x19C, 16);
+        memcpy(blk + 16, im + 0x3FDF0, 16);
+        for (i = 0; i < 16; i++) blk[32 + i] = (uint8_t)(mcpx[0x19C + i] ^ 0x5C);
+        if (sha1(blk, sizeof blk, rk)) {
+            memcpy(dec, im + 0x39E00, 0x3600);
+            rc4(rk, 20, dec, 0x3600);
+            if (search_2bl(dec, 0x3600, hd)) { *rev = "1.1"; r = 0; goto out; }
+        }
+        SecureZeroMemory(blk, sizeof blk); SecureZeroMemory(rk, sizeof rk);
+    }
+    {   /* MCPX 1.0 */
+        memcpy(dec, im + 0x39E00, 0x6000);
+        rc4(mcpx + 0x1A5, 16, dec, 0x6000);
+        if (search_2bl(dec, 0x6000, hd)) { *rev = "1.0"; r = 0; goto out; }
+    }
+out:
+    if (dec) { SecureZeroMemory(dec, 0x6000); free(dec); }
+    if (bios) { SecureZeroMemory(bios, bn); free(bios); }
+    if (mcpx) { SecureZeroMemory(mcpx, mn); free(mcpx); }
+    return r;
+}
+
+static void key_from_bios(const char *bios_path, const char *mcpx_path)
+{
+    uint8_t hd[16];
+    const char *rev = "";
+    char hex[33], msg[200];
+    int i, r;
+    if (!s_ee_ok) { say(s_key_st, "Choose your console's EEPROM first: the key is checked against it."); return; }
+    say(s_key_st, "Decrypting...");
+    UpdateWindow(s_key_st);
+    r = hdkey_from_bios(bios_path, mcpx_path, hd, &rev);
+    if (r == 1) { say(s_key_st, "Those are not a BIOS image (256 KB-1 MB) and an MCPX boot ROM (512 bytes)."); return; }
+    if (r == 2) {
+        say(s_key_st, "That BIOS and MCPX ROM do not unlock this EEPROM. Use your own console's BIOS, and MCPX 1.0 "
+                      "for an Xbox 1.0 (kernels 3944-4627) or MCPX 1.1 for 1.1-1.6 (4817-5838).");
+        return;
+    }
+    for (i = 0; i < 16; i++) sprintf(hex + 2 * i, "%02X", hd[i]);
+    SetWindowTextA(s_key, hex);
+    SecureZeroMemory(hd, sizeof hd); SecureZeroMemory(hex, sizeof hex);
+    check_key();
+    snprintf(msg, sizeof msg, "OK: hard-drive key decrypted from your BIOS (MCPX %s) and verified against the EEPROM.", rev);
+    say(s_key_st, msg);
 }
 
 /* ---- reading a drive: raw, or xemu's qcow2 ---------------------------------------------------- */
@@ -344,9 +489,10 @@ static void make_ui(void)
     s_ee_st = mk("STATIC", "Needed: the EEPROM from your console (or your xemu eeprom.bin).", SS_LEFT, 24, y + 56, 546, 20, ID_EE_STATUS);
     y += 96;
     mk("BUTTON", "2. Your console's hard-drive key", BS_GROUPBOX, 10, y, 572, 86, 0);
-    s_key = mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 24, y + 24, 300, 23, ID_KEY_EDIT);
-    mk("BUTTON", "Show", BS_AUTOCHECKBOX | WS_TABSTOP, 334, y + 25, 60, 22, ID_KEY_SHOW);
-    mk("BUTTON", "From hddinfo.txt...", BS_PUSHBUTTON | WS_TABSTOP, 434, y + 23, 136, 25, ID_KEY_FILE);
+    s_key = mk("EDIT", "", ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP, 24, y + 24, 210, 23, ID_KEY_EDIT);
+    mk("BUTTON", "Show", BS_AUTOCHECKBOX | WS_TABSTOP, 240, y + 25, 54, 22, ID_KEY_SHOW);
+    mk("BUTTON", "From hddinfo.txt...", BS_PUSHBUTTON | WS_TABSTOP, 298, y + 23, 128, 25, ID_KEY_FILE);
+    mk("BUTTON", "From BIOS + MCPX...", BS_PUSHBUTTON | WS_TABSTOP, 432, y + 23, 138, 25, ID_KEY_BIOS);
     s_key_st = mk("STATIC", "Needed: 32 hex digits (UnleashX, EvoX hddinfo.txt, XBlast or xemu show it).", SS_LEFT, 24, y + 56, 546, 20, ID_KEY_STATUS);
     y += 96;
     mk("BUTTON", "3. Your Xbox Live account", BS_GROUPBOX, 10, y, 572, 128, 0);
@@ -382,6 +528,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         case ID_KEY_FILE:
             if (browse("hddinfo.txt\0*.txt\0All files\0*.*\0", path, sizeof path)) key_from_hddinfo(path);
             return 0;
+        case ID_KEY_BIOS: {
+            char mcpx[MAX_PATH];
+            MessageBoxA(s_main, "Choose your console's BIOS image first, then its MCPX boot ROM:\n\n"
+                        "MCPX 1.0 for an Xbox 1.0 (kernels 3944, 4034, 4036, 4627)\n"
+                        "MCPX 1.1 for an Xbox 1.1-1.6 (kernels 4817 to 5838)\n\n"
+                        "They are read only to decrypt the hard-drive key and are not kept.",
+                        "Insignia Setup", MB_ICONINFORMATION);
+            if (browse("BIOS image (*.bin)\0*.bin\0All files\0*.*\0", path, sizeof path) &&
+                browse("MCPX boot ROM (*.bin)\0*.bin\0All files\0*.*\0", mcpx, sizeof mcpx))
+                key_from_bios(path, mcpx);
+            return 0;
+        }
         case ID_KEY_EDIT:
             if (HIWORD(w) == EN_CHANGE) check_key();
             return 0;
@@ -413,7 +571,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
  * the same code. Exit 0 when saved; the reason goes to a message box. */
 static int run_args(void)
 {
-    const char *ee = NULL, *key = NULL, *info = NULL, *drive = NULL;
+    const char *ee = NULL, *key = NULL, *info = NULL, *drive = NULL, *bios = NULL, *mcpx = NULL;
     char t[128];
     int i;
     for (i = 1; i + 1 < __argc; i += 2) {
@@ -421,17 +579,20 @@ static int run_args(void)
         else if (!strcmp(__argv[i], "--hdd-key")) key = __argv[i + 1];
         else if (!strcmp(__argv[i], "--hddinfo")) info = __argv[i + 1];
         else if (!strcmp(__argv[i], "--drive")) drive = __argv[i + 1];
+        else if (!strcmp(__argv[i], "--bios")) bios = __argv[i + 1];
+        else if (!strcmp(__argv[i], "--mcpx")) mcpx = __argv[i + 1];
         else return 2;
     }
     s_cli = 1;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) freopen("CONOUT$", "w", stderr);
-    if (!ee || !drive || (!key && !info)) {
+    if (!ee || !drive || (!key && !info && !(bios && mcpx))) {
         fprintf(stderr, "usage: insignia_setup --eeprom FILE (--hdd-key HEX | --hddinfo FILE) --drive FILE\n");
         return 2;
     }
     check_eeprom(ee);
     if (key) { SetWindowTextA(s_key, key); check_key(); }
-    else key_from_hddinfo(info);
+    else if (info) key_from_hddinfo(info);
+    else { key_from_bios(bios, mcpx); GetWindowTextA(s_key_st, t, sizeof t); fprintf(stderr, "%s\n", t); }
     check_accounts(drive);
     GetWindowTextA(s_ee_st, t, sizeof t);
     if (!s_ee_ok) { tell(t, MB_ICONERROR); return 3; }
