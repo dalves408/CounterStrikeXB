@@ -1,0 +1,73 @@
+From b955d3abd02aae9be72fe0e18a72f119bffa7b85 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nv2a: pass texture stages' bump matrix and cube flag to the
+ back end
+
+SET_TEXTURE_SET_BUMP_ENV_MAT/_SCALE/_OFFSET (0x1B28-0x1B3C, per stage)
+were dropped. They are kept per stage now and, with FORMAT's CUBEMAP bit,
+handed to the back end in the program batch's stages[], so a back end can
+model BUMPENVMAP(_LUMINANCE): Counter-Strike's water (Aztec's river) is a
+V8U8 ripple map in one stage moving the water texture's coordinates in
+the next.
+---
+ src/kernel/nv2a_backend.h |  6 ++++++
+ src/kernel/nv2a_pb_exec.c | 11 +++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 71d1df0..2c2f636 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -53,6 +53,12 @@ typedef struct {
+      * 16-23). A back end that ignores them samples level 0. */
+     uint32_t levels, filter;
+     uint32_t palette;           /* guest CLUT address (P8); 0 if none */
++    /* Program batches only (stages[]): FORMAT's CUBEMAP bit, and the stage's
++     * SET_TEXTURE_SET_BUMP_ENV_MAT (00, 01, 10, 11), _SCALE and _OFFSET, which
++     * a BUMPENVMAP(_LUMINANCE) stage applies to the previous stage's (du, dv):
++     * s' = s + m00 du + m10 dv, t' = t + m01 du + m11 dv (D3D's texbem). */
++    uint32_t cube;
++    float    bump_mat[4], bump_scale, bump_offset;
+ } Nv2aTexture;
+ 
+ typedef struct {
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a7a0027..bae3e82 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -276,6 +276,8 @@ typedef struct {
+     uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
+     int      border_color;              /* FORMAT: BORDER reads `border` */
+     int      cube;                      /* FORMAT: six faces, not one    */
++    float    bump_mat[4];               /* SET_TEXTURE_SET_BUMP_ENV_MAT  */
++    float    bump_scale, bump_offset;   /* ..._BUMP_ENV_SCALE / _OFFSET  */
+     int      valid;
+     const uint32_t *decoded;            /* immutable for this draw batch */
+     uint32_t decoded_pitch;
+@@ -2432,6 +2434,10 @@ static void backend_batch_state(Nv2aSurface *surf, Nv2aRenderState *rs, Nv2aText
+             stages[st].levels = t->pitch ? 1 : t->levels;
+             stages[st].filter = t->filter;
+             stages[st].palette = t->palette;
++            stages[st].cube = (uint32_t)t->cube;
++            memcpy(stages[st].bump_mat, t->bump_mat, sizeof stages[st].bump_mat);
++            stages[st].bump_scale = t->bump_scale;
++            stages[st].bump_offset = t->bump_offset;
+             if (t->valid)
+                 batch.stage_valid |= 1u << st;
+         }
+@@ -4494,6 +4500,11 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+     case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
+         t->border = param;
+         break;
++    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34: /* SET_TEXTURE_SET_BUMP_ENV_MAT */
++        memcpy(&t->bump_mat[(reg - 0x1B28) / 4], &param, 4);
++        break;
++    case 0x1B38: memcpy(&t->bump_scale, &param, 4); break;   /* _BUMP_ENV_SCALE */
++    case 0x1B3C: memcpy(&t->bump_offset, &param, 4); break;  /* _BUMP_ENV_OFFSET */
+     default:
+         break;
+     }
+-- 
+2.51.0.windows.2
+

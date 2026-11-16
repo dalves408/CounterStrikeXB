@@ -79,7 +79,7 @@ static void mapout(char *d, size_t n, const char *x, uint32_t m)
 
 static const char k_head[] =
 "cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint opaque; uint dbg; uint3 pad; };\n"
-"cbuffer RC : register(b1) { uint4 hdr; uint4 hdr2; float4 fogc; float4 uvs[4]; uint4 stg[16]; };\n"
+"cbuffer RC : register(b1) { uint4 hdr; uint4 hdr2; float4 fogc; float4 uvs[4]; uint4 stg[16]; float4 bm[4]; float4 bso[4]; };\n"
 "Texture2D tx0 : register(t0); Texture2D tx1 : register(t1); Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
 "SamplerState sm0 : register(s0); SamplerState sm1 : register(s1); SamplerState sm2 : register(s2); SamplerState sm3 : register(s3);\n"
 "struct VO { float4 pos : SV_Position; float4 c : COLOR0; float4 d1 : TEXCOORD1;\n"
@@ -91,6 +91,13 @@ static const char k_head[] =
 "  return (u.z == 0.0) ? float4(1, 1, 1, 1) : t.SampleGrad(s, c, gx, gy); }\n"
 "float4 dsample(Texture2D t, SamplerState s, float2 c, float4 u) {\n"
 "  if (u.w != 0.0) c = frac(c); return (u.z == 0.0) ? float4(1, 1, 1, 1) : t.Sample(s, c); }\n"
+"float sbyte(float v) { float b = round(v * 255.0); return (b > 127.0 ? b - 256.0 : b) / 127.0; }\n"
+"float4 bsample(Texture2D t, SamplerState s, float4 tc, float4 u, float4 prev, float4 m) {\n"
+"  float du = sbyte(prev.r), dv = sbyte(prev.g);\n"
+"  float2 c = tc.xy / ((tc.w != 0.0) ? tc.w : 1.0);\n"
+"  float2 gx = ddx(c * u.xy), gy = ddy(c * u.xy);\n"
+"  c = (c + float2(m.x * du + m.z * dv, m.y * du + m.w * dv)) * u.xy; if (u.w != 0.0) c = frac(c);\n"
+"  return (u.z == 0.0) ? float4(1, 1, 1, 1) : t.SampleGrad(s, c, gx, gy); }\n"
 "float4 main(VO i) : SV_Target {\n"
 "  float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0, R8 = 0, R9 = 0, R10 = 0, R11 = 0, R12 = 0, R13 = 0, R14 = 0, R15 = 0;\n"
 "  float4 out4; bool mux_cd;\n"
@@ -166,6 +173,18 @@ size_t cs_rc_to_hlsl(const Nv2aCombiner *rc, char *buf, size_t n)
          * D3D's shaders use. CS's buy menu wedges look their colours up so. */
         else if ((mode == 15u || mode == 16u) && k > 0u)
             put(&o, "  R%u = dsample(tx%u, sm%u, R8.%s, uvs[%u]);\n", 8u + k, k, k, mode == 15u ? "ar" : "gb", k);
+        /* BUMPENVMAP (D3D texbem): this stage's texture at its coordinates
+         * moved by the bump matrix times the previous stage's signed (du, dv)
+         * -- a V8U8 map, decoded as (lo, hi, lo, hi): du red, dv green.
+         * _LUMINANCE (texbeml) also scales the result by the third byte
+         * times bso.x plus bso.y. The other-stage-input register is not
+         * tracked: the previous stage, as D3D's texbem tN, tN-1 has it.
+         * Aztec's river: a ripple map in stage 1, the water in stage 2. */
+        else if ((mode == 6u || mode == 7u) && k > 0u) {
+            put(&o, "  R%u = bsample(%s, uvs[%u], R%u, bm[%u]);\n", 8u + k, tx[k], k, 7u + k, k);
+            if (mode == 7u)
+                put(&o, "  R%u.rgb *= saturate(R%u.b * bso[%u].x + bso[%u].y);\n", 8u + k, 7u + k, k, k);
+        }
         else put(&o, "  R%u = float4(0, 0, 0, 0);\n", 8u + k);
     }
     put(&o, "  R12.a = %s;\n", (sp & 31u) ? "R8.a" : "1.0");

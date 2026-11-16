@@ -14,8 +14,9 @@
  * toolkit's nv2a_rc_eval (tools/xboxrecomp/src/kernel/nv2a_combiner.c).
  * Blend / depth / alpha-test / stencil / cull / colour-mask state applies to
  * both. Guest textures use level 0. Optional BC7 replacements have mipmaps.
- * Not modelled yet: cube maps, bump/dot
- * product stage programs (they read zero, as in the CPU rasteriser).
+ * Bump environment maps (BUMPENVMAP, _LUMINANCE: Aztec's river) are modelled
+ * in cs_rc_hlsl.c. Not modelled yet: cube maps (read white) and dot-product
+ * stage programs (they read zero, as in the CPU rasteriser).
  *
  * Structure follows the other xboxrecomp D3D11 back ends on this PC as
  * references only (C:\Recomp\mvc2_pc\src\gpu_backend.c, Redcard 2003,
@@ -261,6 +262,9 @@ typedef struct {
     uint32_t hdr[4], hdr2[4];
     float fogc[4], uvs[4][4];
     uint32_t stg[16][4];
+    /* Specialised shaders only (cs_rc_hlsl.c): per stage, the bump matrix
+     * (00, 01, 10, 11) and (luminance scale, offset, -, -). */
+    float bm[4][4], bso[4][4];
 } RcCb;
 
 static ID3D11Device *s_dev;
@@ -1120,7 +1124,13 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
         srv = get_tex(b->texture, &opaque, &use_mips);
         smp = get_sampler(b->texture, use_mips);
         cb.textured = (srv != s_white_srv) ? 1u : 0u;
-        cb.opaque = opaque ? 1u : 0u;
+        /* Screen-space draws: texture times diffuse, so a texture with no
+         * alpha channel makes the pixel opaque. Not for combiner draws: there
+         * stage 0 is one input among several (its alpha already decodes as
+         * 1) and the combiners compute the output alpha. Aztec's river has
+         * an X8R8G8B8 cube map in stage 0 and a 10-30% alpha of its own;
+         * forcing 1 drew it as an opaque grey sheet over the riverbed. */
+        cb.opaque = (opaque && !b->combiner) ? 1u : 0u;
         cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
     }
     if (s_force_a1) cb.opaque = 1u;
@@ -1162,7 +1172,11 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
                             st, mode, (b->stage_valid >> st) & 1u, t->offset, t->width, t->height, t->color, t->pitch,
                             t->addr_u, t->addr_v, t->filter, b->stages[0].offset, b->stages[0].width, b->stages[0].height, b->stages[0].color);
             }
-            if ((mode == 1 || mode == 2 || ((mode == 15 || mode == 16) && st > 0)) && (b->stage_valid & (1u << st))) {
+            if (mode == 6 || mode == 7) {   /* BUMPENVMAP(_LUMINANCE): the matrix and luminance terms */
+                memcpy(rcb.bm[st], t->bump_mat, sizeof rcb.bm[st]);
+                rcb.bso[st][0] = t->bump_scale; rcb.bso[st][1] = t->bump_offset;
+            }
+            if ((mode == 1 || mode == 2 || ((mode == 15 || mode == 16 || mode == 6 || mode == 7) && st > 0)) && (b->stage_valid & (1u << st))) {
                 int use_mips;
                 srvs[st] = get_tex(t, &op, &use_mips);
                 smps[st] = get_sampler(t, use_mips && (mode == 1 || mode == 2));
