@@ -192,6 +192,17 @@ checks every file. `python scripts\index_texture_pack.py <asset-root>` builds a 
 
 `src/recomp/gen` is pure pipeline output, generated from your disc, and is never edited by hand or committed.
 
+## License
+
+CounterStrikeXB is under the [PolyForm Strict License 1.0.0](LICENSE): you may read, study, build and play it for
+personal, noncommercial use, but not change it or share copies, changed or not. Get the game from this project's
+[releases](https://github.com/dalves408/CounterStrikeXB/releases). The toolkit patches in `patches/xboxrecomp/` stay
+under the toolkit's MIT License.
+
+**Why:** the game signs in to Xbox Live through Insignia, a community-run service shared with players on real
+consoles. Keeping modified builds off it protects everyone there from cheating. Bug reports and suggestions are
+welcome as [issues](https://github.com/dalves408/CounterStrikeXB/issues).
+
 ## Legal
 
 This repository contains original source code, scripts and documentation, plus an icon (`resources/cs.ico`,
