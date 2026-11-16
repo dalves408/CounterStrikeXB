@@ -44,7 +44,9 @@ def manifest():
         setting('stretch', 'Stretch image', 'display/stretch', [('Off (4:3)', 0), ('On (fills window)', 1)], 0),
         setting('vsync', 'VSync', 'display/vsync', toggle, 0),
         setting('frame-rate', 'Frame rate limit', 'display/frame_rate',
-                [('30', 30), ('60', 60), ('120', 120), ('144', 144), ('240', 240), ('Unlimited', 0)], 60),
+                [('30', 30), ('60', 60), ('72', 72)], 60,
+                '72 is the game\'s own limit. The game uses it on 144 Hz or FreeSync/G-Sync monitors; elsewhere it '
+                'runs at 60, the smooth choice there.'),
         setting('msaa', 'Anti-aliasing (MSAA)', 'display/msaa', [('Off', 1), ('2x', 2), ('4x', 4), ('8x', 8)], 1),
         setting('anisotropy', 'Texture filtering', 'display/anisotropy',
                 [('Off', 1), ('2x', 2), ('4x', 4), ('8x', 8), ('16x', 16)], 1),

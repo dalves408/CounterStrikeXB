@@ -6,13 +6,13 @@
 #include <string.h>
 #include "cs_settings.h"
 
-const int CS_SET_RATE_HZ[CS_SET_RATES] = { 30, 60, 120, 144, 240, 0 };
+const int CS_SET_RATE_HZ[CS_SET_RATES] = { 30, 60, 72 };
 const int CS_SET_MSAA_N[CS_SET_MSAAS] = { 1, 2, 4, 8 };
 const int CS_SET_ANISO_N[CS_SET_ANISOS] = { 1, 2, 4, 8, 16 };
 const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES] = {
     "Low  (1x, 640x480)", "Medium  (2x, 1280x960)", "High  (3x, 1920x1440)" };
 const char *const CS_SET_RATE_TEXT[CS_SET_RATES] = {
-    "30", "60", "120", "144", "240", "Uncapped" };
+    "30", "60", "72" };
 const char *const CS_SET_MSAA_TEXT[CS_SET_MSAAS] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
 const char *const CS_SET_ANISO_TEXT[CS_SET_ANISOS] = { "Off", "2x", "4x", "8x", "16x" };
 
@@ -71,7 +71,11 @@ void cs_settings_load(CsSettings *s)
     s->fullscreen = get(path, "fullscreen", s->fullscreen) != 0;
     s->stretch = get(path, "stretch", s->stretch) != 0;
     s->vsync = get(path, "vsync", s->vsync) != 0;
-    s->frame_rate = CS_SET_RATE_HZ[cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, get(path, "frame_rate", s->frame_rate))];
+    {   /* 72 is the game's own limit: older choices above it, and uncapped (0), are 72 */
+        int r = get(path, "frame_rate", s->frame_rate);
+        if (r <= 0 || r > 72) r = 72;
+        s->frame_rate = CS_SET_RATE_HZ[cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, r)];
+    }
     s->msaa = CS_SET_MSAA_N[cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, get(path, "msaa", s->msaa))];
     s->aniso = CS_SET_ANISO_N[cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, get(path, "anisotropy", s->aniso))];
     s->hires = get(path, "hires_textures", s->hires) != 0;
@@ -181,4 +185,98 @@ void cs_settings_startup(void)
     fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d, hi-res textures %d\n",
             g_cs_settings.scale, g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
             g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso, g_cs_settings.hires);
+}
+
+/* ---- the frame-rate top for a monitor --------------------------------------------------------- */
+/* Adaptive sync in a monitor's EDID: the AMD FreeSync vendor block or an HDMI
+ * Forum block with a VRR range (CTA-861 extensions), or a DisplayID 2.0
+ * Adaptive-Sync block. G-Sync Compatible monitors carry one of these; a native
+ * G-Sync module may not, and then 60 is the top until the refresh rate is set
+ * to 144 Hz. */
+static int edid_vrr(const BYTE *e, DWORD n)
+{
+    DWORD b;
+    for (b = 128; b + 128 <= n; b += 128) {
+        const BYTE *x = e + b;
+        if (x[0] == 0x02) {                             /* CTA-861: data blocks from 4 to x[2] */
+            DWORD p = 4, end = x[2] >= 4 && x[2] <= 127 ? x[2] : 4;
+            while (p < end) {
+                DWORD tag = x[p] >> 5, len = x[p] & 31;
+                if (p + 1 + len > end) break;
+                if (tag == 3 && len >= 3) {
+                    DWORD oui = x[p + 1] | (x[p + 2] << 8) | ((DWORD)x[p + 3] << 16);
+                    if (oui == 0x00001A) return 1;      /* AMD FreeSync */
+                    if (oui == 0xC45DD8 && len >= 9 && (x[p + 9] & 0x3F)) return 1;   /* HDMI 2.1 VRRmin */
+                }
+                p += 1 + len;
+            }
+        } else if (x[0] == 0x70) {                      /* DisplayID: blocks of tag, revision, length */
+            DWORD p = 5, end = 5 + x[2];
+            if (end > 127) end = 127;
+            while (p + 3 <= end) {
+                if (x[p] == 0x2B) return 1;             /* Adaptive-Sync */
+                if (!x[p] && !x[p + 2]) break;
+                p += 3 + x[p + 2];
+            }
+        }
+    }
+    return 0;
+}
+
+/* The monitor's EDID from the registry: its device interface name,
+ * \?\DISPLAY#<id>#<instance>#{guid}, names Enum\DISPLAY\<id>\<instance>. */
+static int monitor_vrr(const char *display)
+{
+    DISPLAY_DEVICEA m;
+    DWORD i;
+    memset(&m, 0, sizeof m);
+    m.cb = sizeof m;
+    for (i = 0; EnumDisplayDevicesA(display, i, &m, EDD_GET_DEVICE_INTERFACE_NAME); i++) {
+        char id[128], key[400], *a, *b, *c;
+        BYTE edid[1024];
+        DWORD sz = sizeof edid;
+        HKEY k;
+        if (!(m.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+        snprintf(id, sizeof id, "%s", m.DeviceID);
+        a = strchr(id, '#'); b = a ? strchr(a + 1, '#') : NULL; c = b ? strchr(b + 1, '#') : NULL;
+        if (!c) continue;
+        *b = 0; *c = 0;
+        snprintf(key, sizeof key, "SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\%s\\%s\\Device Parameters", a + 1, b + 1);
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &k)) continue;
+        if (!RegQueryValueExA(k, "EDID", NULL, NULL, edid, &sz) && sz >= 128 && edid_vrr(edid, sz)) {
+            RegCloseKey(k);
+            return 1;
+        }
+        RegCloseKey(k);
+    }
+    return 0;
+}
+
+int cs_settings_rate_max(void *monitor, int *hz, int *vrr)
+{
+    MONITORINFOEXA mi;
+    DEVMODEA dm;
+    HMONITOR mon = monitor ? (HMONITOR)monitor : MonitorFromPoint((POINT){ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    int r = 0, v;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (GetMonitorInfoA(mon, (MONITORINFO *)&mi) && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+        r = (int)dm.dmDisplayFrequency;
+    v = mi.szDevice[0] ? monitor_vrr(mi.szDevice) : 0;
+    if (hz) *hz = r;
+    if (vrr) *vrr = v;
+    /* Adaptive sync (any refresh rate that reaches 72, 120 Hz included): the monitor follows the game. Without
+     * it, 72 shows each frame for the same number of refreshes only on 144 Hz (and 72, 216, 288); Windows
+     * reports 143.9 Hz as 143. */
+    if (v && r >= 71) return 72;
+    return r >= 71 && (r % 72 <= 1 || r % 72 >= 71) ? 72 : 60;
+}
+
+int cs_settings_rate_choices(int rate_max) { return rate_max >= 72 ? CS_SET_RATES : CS_SET_RATES - 1; }
+
+int cs_settings_rate_effective(int frame_rate, int rate_max)
+{
+    return frame_rate > rate_max ? rate_max : frame_rate;
 }

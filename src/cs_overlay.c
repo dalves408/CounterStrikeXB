@@ -72,7 +72,7 @@ static int item_count(int i)
 {
     switch (i) {
     case IT_SCALE: return CS_SET_SCALES;
-    case IT_RATE:  return CS_SET_RATES;
+    case IT_RATE:  return cs_settings_rate_choices(cs_d3d11_rate_max());   /* 72 only where it is smooth */
     case IT_MSAA:  return CS_SET_MSAAS;
     case IT_ANISO: return CS_SET_ANISOS;
     case IT_FULLSCREEN: case IT_STRETCH: case IT_VSYNC: case IT_HIRES: return 2;
@@ -88,7 +88,8 @@ static int item_get(int i)
     case IT_FULLSCREEN: return xbox_FramebufferIsFullscreen() ? 1 : 0;
     case IT_STRETCH: return s->stretch;
     case IT_VSYNC: return s->vsync;
-    case IT_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, s->frame_rate);
+    case IT_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES,
+                                           cs_settings_rate_effective(s->frame_rate, cs_d3d11_rate_max()));
     case IT_MSAA: return cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, s->msaa);
     case IT_ANISO: return cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, s->aniso);
     case IT_HIRES: return s->hires;

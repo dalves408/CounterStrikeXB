@@ -53,11 +53,19 @@ static HWND s_main, s_tab, s_list, s_status, s_combo[NVIDEO];
 static HWND s_vpage[32], s_cpage[16];
 static int s_nv, s_nc;
 
+/* The top frame-rate cap for the main monitor (the game checks the monitor its window is on). */
+static int rate_top(void)
+{
+    static int top;
+    if (!top) top = cs_settings_rate_max(NULL, NULL, NULL);
+    return top;
+}
+
 static int video_count(int i)
 {
     switch (i) {
     case V_SCALE: return CS_SET_SCALES;
-    case V_RATE: return CS_SET_RATES;
+    case V_RATE: return cs_settings_rate_choices(rate_top());   /* 72 only where it is smooth */
     case V_MSAA: return CS_SET_MSAAS;
     case V_ANISO: return CS_SET_ANISOS;
     }
@@ -83,7 +91,7 @@ static int video_get(int i)
     case V_FULLSCREEN: return s_set.fullscreen;
     case V_STRETCH: return s_set.stretch;
     case V_VSYNC: return s_set.vsync;
-    case V_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, s_set.frame_rate);
+    case V_RATE: return cs_settings_index(CS_SET_RATE_HZ, CS_SET_RATES, cs_settings_rate_effective(s_set.frame_rate, rate_top()));
     case V_MSAA: return cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, s_set.msaa);
     case V_ANISO: return cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, s_set.aniso);
     case V_HIRES: return s_set.hires;
@@ -308,7 +316,7 @@ static void make_ui(HWND h)
     s_vpage[s_nv++] = mk("STATIC",
         "Render scale: Low draws the game at the Xbox's own 640x480, Medium at 2x and High at 3x. Anti-aliasing smooths edges and anisotropic "
         "filtering keeps distant textures sharp; both cost a little GPU time. Fullscreen fills the screen without a border "
-        "(F11 or Alt+Enter switch while playing). Frame rate cap limits how fast the game runs. Hi-res textures uses the "
+        "(F11 or Alt+Enter switch while playing). Frame rate cap: 72 is the game's own limit and is offered on 144 Hz or FreeSync/G-Sync monitors; elsewhere 60 is the smooth choice. Hi-res textures uses the "
         "texture_pack folder beside the game when it is there.",
         SS_LEFT, 30, 416, 540, 84, 0, f);
 

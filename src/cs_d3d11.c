@@ -2446,14 +2446,49 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
     cs_diag_frame();
 }
 
-/* The frame-rate cap (settings: 30..240, 0 = none): wait out the rest of the frame. */
+/* The top cap for the window's monitor (cs_settings_rate_max), looked up again every two seconds: the window can move
+ * to another monitor, or the refresh rate change. */
+static volatile LONG s_rate_max = 60;
+
+int cs_d3d11_rate_max(void) { return (int)s_rate_max; }
+
+static void rate_max_update(void)
+{
+    static DWORD last;
+    static HMONITOR last_mon;
+    static int last_hz = -1;
+    DWORD t = GetTickCount();
+    HWND h;
+    HMONITOR mon;
+    int hz, vrr, top;
+    if (last && t - last < 2000) return;
+    last = t;
+    h = (HWND)xbox_FramebufferWindowHwnd();
+    mon = h ? MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) : NULL;
+    {
+        DEVMODEA dm; MONITORINFOEXA mi;
+        memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+        memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+        hz = mon && GetMonitorInfoA(mon, (MONITORINFO *)&mi) &&
+             EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmDisplayFrequency : 0;
+    }
+    if (mon == last_mon && hz == last_hz) return;   /* same monitor, same refresh: the EDID is not read again */
+    last_mon = mon; last_hz = hz;
+    top = cs_settings_rate_max(mon, &hz, &vrr);
+    InterlockedExchange(&s_rate_max, top);
+    fprintf(stderr, "[CS-SET] frame rate top %d (monitor %d Hz, adaptive sync %s)\n", top, hz, vrr ? "yes" : "no");
+}
+
+/* The frame-rate cap (settings: 30, 60, 72; above the monitor's top, the top): wait out the rest of the frame. */
 static void frame_cap(void)
 {
     static LARGE_INTEGER f, next;
     static int timer_res;
     LARGE_INTEGER now;
     LONGLONG period;
-    int hz = g_cs_settings.frame_rate;
+    int hz;
+    rate_max_update();
+    hz = cs_settings_rate_effective(g_cs_settings.frame_rate, (int)s_rate_max);
     if (hz <= 0) { next.QuadPart = 0; return; }
     if (!f.QuadPart) QueryPerformanceFrequency(&f);
     if (!timer_res) { timer_res = 1; timeBeginPeriod(1); }

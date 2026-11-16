@@ -9,9 +9,10 @@ renderer drawing it at up to 3x the original resolution.
 
 ## Features
 
-- **The whole game:** training, single player with bots, every map, at 60 FPS and beyond.
+- **The whole game:** training, single player with bots, every map, at 60 FPS (72 on 144 Hz and FreeSync/G-Sync
+  monitors).
 - **Direct3D 11 renderer:** render scale 1x/2x/3x (640x480 to 1920x1440), MSAA up to 8x, anisotropic filtering up
-  to 16x, VSync, a frame-rate cap from 30 to 240 or uncapped, fullscreen, 4:3 or stretched. Picks the fast GPU on
+  to 16x, VSync, a frame-rate cap of 30, 60 or 72, fullscreen, 4:3 or stretched. Picks the fast GPU on
   laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
 - **System link:** LAN play between PCs, and online with friends over a VPN, no Xbox needed: Tailscale is found by
@@ -79,10 +80,14 @@ drawn over the game and changes these as you play, saving them as you go:
 | Fullscreen | borderless, on the window's monitor (default on) |
 | Stretch image | fill the window instead of keeping 4:3 |
 | VSync | on / off |
-| Frame rate cap | 30, 60 (default), 120, 144, 240, uncapped |
+| Frame rate cap | 30, 60 (default), 72 (on 144 Hz or FreeSync/G-Sync monitors) |
 | Anti-aliasing | off, 2x, 4x, 8x MSAA |
 | Anisotropic filtering | off, 2x to 16x |
 | Hi-res textures | on / off (when the pack is installed) |
+
+72 FPS is the game's own limit, as on the PC version of the time. It is offered only where it looks smooth: on a
+144 Hz monitor (two refreshes per frame) or one with FreeSync/G-Sync Compatible; on other monitors 60 is the top,
+which is smooth on 60, 120 and 240 Hz. A native G-Sync monitor that does not report adaptive sync gets 72 at 144 Hz.
 
 `config.exe` has the same options, and changes made there or in RecompLauncher while the game runs apply within a
 second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` and `keymap.ini`.
