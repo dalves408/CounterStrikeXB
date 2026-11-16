@@ -3,7 +3,7 @@
 A static recompilation of the original Xbox **Counter-Strike** (2003) into a native Windows x64 program, built on the
 [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit. The game's own code is translated to C and runs
 natively, with the Xbox's kernel, GPU, audio, USB and network hardware modelled around it, and a Direct3D 11
-renderer drawing it at up to 3x the original resolution.
+renderer drawing it at up to 5x the original resolution (4K).
 
 **No game data is included.** You need your own legally dumped copy of the disc (*Counter-Strike (USA)*).
 
@@ -11,7 +11,7 @@ renderer drawing it at up to 3x the original resolution.
 
 - **The whole game:** training, single player with bots, every map, at 60 FPS (72 on 144 Hz and FreeSync/G-Sync
   monitors).
-- **Direct3D 11 renderer:** render scale 1x/2x/3x (640x480 to 1920x1440), MSAA up to 8x, anisotropic filtering up
+- **Direct3D 11 renderer:** render scale from 1x (480p) to 5x (4K), MSAA up to 8x, anisotropic filtering up
   to 16x, VSync, a frame-rate cap of 30, 60 or 72, fullscreen, 4:3 or stretched. Picks the fast GPU on
   laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
@@ -83,7 +83,7 @@ drawn over the game and changes these as you play, saving them as you go:
 
 | Setting | Choices |
 | --- | --- |
-| Render scale | 1x (640x480, default), 2x (1280x960), 3x (1920x1440) |
+| Render scale | 1x (480p, the original, default), 2x (1080p), 3x (1440p), 4x (4K, lighter), 4.5x (4K), 5x (4K, sharpest) |
 | Fullscreen | borderless, on the window's monitor (default on) |
 | Stretch image | fill the window instead of keeping 4:3 |
 | VSync | on / off |

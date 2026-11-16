@@ -88,7 +88,7 @@ static const char *video_text(int i, int v)
 static int video_get(int i)
 {
     switch (i) {
-    case V_SCALE: return s_set.scale - 1;
+    case V_SCALE: return cs_settings_index(CS_SET_SCALE_X2, CS_SET_SCALES, s_set.scale_x2);
     case V_FULLSCREEN: return s_set.fullscreen;
     case V_STRETCH: return s_set.stretch;
     case V_VSYNC: return s_set.vsync;
@@ -103,7 +103,7 @@ static int video_get(int i)
 static void video_set(int i, int v)
 {
     switch (i) {
-    case V_SCALE: s_set.scale = v + 1; break;
+    case V_SCALE: s_set.scale_x2 = CS_SET_SCALE_X2[v]; break;
     case V_FULLSCREEN: s_set.fullscreen = v; break;
     case V_STRETCH: s_set.stretch = v; break;
     case V_VSYNC: s_set.vsync = v; break;
@@ -319,7 +319,7 @@ static void make_ui(HWND h)
         s_vpage[s_nv++] = s_combo[i];
     }
     s_vpage[s_nv++] = mk("STATIC",
-        "Render scale: Low draws the game at the Xbox's own 640x480, Medium at 2x and High at 3x. Anti-aliasing smooths edges and anisotropic "
+        "Render scale: pick your screen (480p is the Xbox's own 640x480); higher needs a faster graphics card. Anti-aliasing smooths edges and anisotropic "
         "filtering keeps distant textures sharp; both cost a little GPU time. Fullscreen fills the screen without a border "
         "(F11 or Alt+Enter switch while playing). Frame rate cap: 72 is the game's own limit and is offered on 144 Hz or FreeSync/G-Sync monitors; elsewhere 60 is the smooth choice. Hi-res textures uses the "
         "texture_pack folder beside the game when it is there.",

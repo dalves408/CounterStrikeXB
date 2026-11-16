@@ -83,7 +83,8 @@ extern const float *nv2a_vsh_constant(uint32_t index);   /* kernel/nv2a_vsh_inte
 #define PHYS(va) ((va) & 0x03FFFFFFu)
 
 /* Targets are made at the player's render scale (F1 / config.exe): w and h
- * stay the title's sizes, everything on the GPU is s_scale times larger. With
+ * stay the title's sizes, everything on the GPU is s_scale_x2 / 2 times
+ * larger (4.5x for a 4K screen's height; sizes round to whole pixels). With
  * MSAA the drawing goes to `ms` (rtv is its view) and is resolved into `tex`
  * (what srv samples and the presenter shows) before anything reads it. */
 typedef struct {
@@ -102,7 +103,9 @@ typedef struct {
     ID3D11DepthStencilView *dsv;
 } Ds;
 
-static int s_scale = 1, s_msaa = 1, s_aniso = 1, s_hires = 1;   /* what the targets and samplers are made with now */
+static int s_scale_x2 = 2, s_msaa = 1, s_aniso = 1, s_hires = 1;   /* what the targets and samplers are made with now */
+/* A title size at the render scale. */
+static UINT scaled(uint32_t v) { return (UINT)(((uint64_t)v * (uint32_t)s_scale_x2 + 1u) / 2u); }
 static int s_presenting;                           /* our presenter draws the window (cs_window_present) */
 static void settings_apply(int first);
 
@@ -521,7 +524,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     if (free_i < 0) { free_i = lru; rt_release(&s_rt[free_i]); }
     r = &s_rt[free_i];
     memset(&td, 0, sizeof td);
-    td.Width = s->width * (UINT)s_scale; td.Height = s->height * (UINT)s_scale; td.MipLevels = td.ArraySize = 1;
+    td.Width = scaled(s->width); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->tex))) { rt_release(r); return NULL; }
@@ -533,13 +536,13 @@ static Rt *get_rt(const Nv2aSurface *s)
         td.SampleDesc.Count = 1;
     } else
         ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->tex, NULL, &r->rtv);
-    if (s_scale == 1) {   /* the copy back to guest memory is at the title's size */
+    if (s_scale_x2 == 2) {   /* the copy back to guest memory is at the title's size */
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->stage);
     }
     r->va = PHYS(s->color_va); r->rawva = s->color_va; r->w = s->width; r->h = s->height;
     r->pitch = s->pitch; r->bpp = s->bytes_per_pixel; r->used = s_tick; r->dirty = 0; r->unresolved = 0;
-    if (!r->srv || !r->rtv || (s_scale == 1 && !r->stage)) { rt_release(r); return NULL; }
+    if (!r->srv || !r->rtv || (s_scale_x2 == 2 && !r->stage)) { rt_release(r); return NULL; }
     if (s_log)
         fprintf(stderr, "[CS-D3D11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n",
                 s->color_va, s->width, s->height, s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy);
@@ -556,7 +559,7 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     for (i = 0; i < MAX_DS; i++) if (!s_ds[i].tex) { slot = i; break; }
     if (slot < 0) { slot = (int)(s_tick % MAX_DS); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
-    td.Width = s->width * (UINT)s_scale; td.Height = s->height * (UINT)s_scale; td.MipLevels = td.ArraySize = 1;
+    td.Width = scaled(s->width); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = (UINT)s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
@@ -1225,8 +1228,8 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, ds ? ds->dsv : NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
-    vp.TopLeftX = vp.TopLeftY = s_pixofs * (float)s_scale;
-    vp.Width = (float)(s->width * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale);
+    vp.TopLeftX = vp.TopLeftY = s_pixofs * (float)s_scale_x2 * 0.5f;
+    vp.Width = (float)scaled(s->width); vp.Height = (float)scaled(s->height);
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_PSSetShader(s_ctx, !use_rc ? s_ps : (cb.dbg ? s_ps_rc : rc_shader(b->combiner)), NULL, 0);
@@ -1541,7 +1544,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &one);
         }
         box.left = (UINT)s_pick_x; box.top = (UINT)s_pick_y; box.right = box.left + 1; box.bottom = box.top + 1; box.front = 0; box.back = 1;
-        if (one && s_scale == 1 && s_msaa == 1 && box.right <= rt->w && box.bottom <= rt->h) {
+        if (one && s_scale_x2 == 2 && s_msaa == 1 && box.right <= rt->w && box.bottom <= rt->h) {
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)one, 0, 0, 0, 0, (ID3D11Resource *)rt->tex, 0, &box);
             if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)one, 0, D3D11_MAP_READ, 0, &pm))) {
                 fprintf(stderr, "[PICK]    -> pixel now %08X\n", *(const uint32_t *)pm.pData);
@@ -2181,14 +2184,14 @@ static int msaa_supported(int want)
 /* Between frames, on the executor thread: make the targets and samplers match the settings. */
 static void settings_apply(int first)
 {
-    int scale = g_cs_settings.scale < 1 ? 1 : g_cs_settings.scale > CS_SET_SCALES ? CS_SET_SCALES : g_cs_settings.scale;
+    int scale = CS_SET_SCALE_X2[cs_settings_index(CS_SET_SCALE_X2, CS_SET_SCALES, g_cs_settings.scale_x2)];
     int msaa = msaa_supported(g_cs_settings.msaa), aniso = g_cs_settings.aniso, i;
     if (aniso < 1) aniso = 1;
     if (aniso > 16) aniso = 16;
-    if (scale != s_scale || msaa != s_msaa) {
+    if (scale != s_scale_x2 || msaa != s_msaa) {
         for (i = 0; i < MAX_RT; i++) if (s_rt[i].tex || s_rt[i].ms) rt_release(&s_rt[i]);
         for (i = 0; i < MAX_DS; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); memset(&s_ds[i], 0, sizeof s_ds[i]); }
-        s_scale = scale; s_msaa = msaa;
+        s_scale_x2 = scale; s_msaa = msaa;
     }
     if (aniso != s_aniso) {
         for (i = 0; i < s_nss; i++) { ID3D11SamplerState *o = (ID3D11SamplerState *)s_ss[i].obj; SAFE_REL(o); }
@@ -2203,8 +2206,8 @@ static void settings_apply(int first)
         if (!s_hires) cs_pack_drop();
     }
     if (first || s_log)
-        fprintf(stderr, "[CS-D3D11] render scale %dx (%ux%u), msaa %d%s, anisotropy %d, hi-res textures %d\n", s_scale,
-                640u * (unsigned)s_scale, 480u * (unsigned)s_scale, s_msaa,
+        fprintf(stderr, "[CS-D3D11] render scale %d%sx (%ux%u), msaa %d%s, anisotropy %d, hi-res textures %d\n",
+                s_scale_x2 / 2, (s_scale_x2 & 1) ? ".5" : "", scaled(640), scaled(480), s_msaa,
                 msaa != g_cs_settings.msaa ? " (the most this card has)" : "", s_aniso, s_hires);
 }
 

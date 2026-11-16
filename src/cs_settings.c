@@ -9,8 +9,9 @@
 const int CS_SET_RATE_HZ[CS_SET_RATES] = { 30, 60, 72 };
 const int CS_SET_MSAA_N[CS_SET_MSAAS] = { 1, 2, 4, 8 };
 const int CS_SET_ANISO_N[CS_SET_ANISOS] = { 1, 2, 4, 8, 16 };
+const int CS_SET_SCALE_X2[CS_SET_SCALES] = { 2, 4, 6, 8, 9, 10 };
 const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES] = {
-    "Low  (1x, 640x480)", "Medium  (2x, 1280x960)", "High  (3x, 1920x1440)" };
+    "1x  (480p)", "2x  (1080p)", "3x  (1440p)", "4x  (4K, lighter)", "4.5x  (4K)", "5x  (4K, sharpest)" };
 const char *const CS_SET_RATE_TEXT[CS_SET_RATES] = {
     "30", "60", "72" };
 const char *const CS_SET_MSAA_TEXT[CS_SET_MSAAS] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
@@ -20,7 +21,7 @@ CsSettings g_cs_settings;
 
 void cs_settings_defaults(CsSettings *s)
 {
-    s->scale = 1;
+    s->scale_x2 = 2;
     s->fullscreen = 1;      /* a fresh install starts fullscreen; settings.ini keeps the player's choice */
     s->stretch = 0;
     s->vsync = 0;
@@ -59,15 +60,17 @@ static int get(const char *path, const char *key, int def)
     return (int)GetPrivateProfileIntA("display", key, def, path);
 }
 
-static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
-
 void cs_settings_load(CsSettings *s)
 {
     char path[MAX_PATH];
     cs_settings_defaults(s);
     if (!cs_settings_path("settings.ini", path, sizeof path, 0))
         return;
-    s->scale = clampi(get(path, "resolution_scale", s->scale), 1, CS_SET_SCALES);
+    {   /* "1".."5" or "4.5": the nearest offered scale */
+        char v[16];
+        GetPrivateProfileStringA("display", "resolution_scale", "1", v, sizeof v, path);
+        s->scale_x2 = CS_SET_SCALE_X2[cs_settings_index(CS_SET_SCALE_X2, CS_SET_SCALES, (int)(atof(v) * 2.0 + 0.5))];
+    }
     s->fullscreen = get(path, "fullscreen", s->fullscreen) != 0;
     s->stretch = get(path, "stretch", s->stretch) != 0;
     s->vsync = get(path, "vsync", s->vsync) != 0;
@@ -123,7 +126,11 @@ int cs_settings_save(const CsSettings *s)
     int ok;
     if (!cs_settings_path("settings.ini", path, sizeof path, 1))
         return 0;
-    ok = put(path, "resolution_scale", s->scale);
+    {
+        char v[16];
+        snprintf(v, sizeof v, (s->scale_x2 & 1) ? "%d.5" : "%d", s->scale_x2 / 2);
+        ok = WritePrivateProfileStringA("display", "resolution_scale", v, path) != 0;
+    }
     ok &= put(path, "fullscreen", s->fullscreen);
     ok &= put(path, "stretch", s->stretch);
     ok &= put(path, "vsync", s->vsync);
@@ -217,8 +224,8 @@ void cs_settings_startup(void)
             fprintf(stderr, "[CS-SET] system link with xemu\n");
         }
     }
-    fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d, hi-res textures %d\n",
-            g_cs_settings.scale, g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
+    fprintf(stderr, "[CS-SET] scale %d%sx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d, hi-res textures %d\n",
+            g_cs_settings.scale_x2 / 2, (g_cs_settings.scale_x2 & 1) ? ".5" : "", g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
             g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso, g_cs_settings.hires);
 }
 

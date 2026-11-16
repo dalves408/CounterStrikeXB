@@ -3,8 +3,9 @@
  * config.exe.
  *
  * %LOCALAPPDATA%\CounterStrikeXB\settings.ini, [display]:
- *   resolution_scale  1..3      internal resolution: Low 1x (the Xbox's 640x480, default),
- *                               Medium 2x, High 3x
+ *   resolution_scale  1, 2, 3, 4, 4.5, 5   internal resolution, times the Xbox's 640x480
+ *                               (default 1). Named by the screen each fits best: 480p,
+ *                               1080p, 1440p, then 4K (4.5x is exactly its 2160 lines).
  *   fullscreen        0/1       borderless fullscreen at start (F11 / Alt+Enter toggle)
  *   stretch           0/1       fill the window instead of keeping 4:3
  *   vsync             0/1
@@ -26,7 +27,7 @@
 #define CS_SETTINGS_H
 
 typedef struct {
-    int scale;        /* 1..4 */
+    int scale_x2;     /* twice the render scale: 2, 4, 6, 8, 9, 10 (4.5x is 9) */
     int fullscreen;   /* 0/1 */
     int stretch;      /* 0/1 */
     int vsync;        /* 0/1 */
@@ -37,13 +38,14 @@ typedef struct {
 } CsSettings;
 
 /* The choices each option offers, in menu order, and their names. */
-#define CS_SET_SCALES 3                               /* Low 1x (default), Medium 2x, High 3x */
+#define CS_SET_SCALES 6                               /* 1x (default), 2x, 3x, 4x, 4.5x, 5x */
 #define CS_SET_RATES 3
 #define CS_SET_MSAAS 4
 #define CS_SET_ANISOS 5
 extern const int CS_SET_RATE_HZ[CS_SET_RATES];        /* 30, 60, 72 */
 extern const int CS_SET_MSAA_N[CS_SET_MSAAS];         /* 1, 2, 4, 8 */
 extern const int CS_SET_ANISO_N[CS_SET_ANISOS];       /* 1, 2, 4, 8, 16 */
+extern const int CS_SET_SCALE_X2[CS_SET_SCALES];      /* 2, 4, 6, 8, 9, 10 */
 extern const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES];
 extern const char *const CS_SET_RATE_TEXT[CS_SET_RATES];
 extern const char *const CS_SET_MSAA_TEXT[CS_SET_MSAAS];

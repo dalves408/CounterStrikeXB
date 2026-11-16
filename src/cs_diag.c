@@ -411,9 +411,9 @@ static void video_line(const char *why)
     dm.dmSize = sizeof dm;
     if (!EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) dm.dmDisplayFrequency = 0;
     GetLocalTime(&st);
-    putf("[VIDEO] %02d:%02d:%02d %s: render scale %dx, msaa %d, anisotropy %d, vsync %d, frame cap %d, stretch %d, "
+    putf("[VIDEO] %02d:%02d:%02d %s: render scale %d%sx, msaa %d, anisotropy %d, vsync %d, frame cap %d, stretch %d, "
          "fullscreen %d, hi-res textures %d | window %ldx%ld, monitor %lu Hz\n", st.wHour, st.wMinute, st.wSecond, why,
-         c->scale, c->msaa, c->aniso, c->vsync, c->frame_rate, c->stretch, xbox_FramebufferIsFullscreen(), c->hires,
+         c->scale_x2 / 2, (c->scale_x2 & 1) ? ".5" : "", c->msaa, c->aniso, c->vsync, c->frame_rate, c->stretch, xbox_FramebufferIsFullscreen(), c->hires,
          (long)r.right, (long)r.bottom, (unsigned long)dm.dmDisplayFrequency);
 }
 

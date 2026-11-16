@@ -85,7 +85,7 @@ static int item_get(int i)
 {
     const CsSettings *s = &g_cs_settings;
     switch (i) {
-    case IT_SCALE: return s->scale - 1;
+    case IT_SCALE: return cs_settings_index(CS_SET_SCALE_X2, CS_SET_SCALES, s->scale_x2);
     case IT_FULLSCREEN: return xbox_FramebufferIsFullscreen() ? 1 : 0;
     case IT_STRETCH: return s->stretch;
     case IT_VSYNC: return s->vsync;
@@ -116,7 +116,7 @@ static void item_set(int i, int v)
 {
     CsSettings *s = &g_cs_settings;
     switch (i) {
-    case IT_SCALE: s->scale = v + 1; cs_d3d11_settings_changed(); break;
+    case IT_SCALE: s->scale_x2 = CS_SET_SCALE_X2[v]; cs_d3d11_settings_changed(); break;
     case IT_FULLSCREEN:
         if (v != item_get(IT_FULLSCREEN)) xbox_FramebufferToggleFullscreen();
         s->fullscreen = v;
