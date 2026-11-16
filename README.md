@@ -14,8 +14,8 @@ renderer drawing it at up to 3x the original resolution.
   to 16x, VSync, a frame-rate cap from 30 to 240 or uncapped, fullscreen, 4:3 or stretched. Picks the fast GPU on
   laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
-- **System link:** LAN play between PCs, and online with friends through Tailscale (found by itself) or any VPN
-  with a peer list.
+- **System link:** LAN play between PCs, and online with friends over a VPN, no Xbox needed: Tailscale is found by
+  itself, any other VPN works with a peer list.
 - **Xbox Live through [Insignia](https://insignia.live)** with your own console's identity: sign in, play online,
   and recover your Insignia account straight into the game.
 - **Title update 257** (the version Xbox Live expects), made from your own disc: no download needed.
@@ -91,11 +91,21 @@ second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` an
 
 System Link works between PCs on the same network: the games find each other by themselves.
 
-To play with friends over the internet, put everyone in one [Tailscale](https://tailscale.com) network (one person
-invites the others). While Tailscale is connected, the game asks it for the other PCs and finds their games too, with
-nothing to type. Without Tailscale it only searches the local network.
+### Online without an Xbox: System Link over a VPN
 
-For partners neither reaches (another subnet, another VPN), list their addresses in `settings.ini`:
+You can play online with friends with no original Xbox, no EEPROM and no Insignia account: System Link runs over a
+VPN as if everyone were on one home network. There is no matchmaking or server list, so agree on a time and who hosts
+on Discord (or however your group talks).
+
+1. Everyone installs [Tailscale](https://tailscale.com) (free). One person creates the network and sends the others
+   an invite; everyone joins it.
+2. With Tailscale connected, start the game and choose **System Link**. One player creates the match; the others
+   see it and join.
+
+While Tailscale is connected the game asks it for the other PCs by itself, so there is nothing to type. Without
+Tailscale it only searches the local network.
+
+Another VPN works too. For partners the game does not find by itself, list their VPN addresses in `settings.ini`:
 
 ```ini
 [network]
