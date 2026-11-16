@@ -14,7 +14,8 @@ renderer drawing it at up to 3x the original resolution.
   to 16x, VSync, a frame-rate cap from 30 to 240 or uncapped, fullscreen, 4:3 or stretched. Picks the fast GPU on
   laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
-- **System link:** LAN play between PCs, and across subnets or a VPN (Tailscale and the like) with a peer list.
+- **System link:** LAN play between PCs, and online with friends through Tailscale (found by itself) or any VPN
+  with a peer list.
 - **Xbox Live through [Insignia](https://insignia.live)** with your own console's identity: sign in, play online,
   and recover your Insignia account straight into the game.
 - **Title update 257** (the version Xbox Live expects), made from your own disc: no download needed.
@@ -86,8 +87,13 @@ second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` an
 
 ### System link
 
-System Link works between PCs on the same network. For partners the LAN broadcast does not reach (another subnet, a
-VPN such as Tailscale), list their addresses in `settings.ini`:
+System Link works between PCs on the same network: the games find each other by themselves.
+
+To play with friends over the internet, put everyone in one [Tailscale](https://tailscale.com) network (one person
+invites the others). While Tailscale is connected, the game asks it for the other PCs and finds their games too, with
+nothing to type. Without Tailscale it only searches the local network.
+
+For partners neither reaches (another subnet, another VPN), list their addresses in `settings.ini`:
 
 ```ini
 [network]
