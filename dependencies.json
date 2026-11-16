@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "d608674ad9a26b06ca13cc7afd4a5523019ed1fa",
+                       "commit":  "6bef75e57e56a4689d38220c8ef0b897cfb452c5",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -41,7 +41,8 @@
                                              "patches/xboxrecomp/0034-nvnet-send-Xbox-Live-DNS-lookups-to-the-first-DNS-se.patch",
                                              "patches/xboxrecomp/0035-nvnet-find-Tailscale-peers-by-itself-for-system-link.patch",
                                              "patches/xboxrecomp/0036-input-a-port-0-hook-for-host-menus-and-the-key-mappe.patch",
-                                             "patches/xboxrecomp/0037-nvnet-say-when-the-Tailscale-adapter-is-up-but-tails.patch"
+                                             "patches/xboxrecomp/0037-nvnet-say-when-the-Tailscale-adapter-is-up-but-tails.patch",
+                                             "patches/xboxrecomp/0038-nvnet-no-internet-without-the-player-s-console-ident.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

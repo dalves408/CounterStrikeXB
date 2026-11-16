@@ -1,0 +1,78 @@
+From 6bef75e57e56a4689d38220c8ef0b897cfb452c5 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nvnet: no internet without the player's console identity
+
+Without a valid eeprom.bin and a hard-drive key the router still answers
+locally (ARP, ping, TCP resets) but drops every packet bound for the
+internet, DNS included, so Insignia is never contacted with a blank or
+made-up console. One log line says why; system link is unaffected.
+---
+ src/kernel/nvnet_nat.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/nvnet_nat.c b/src/kernel/nvnet_nat.c
+index 8a63de0..3c7881f 100644
+--- a/src/kernel/nvnet_nat.c
++++ b/src/kernel/nvnet_nat.c
+@@ -22,8 +22,14 @@
+  * servers (comma-separated; default 46.101.64.175, Insignia's, then 1.1.1.1).
+  * The log names the first DNS lookups and the first host each way, never
+  * payloads.
++ *
++ * Nothing leaves for the internet without the player's console identity (a
++ * valid eeprom.bin and a hard-drive key, console_id.c): without one the
++ * router still answers locally but drops every packet bound beyond it, DNS
++ * included, so Insignia is never contacted with a blank or made-up console.
+  */
+ #include "nvnet_nat.h"
++#include "console_id.h"
+ 
+ #if defined(_WIN32)
+ #include <winsock2.h>
+@@ -67,6 +73,8 @@ static int s_ndns;
+ static uint16_t s_ip_id = 1;
+ static unsigned s_log_dns, s_log_hosts, s_log_tcp;
+ static unsigned long s_out, s_in;
++static int s_identity;                  /* 1: the player's EEPROM and hard-drive key are loaded */
++static unsigned s_log_blocked;
+ 
+ static uint16_t csum(const uint8_t *p, int n, uint32_t s)
+ {
+@@ -241,6 +249,12 @@ static void ip_out(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *p,
+         UdpMap *m;
+         struct sockaddr_in to;
+         if (dst == NAT_ROUTER_IP) return;
++        if (!s_identity) {
++            if (!s_log_blocked++)
++                fprintf(stderr, "  [NAT] no console identity (EEPROM and hard-drive key): internet traffic "
++                                "blocked, Xbox Live is off. Run Insignia Setup to add yours.\n");
++            return;
++        }
+         if (dp == 53) log_dns(p + 8, n - 8);
+         if (!(m = udp_for(sp))) return;
+         if (dp == 53 && s_ndns && dst != ntohl(s_dns[0]) && n >= 10 && dns_is_xboxlive(p + 8, n - 8)) {
+@@ -416,13 +430,19 @@ void nat_init(void (*inject)(const uint8_t *frame, int len))
+         struct in_addr a;
+         if (inet_pton(AF_INET, tok, &a) == 1) s_dns[s_ndns++] = a.s_addr;
+     }
++    {
++        uint8_t k[16];
++        s_identity = xbox_ConsoleHasEeprom() && xbox_ConsoleHdKey(k);
++        memset(k, 0, sizeof k);
++    }
+     s_inject = inject;
+     s_on = 1;
+     {
+         HANDLE th = CreateThread(NULL, 0, nat_thread, NULL, 0, NULL);
+         if (th) CloseHandle(th);
+     }
+-    fprintf(stderr, "  [NAT] router at 10.0.0.1, %d DNS server(s)\n", s_ndns);
++    fprintf(stderr, "  [NAT] router at 10.0.0.1, %d DNS server(s)%s\n", s_ndns,
++            s_identity ? "" : "; internet blocked: no console identity");
+ }
+ 
+ #else
+-- 
+2.51.0.windows.2
+

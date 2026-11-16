@@ -135,9 +135,15 @@ peers=100.64.0.2,100.64.0.3
 4. Your **Xbox Live account**: recovered from Insignia with your gamertag and the 16-digit number on your
    insignia.live Web Dashboard, or loaded from a dump of your console's drive (or your xemu drive).
 
-**Insignia Setup** (`insignia_setup.exe`, in the game folder) takes all of these and checks each one. Recover from
-Insignia briefly starts the game, which signs your console in, fetches the account and closes by itself. The recovery
-number is never logged or stored. Creating a brand-new account still needs the Xbox dashboard on a console.
+**Insignia Setup** (`insignia_setup.exe`, in the game folder) takes all of these and checks each one. A typed
+hard-drive key is checked against the accounts on your drive when you give one (they are signed with it); it refuses
+a key that did not sign them, and says when a key could not be checked. Insignia Setup itself never goes online.
+Recover from Insignia briefly starts the game, which signs your console in, fetches the account and closes by itself.
+The recovery number is never logged or stored. Creating a brand-new account still needs the Xbox dashboard on a
+console.
+
+Without an EEPROM and a hard-drive key the game never contacts Insignia: it blocks all internet traffic and plays
+system link only.
 
 Then choose Xbox Live in the game and pick your gamertag. Matches run at 30 FPS, like everyone else's on Insignia.
 

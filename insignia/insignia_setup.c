@@ -43,11 +43,14 @@ enum { ID_EE_EDIT = 100, ID_EE_BROWSE, ID_EE_STATUS, ID_KEY_EDIT, ID_KEY_SHOW, I
 static HWND s_main, s_ee, s_ee_st, s_key, s_key_st, s_acc, s_acc_st, s_status;
 static uint8_t s_eeprom[256];
 static int s_ee_ok, s_acc_ok;
+static uint8_t s_bios_key_sum[20];          /* SHA-1 of a key decrypted from the BIOS (verified) */
+static int s_have_bios_key;
 #define ACCOUNT_SECTORS 11                  /* 9 machine account, 10, 11 user directory, 12-19 user slots */
 static uint8_t s_sectors[ACCOUNT_SECTORS][512];   /* the drive's sectors 9..19 */
 static char s_gamertags[256];
 static void say(HWND w, const char *t);
 static void check_key(void);
+static int key_state(void);
 static int s_cli;                           /* run from the command line: no message boxes */
 
 /* A message box, or with arguments a line on the calling console. */
@@ -240,11 +243,14 @@ static void key_from_bios(const char *bios_path, const char *mcpx_path)
         return;
     }
     for (i = 0; i < 16; i++) sprintf(hex + 2 * i, "%02X", hd[i]);
+    s_have_bios_key = sha1(hd, 16, s_bios_key_sum);
     SetWindowTextA(s_key, hex);
     SecureZeroMemory(hd, sizeof hd); SecureZeroMemory(hex, sizeof hex);
     check_key();
-    snprintf(msg, sizeof msg, "OK: hard-drive key decrypted from your BIOS (MCPX %s) and verified against the EEPROM.", rev);
-    say(s_key_st, msg);
+    if (!s_acc_ok) {
+        snprintf(msg, sizeof msg, "OK: hard-drive key decrypted from your BIOS (MCPX %s) and verified against the EEPROM.", rev);
+        say(s_key_st, msg);
+    }
 }
 
 /* ---- reading a drive: raw, or xemu's qcow2 ---------------------------------------------------- */
@@ -320,15 +326,122 @@ static void check_eeprom(const char *path)
     say(s_ee_st, msg);
 }
 
+/* ---- checking a hard-drive key against the drive's accounts ----------------------------------- */
+/* XOnline signs each account record with the hard-drive key (the game's own
+ * signer, cs_account.c, 0x0027A7BE): the 16-byte account key at +0x50 is
+ * encrypted with 3DES-CBC, its IV the 8-byte confounder in the account's
+ * directory entry and its key HMAC-SHA1(K1, hd)[0..3] | HMAC-SHA1(K2, hd), and
+ * +0x64 holds the first 8 bytes of HMAC-SHA1(hd, record[0..0x63]) taken over
+ * the record with the account key in the clear. K1 and K2 are XOnline
+ * constants read from the game's own default.xbe (never built in here), so a
+ * key that reproduces a stored signature is this drive's console's key. */
+#define XBE_PATH   "game_files\\default.xbe"
+#define XO_K1_VA   0x007DE13Cu
+#define XO_K2_VA   0x007DE128u
+#define REC_SIZE   0x6C
+#define SECTOR_HDR 0x0C                     /* config-sector data starts after magic and header */
+
+/* 16 bytes at virtual address va from the game's XBE. */
+static int xbe_read(uint32_t va, uint8_t out[16])
+{
+    char path[MAX_PATH], *sl;
+    size_t n = 0;
+    uint8_t *x;
+    uint32_t base, nsec, sec, i;
+    int ok = 0;
+    if (getenv("CS_GAME_CWD")) snprintf(path, sizeof path, "%s\\" XBE_PATH, getenv("CS_GAME_CWD"));
+    else {
+        if (!GetModuleFileNameA(NULL, path, sizeof path) || !(sl = strrchr(path, '\\'))) return 0;
+        strcpy_s(sl + 1, sizeof path - (size_t)(sl + 1 - path), XBE_PATH);
+    }
+    if (!(x = read_file(path, &n)) || n < 0x200 || memcmp(x, "XBEH", 4)) { free(x); return 0; }
+    base = rd32(x + 0x104); nsec = rd32(x + 0x11C); sec = rd32(x + 0x120) - base;
+    for (i = 0; i < nsec && sec + (i + 1) * 0x38 <= n; i++) {
+        const uint8_t *h = x + sec + i * 0x38;
+        uint32_t v = rd32(h + 4), raw = rd32(h + 12), rs = rd32(h + 16);
+        if (va >= v && va + 16 <= v + rs && raw + (va - v) + 16 <= n) {
+            memcpy(out, x + raw + (va - v), 16);
+            ok = 1;
+            break;
+        }
+    }
+    free(x);
+    return ok;
+}
+
+static int des3_cbc_decrypt(const uint8_t key[24], const uint8_t iv_in[8], uint8_t *d, ULONG n)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_KEY_HANDLE k = NULL;
+    uint8_t iv[8];
+    ULONG got = 0;
+    int ok = 0;
+    memcpy(iv, iv_in, 8);
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_3DES_ALGORITHM, NULL, 0) == 0 &&
+        BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof BCRYPT_CHAIN_MODE_CBC, 0) == 0 &&
+        BCryptGenerateSymmetricKey(alg, &k, NULL, 0, (PUCHAR)key, 24, 0) == 0)
+        ok = BCryptDecrypt(k, d, n, NULL, iv, 8, d, n, &got, 0) == 0 && got == n;
+    if (k) BCryptDestroyKey(k);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+/* 1: the key signed an account on the chosen drive; 0: it signed none of
+ * them; -1: nothing to check against (no drive, no accounts, no game XBE). */
+static int key_matches_accounts(const uint8_t hd[16])
+{
+    uint8_t k1[16], k2[16], h1[20], h2[20], dk[24], rec[REC_SIZE], sig[20];
+    const uint8_t *dir;
+    int i, tried = 0, match = 0;
+    if (!s_acc_ok || !xbe_read(XO_K1_VA, k1) || !xbe_read(XO_K2_VA, k2)) return -1;
+    if (!hmac_sha1(k1, 16, hd, 16, h1) || !hmac_sha1(k2, 16, hd, 16, h2)) return -1;
+    memcpy(dk, h1, 4); memcpy(dk + 4, h2, 20);
+    dir = s_sectors[11 - 9] + SECTOR_HDR;                    /* sector 11: the account directory */
+    for (i = 0; i < 8 && !match; i++) {
+        const uint8_t *e = dir + 12 * i;
+        if (!rd32(e)) continue;                              /* slot not in use */
+        memcpy(rec, s_sectors[12 + i - 9] + SECTOR_HDR, REC_SIZE);
+        tried = 1;
+        if (des3_cbc_decrypt(dk, e + 4, rec + 0x50, 16) && hmac_sha1(hd, 16, rec, 0x64, sig) && !memcmp(sig, rec + 0x64, 8))
+            match = 1;
+    }
+    SecureZeroMemory(dk, sizeof dk); SecureZeroMemory(h1, sizeof h1); SecureZeroMemory(h2, sizeof h2);
+    SecureZeroMemory(rec, sizeof rec); SecureZeroMemory(k1, sizeof k1); SecureZeroMemory(k2, sizeof k2);
+    return tried ? match : -1;
+}
+
+/* 1 verified (it signed the drive's accounts, or came from the BIOS), 0 it
+ * did not sign the drive's accounts, 3 it came from the BIOS (so it is the
+ * EEPROM's) but the drive's accounts are another console's, -1 not
+ * verifiable here, -2 not a key. */
+static int key_state(void)
+{
+    char t[128];
+    uint8_t k[16], sum[20];
+    int acc, bios;
+    GetWindowTextA(s_key, t, sizeof t);
+    if (!hex_key(t, k)) { SecureZeroMemory(t, sizeof t); return -2; }
+    SecureZeroMemory(t, sizeof t);
+    acc = key_matches_accounts(k);
+    bios = s_have_bios_key && sha1(k, 16, sum) && !memcmp(sum, s_bios_key_sum, 20);
+    SecureZeroMemory(k, sizeof k);
+    if (bios) return acc == 0 ? 3 : 1;
+    return acc;
+}
+
 static void check_key(void)
 {
     char t[128];
-    uint8_t k[16];
     GetWindowTextA(s_key, t, sizeof t);
     if (!t[0]) say(s_key_st, "Needed: your console's hard-drive key (32 hex digits).");
-    else if (hex_key(t, k)) say(s_key_st, "OK: 16-byte hard-drive key.");
-    else say(s_key_st, "Not a hard-drive key: it must be 32 hex digits (0-9, A-F).");
-    SecureZeroMemory(k, sizeof k);
+    else switch (key_state()) {
+    case -2: say(s_key_st, "Not a hard-drive key: it must be 32 hex digits (0-9, A-F)."); break;
+    case 1:  say(s_key_st, s_acc_ok ? "OK: hard-drive key verified: it signed the accounts on your drive."
+                                    : "OK: hard-drive key decrypted from your BIOS and verified against the EEPROM."); break;
+    case 0:  say(s_key_st, "This key did not sign the accounts on that drive: it is not that console's key."); break;
+    case 3:  say(s_key_st, "The key is this EEPROM's, but the accounts on that drive are another console's."); break;
+    default: say(s_key_st, "16-byte key, not verified: add your drive in step 3, or use From BIOS + MCPX, to check it.");
+    }
     SecureZeroMemory(t, sizeof t);
 }
 
@@ -390,6 +503,7 @@ static void check_accounts(const char *path)
     snprintf(msg, sizeof msg, users ? "OK: account(s) %s" : "Found the console's machine account but no player accounts.",
              s_gamertags);
     say(s_acc_st, msg);
+    check_key();                                    /* the key can be checked against these accounts now */
 }
 
 /* ---- saving ----------------------------------------------------------------------------------- */
@@ -428,6 +542,20 @@ static int save_identity(void)
     if (!s_ee_ok) { tell("Choose your console's EEPROM first.", MB_ICONWARNING); return 0; }
     if (!hex_key(t, k)) { tell("Enter your console's hard-drive key (32 hex digits).", MB_ICONWARNING); return 0; }
     SecureZeroMemory(k, sizeof k);
+    switch (key_state()) {
+    case 0:
+        SecureZeroMemory(t, sizeof t);
+        tell("That hard-drive key did not sign the accounts on your drive, so it is not your console's key.\n\n"
+             "Check the key (UnleashX, EvoX hddinfo.txt, XBlast or xemu show it), or use From BIOS + MCPX.", MB_ICONWARNING);
+        return 0;
+    case 3:
+        SecureZeroMemory(t, sizeof t);
+        tell("The hard-drive key belongs to this EEPROM, but the accounts on that drive were made on another "
+             "console and will not work with it.\n\n"
+             "Choose the drive of the console this EEPROM came from, or "
+             "recover your account from Insignia instead.", MB_ICONWARNING);
+        return 0;
+    }
     if (!cs_settings_path("eeprom.bin", path, sizeof path, 1) || !(f = fopen(path, "wb")) ||
         fwrite(s_eeprom, 1, 256, f) != 256 || fclose(f) != 0) {
         tell("The EEPROM could not be saved.", MB_ICONERROR);
