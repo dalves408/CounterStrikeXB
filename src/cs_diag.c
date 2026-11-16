@@ -8,6 +8,7 @@
  *   [BUILD]       one line at start: version, symbol-file id, Windows, CPU, GPU, memory.
  *   [VIDEO]       every video setting in effect, the window size and the monitor's refresh rate: once when the game
  *                 is up, when a setting changes in the F1 menu (cs_overlay.c), and in every freeze or crash report.
+ *   [FPS]         once a minute of play: average frame rate, 1% low, longest frame, frames over 50 and 100 ms.
  *   [FREEZE]      no frame for 10 s: every thread's call stack as module+offset (and symbol, when a .pdb is beside the
  *                 exe); again 20 s later; a line when frames move again. The ESC/F1 menus never stop the game, so a
  *                 freeze is a freeze whatever is on screen. scripts/symbolize_log.py turns the offsets into function
@@ -416,6 +417,60 @@ static void video_line(const char *why)
 }
 
 void cs_diag_log_video(const char *why) { video_line(why); }
+
+/* ---- [FPS] --------------------------------------------------------------------------------------------------------- */
+/* Frame times in 0.25 ms bins up to 250 ms, the rest in the last bin; the longest kept exactly. A minute's summary is
+ * printed from the render thread when the minute is up, so nothing is shared with another thread. A gap of over 5 s
+ * (a freeze, which has its own report, or the window held) starts a new minute instead of counting. */
+#define FPS_BINS 1001
+#define FPS_WINDOW_S 60
+
+void cs_diag_frame(void)
+{
+    static LARGE_INTEGER f, last, start;
+    static unsigned hist[FPS_BINS], frames, over50, over100;
+    static double longest, total;
+    LARGE_INTEGER now;
+    double ms;
+
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (!last.QuadPart || now.QuadPart - last.QuadPart > f.QuadPart * 5) {
+        memset(hist, 0, sizeof hist);
+        frames = over50 = over100 = 0;
+        longest = total = 0;
+        last = start = now;
+        return;
+    }
+    ms = (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)f.QuadPart;
+    last = now;
+    hist[ms * 4 < FPS_BINS - 1 ? (unsigned)(ms * 4) : FPS_BINS - 1]++;
+    frames++;
+    total += ms;
+    if (ms > longest) longest = ms;
+    if (ms > 50) over50++;
+    if (ms > 100) over100++;
+
+    if (now.QuadPart - start.QuadPart >= f.QuadPart * FPS_WINDOW_S && frames) {
+        /* 1% low: the frame time that the slowest 1% of frames reach, as a rate */
+        unsigned want = frames / 100 ? frames / 100 : 1, seen = 0;
+        int b;
+        double low_ms = longest;
+        for (b = FPS_BINS - 1; b >= 0; b--) {
+            seen += hist[b];
+            if (seen >= want) { low_ms = b == FPS_BINS - 1 ? longest : (b + 1) / 4.0; break; }
+        }
+        if (low_ms > longest) low_ms = longest;
+        putf("[FPS] last %.0f s: %.1f fps average, 1%% low %.1f fps, longest frame %.1f ms, %u frame(s) over 50 ms, "
+             "%u over 100 ms (cap %d, vsync %d)\n", total / 1000.0, frames * 1000.0 / total,
+             low_ms > 0 ? 1000.0 / low_ms : 0.0, longest, over50, over100, g_cs_settings.frame_rate,
+             g_cs_settings.vsync);
+        memset(hist, 0, sizeof hist);
+        frames = over50 = over100 = 0;
+        longest = total = 0;
+        start = now;
+    }
+}
 
 /* ---- [FREEZE] ------------------------------------------------------------------------------------------------------ */
 static ULONGLONG s_t0;

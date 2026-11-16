@@ -1,0 +1,31 @@
+From d608674ad9a26b06ca13cc7afd4a5523019ed1fa Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nvnet: say when the Tailscale adapter is up but tailscale.exe
+ is missing
+
+---
+ src/kernel/nvnet_link.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/kernel/nvnet_link.c b/src/kernel/nvnet_link.c
+index 7ce5a17..35763ce 100644
+--- a/src/kernel/nvnet_link.c
++++ b/src/kernel/nvnet_link.c
+@@ -226,8 +226,11 @@ static DWORD WINAPI ts_thread(LPVOID unused)
+                 fprintf(stderr, "  [NVNET] Tailscale: %d online peer(s)\n", n);
+             last = n;
+         }
+-        if (!found)
+-            return 0;                           /* adapter without the command-line tool: LAN only */
++        if (!found) {                           /* adapter without the command-line tool: LAN only */
++            fprintf(stderr, "  [NVNET] Tailscale: adapter is up but tailscale.exe was not found, "
++                            "LAN only (add the other players to [network] peers=)\n");
++            return 0;
++        }
+         WaitForSingleObject(s_ts_wake, 15000);
+     }
+ }
+-- 
+2.51.0.windows.2
+

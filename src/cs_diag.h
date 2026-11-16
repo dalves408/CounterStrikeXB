@@ -25,6 +25,10 @@ void cs_diag_install_crash_filter(void);
 /* A [VIDEO] line: every video setting in effect, the window and the monitor. `why`: "start", "settings changed"... */
 void cs_diag_log_video(const char *why);
 
+/* Called by the renderer after every Present: once a minute of play, an [FPS] line with the average frame rate, the
+ * 1% low, the longest frame and how many frames took over 50 ms. Runs on the render thread; no allocation. */
+void cs_diag_frame(void);
+
 /* Push everything printed so far into the log before the process ends. */
 void cs_diag_flush(void);
 

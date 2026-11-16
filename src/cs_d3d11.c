@@ -54,6 +54,7 @@
 #include <string.h>
 
 #include "cs_d3d11.h"
+#include "cs_diag.h"
 #include "cs_texture_pack.h"
 #include "cs_settings.h"
 #include "cs_overlay.h"
@@ -2442,6 +2443,7 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
         }
     }
     frame_latency_limit();
+    cs_diag_frame();
 }
 
 /* The frame-rate cap (settings: 30..240, 0 = none): wait out the rest of the frame. */
