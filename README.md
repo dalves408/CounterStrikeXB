@@ -65,11 +65,13 @@ alternate key for each.
 
 | Key | |
 | --- | --- |
-| F1 | Settings menu |
+| F1, or hold BACK and press START on the pad | Settings menu |
 | Esc | "Quit Counter-Strike?" |
 | F11 or Alt+Enter | Fullscreen on/off |
 
-The F1 menu is drawn over the game and changes these as you play, saving them as you go:
+Both menus work with the controller too: D-pad or left stick to move, A to confirm, B to close (the keys mapped to A
+and B do the same). The settings menu also has Quit Counter-Strike, so the game can be closed from the pad. It is
+drawn over the game and changes these as you play, saving them as you go:
 
 | Setting | Choices |
 | --- | --- |

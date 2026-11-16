@@ -11,7 +11,9 @@
  * input: while a menu is open every key goes to the menu, and controller 1
  * (which drives it too: D-pad or left stick, A confirms, B or START closes)
  * reads as neutral to the game (xbox_InputSetHold), so a press meant for the
- * menu is not also a shot or a jump.
+ * menu is not also a shot or a jump. The keys mapped to A and B confirm and
+ * close as well. Holding BACK and pressing START opens the settings menu from
+ * the controller; the game never sees that START (pad_filter).
  * F1 (or the menu's own lines) changes the settings of cs_settings.h; each
  * change is saved to settings.ini at once and applied while the game runs:
  * render scale, anti-aliasing, anisotropy and hi-res textures between frames, the rest at the
@@ -31,7 +33,20 @@
 #include "video/video_player.h"
 
 extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
+extern int  xbox_InputKeyFaceButton(int vk); /* toolkit input/keyboard.c: 0 A, 1 B, ... or -1 */
 extern void xbox_InputSetHold(int on);      /* toolkit input/xinput_device.c */
+
+/* Port 0's state as the toolkit hands it to the title (input/xinput_xbox.h,
+ * mirrored here: that header brings the Xbox's own Windows types). */
+typedef struct CsPadState {
+    DWORD dwPacketNumber;
+    WORD  wButtons;
+    BYTE  bAnalogButtons[8];
+    SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY;
+} CsPadState;
+#define PAD_START 0x0010
+#define PAD_BACK  0x0020
+extern void xbox_InputSetPort0Filter(void (*filter)(CsPadState *));
 
 enum { MODE_QUIT, MODE_SETTINGS };
 enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
@@ -356,6 +371,10 @@ static void settings_change(int dir)
 /* A key for an open menu. */
 static void menu_key(WPARAM w, int repeat)
 {
+    switch (w == VK_RETURN || w == VK_SPACE ? -1 : xbox_InputKeyFaceButton((int)w)) {
+    case 0: w = VK_RETURN; break;                    /* the player's A key confirms */
+    case 1: if (!repeat) menu_close(); return;       /* and their B key closes */
+    }
     if (s_mode == MODE_SETTINGS) {
         if (w == VK_UP || w == VK_DOWN) {
             s_sel = (s_sel + (w == VK_UP ? IT_COUNT - 1 : 1)) % IT_COUNT;
@@ -430,7 +449,32 @@ static void pad_tick(void)
     }
 }
 
+/* Port 0 on its way to the game (the game's input thread): BACK held and START
+ * pressed opens the settings menu. Both buttons are taken out of what the game
+ * sees until they are let go, so the game's own pause menu does not open too.
+ * The menu itself opens on the window thread, through the F1 key's own path. */
+static void pad_filter(CsPadState *s)
+{
+    static int chord, start_was;
+    WORD b = s->wButtons;
+    int start = (b & PAD_START) != 0, back = (b & PAD_BACK) != 0;
+    if (chord) {
+        if (!start && !back) chord = 0;
+        s->wButtons &= (WORD)~(PAD_START | PAD_BACK);
+    } else if (back && start && !start_was && !s_active) {
+        HWND h = (HWND)xbox_FramebufferWindowHwnd();
+        chord = 1;
+        s->wButtons &= (WORD)~(PAD_START | PAD_BACK);
+        if (h) {
+            PostMessageA(h, WM_KEYDOWN, VK_F1, 1);
+            PostMessageA(h, WM_KEYUP, VK_F1, (LPARAM)(1u | 3u << 30));
+        }
+    }
+    start_was = start;
+}
+
 void cs_overlay_init(void)
 {
     xbox_FramebufferSetKeyFilter(key_filter);
+    xbox_InputSetPort0Filter(pad_filter);
 }

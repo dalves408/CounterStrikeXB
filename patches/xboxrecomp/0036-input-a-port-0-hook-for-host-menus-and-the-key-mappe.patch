@@ -1,0 +1,100 @@
+From 911b759492db3f6c50d286fc2d1130a55245e31b Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input: a port-0 hook for host menus, and the key mapped to
+ each face button
+
+xbox_InputSetPort0Filter lets the host see and change port 0's state before
+the title does, so a chord that opens a host menu (BACK held + START) can be
+kept from the title. xbox_InputKeyFaceButton says which face button a key is
+bound to in the player's key map, so a host menu can take the player's A and
+B keys as confirm and back.
+---
+ src/input/keyboard.c      | 15 +++++++++++++++
+ src/input/keyboard.h      |  2 ++
+ src/input/xinput_device.c | 12 ++++++++++++
+ src/input/xinput_xbox.h   |  3 +++
+ 4 files changed, 32 insertions(+)
+
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index 520a8a0..080cbae 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -217,6 +217,21 @@ void xbox_InputKeyboardBindings(InputBindings *b)
+     *b = s_keymap;
+ }
+ 
++/* The face button (XBOX_BUTTON_A..Y, 0..3) a key is bound to in the player's
++ * key map, or -1: lets a host menu read the keys the player presses for A and
++ * B as confirm and back. */
++int xbox_InputKeyFaceButton(int vk)
++{
++    InputBindings b;
++    int c, k;
++    xbox_InputKeyboardBindings(&b);
++    for (c = INPUT_A; c <= INPUT_Y; c++)
++        for (k = 0; k < b.count[c]; k++)
++            if (b.key[c][k] == vk)
++                return c - INPUT_A;
++    return -1;
++}
++
+ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
+ {
+     static DWORD packet;
+diff --git a/src/input/keyboard.h b/src/input/keyboard.h
+index 59eafd1..d93f78b 100644
+--- a/src/input/keyboard.h
++++ b/src/input/keyboard.h
+@@ -116,6 +116,8 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out);
+  * resolves, and what xbox_InputMap_BindingsFormat writes as text. */
+ struct InputBindings;
+ void xbox_InputKeyboardBindings(struct InputBindings *b);
++/* The face button (0 A, 1 B, 2 X, 3 Y) a key is bound to in the key map, or -1. */
++int xbox_InputKeyFaceButton(int vk);
+ /* 0 when RECOMP_KEYBOARD is off, else 1 with *out filled by
+  * xbox_InputKeyboardState(). */
+ int  xbox_InputKeyboardPoll(XBOX_INPUT_STATE *out);
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 0451e24..368b5be 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -145,9 +145,21 @@ void xbox_InputSetHold(int on)
+     InterlockedExchange(&s_hold_port0, on ? 1 : 0);
+ }
+ 
++/* A host hook on port 0's state before the title sees it: a button chord that
++ * opens a host menu (BACK held + START) can take its buttons out, so the press
++ * that opens the host's menu does not also open the title's own. */
++static void (*s_port0_filter)(XBOX_INPUT_STATE *);
++
++void xbox_InputSetPort0Filter(void (*filter)(XBOX_INPUT_STATE *))
++{
++    s_port0_filter = filter;
++}
++
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     DWORD r = input_get_state(dwPort, pState);
++    if (r == ERROR_SUCCESS && dwPort == 0 && s_port0_filter)
++        s_port0_filter(pState);
+     if (r == ERROR_SUCCESS && dwPort == 0 && s_hold_port0)
+         memset(&pState->Gamepad, 0, sizeof pState->Gamepad);
+     return r;
+diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
+index bc6717b..b5bb6cb 100644
+--- a/src/input/xinput_xbox.h
++++ b/src/input/xinput_xbox.h
+@@ -95,6 +95,9 @@ void xbox_InputInit(void);
+ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
+ /* Windows: port 0 reads as neutral while a host menu is open (xinput_device.c). */
+ void  xbox_InputSetHold(int on);
++/* Windows: a host hook that sees (and may change) port 0's state before the
++ * title does, e.g. to take out a chord that opens a host menu. */
++void  xbox_InputSetPort0Filter(void (*filter)(XBOX_INPUT_STATE *));
+ 
+ /**
+  * Set controller vibration.
+-- 
+2.51.0.windows.2
+
