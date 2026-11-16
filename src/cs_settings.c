@@ -189,6 +189,34 @@ void cs_settings_startup(void)
             fprintf(stderr, "[CS-SET] system link peers: %s\n", peers);
         }
     }
+    /* [network] real_xbox=1: system link with real Xboxes and xemu. They key
+     * system-link traffic with the game's real XboxLANKey; this build's
+     * default is the all-zero key, which every other copy of it shares, so
+     * the switch is off unless the player wants the real ones. The key is
+     * lankey.bin in the data folder, which Insignia Setup derives from the
+     * player's own BIOS (never built in). Not logged. */
+    if (!getenv("RECOMP_XBOX_LAN_KEY") && cs_settings_path("settings.ini", path, sizeof path, 0)
+        && GetPrivateProfileIntA("network", "real_xbox", 0, path) == 1) {
+        char key[MAX_PATH];
+        if (cs_settings_path("lankey.bin", key, sizeof key, 0) && GetFileAttributesA(key) != INVALID_FILE_ATTRIBUTES) {
+            _putenv_s("RECOMP_XBOX_LAN_KEY", key);
+            fprintf(stderr, "[CS-SET] system link with xemu (the real Xbox LAN key)\n");
+        } else {
+            fprintf(stderr, "[CS-SET] real_xbox=1, but no lankey.bin: run Insignia Setup with your BIOS + MCPX; "
+                            "system link stays with this build's other players\n");
+        }
+    }
+    /* [network] xemu=host:port: system link with xemu, set to its "udp"
+     * network backend with that bind address and this PC as its remote
+     * address (port 30740). The address is not logged. */
+    if (!getenv("RECOMP_NET_XEMU") && cs_settings_path("settings.ini", path, sizeof path, 0)) {
+        char xemu[256];
+        GetPrivateProfileStringA("network", "xemu", "", xemu, sizeof xemu, path);
+        if (xemu[0]) {
+            _putenv_s("RECOMP_NET_XEMU", xemu);
+            fprintf(stderr, "[CS-SET] system link with xemu\n");
+        }
+    }
     fprintf(stderr, "[CS-SET] scale %dx, fullscreen %d, stretch %d, vsync %d, frame rate %d, msaa %d, aniso %d, hi-res textures %d\n",
             g_cs_settings.scale, g_cs_settings.fullscreen, g_cs_settings.stretch, g_cs_settings.vsync,
             g_cs_settings.frame_rate, g_cs_settings.msaa, g_cs_settings.aniso, g_cs_settings.hires);

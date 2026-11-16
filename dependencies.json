@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "b955d3abd02aae9be72fe0e18a72f119bffa7b85",
+                       "commit":  "e9ba7582709b1c7086e418f45e2600e2a7736299",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -44,7 +44,8 @@
                                              "patches/xboxrecomp/0037-nvnet-say-when-the-Tailscale-adapter-is-up-but-tails.patch",
                                              "patches/xboxrecomp/0038-nvnet-no-internet-without-the-player-s-console-ident.patch",
                                              "patches/xboxrecomp/0039-input-PlayStation-and-other-non-Xbox-controllers-thr.patch",
-                                             "patches/xboxrecomp/0040-nv2a-pass-texture-stages-bump-matrix-and-cube-flag-t.patch"
+                                             "patches/xboxrecomp/0040-nv2a-pass-texture-stages-bump-matrix-and-cube-flag-t.patch",
+                                             "patches/xboxrecomp/0041-nvnet-kernel-system-link-with-xemu-and-real-Xboxes.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

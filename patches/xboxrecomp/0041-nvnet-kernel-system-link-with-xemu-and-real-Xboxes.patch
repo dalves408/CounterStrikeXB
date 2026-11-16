@@ -1,0 +1,293 @@
+From e9ba7582709b1c7086e418f45e2600e2a7736299 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] nvnet, kernel: system link with xemu and real Xboxes
+
+xemu's "udp" network backend carries Ethernet frames bare, one per
+datagram, between its bind address and one remote address.
+RECOMP_NET_XEMU=<host>:<port> names that bind address: frames also go
+there untagged, and untagged datagrams from exactly that address are
+taken as frames. Its Xbox has no DHCP server on the tunnel, so the NIC
+answers its DHCP over the link too -- the address its MAC gives under
+the same rule as ours, the same subnet, no router and no DNS -- instead
+of it falling back to 169.254/16 after 20 s, a subnet ours is not on.
+The link socket also stops reporting WSAECONNRESET for datagrams sent to
+a port nobody had open yet.
+
+XNet keys system link with XboxLANKey, which a real kernel derives when
+the title starts (HMAC-SHA1 of the certificate's LAN key with the BIOS's
+CERT key, first 16 bytes). It stays 16 zeros by default, which every
+recompiled copy shares; RECOMP_XBOX_LAN_KEY=<file> loads the real one,
+derived by the title's setup tool from the player's own BIOS. With it,
+xemu finds a game hosted here and the reverse.
+---
+ src/kernel/kernel_bridge.c | 21 ++++++++++-
+ src/kernel/nvnet.c         | 30 ++++++++++++----
+ src/kernel/nvnet_link.c    | 74 ++++++++++++++++++++++++++++++++++----
+ src/kernel/nvnet_link.h    |  4 +++
+ 4 files changed, 116 insertions(+), 13 deletions(-)
+
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 42456bb..a047b1d 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -330,8 +330,27 @@ static void kernel_data_init(void)
+     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
+     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
+ 
+-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
++    /* XboxLANKey (ordinals 326, 355). A real kernel makes it when the title
++     * starts: HMAC-SHA1 of the certificate's LAN key, keyed with the BIOS's
++     * CERT key, first 16 bytes. XNet keys system link with it, so real
++     * consoles and xemu only hear a recompiled title that has the same key.
++     * Default 16 zeros (every recompiled copy agrees with every other);
++     * RECOMP_XBOX_LAN_KEY=<file> loads the real one, which a title's setup
++     * tool derives from the player's own BIOS -- the CERT key is
++     * Microsoft's and not built in. */
+     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
++    {
++        const char *lk = getenv("RECOMP_XBOX_LAN_KEY");
++        FILE *f = lk ? fopen(lk, "rb") : NULL;
++        if (f) {
++            uint8_t k[16];
++            if (fread(k, 1, 16, f) == 16) {
++                memcpy((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), k, 16);
++                fprintf(stderr, "  [KERNEL] XboxLANKey from file\n");
++            }
++            fclose(f);
++        }
++    }
+ 
+     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
+     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
+diff --git a/src/kernel/nvnet.c b/src/kernel/nvnet.c
+index 62ee8e8..b1fd260 100644
+--- a/src/kernel/nvnet.c
++++ b/src/kernel/nvnet.c
+@@ -273,10 +273,16 @@ static uint16_t ip_csum(const uint8_t *p, int n)
+     return (uint16_t)~s;
+ }
+ 
+-static int dhcp_answer(const uint8_t *f, int len)
++/* peer: the request came over the link from an xemu (nvlink_last_from_xemu),
++ * whose udp backend has no DHCP server. It gets the address its MAC gives
++ * under the same rule -- the same subnet as ours, which system link needs --
++ * but no router and no DNS (its traffic is not ours to route), and the
++ * answer goes back to it over the link. */
++static int dhcp_answer_for(const uint8_t *f, int len, int peer)
+ {
+     static const uint8_t srv_mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
+     const uint8_t *ip, *udp, *bp, *opt;
++    const uint8_t *m = peer ? f + 6 : s_mac;
+     uint8_t r[400], *rb, *o;
+     int ihl, type = 0, i, blen;
+     uint8_t yi[4], sv[4] = { 169, 254, 0, 1 };
+@@ -304,11 +310,11 @@ static int dhcp_answer(const uint8_t *f, int len)
+     if (nat_enabled()) {
+         /* behind the router (nvnet_nat.c): 10.x.y.z/8 from the MAC, every
+          * console on one subnet for system link, 10.0.0.1 the way out */
+-        yi[0] = 10; yi[1] = s_mac[3]; yi[2] = s_mac[4]; yi[3] = (uint8_t)(2 + s_mac[5] % 252);
++        yi[0] = 10; yi[1] = m[3]; yi[2] = m[4]; yi[3] = (uint8_t)(2 + m[5] % 252);
+         sv[0] = 10; sv[1] = 0; sv[2] = 0; sv[3] = 1;
+     } else {
+         yi[0] = 169; yi[1] = 254;
+-        yi[2] = (uint8_t)(1 + s_mac[4] % 253); yi[3] = (uint8_t)(1 + (s_mac[5] ^ s_mac[3]) % 253);
++        yi[2] = (uint8_t)(1 + m[4] % 253); yi[3] = (uint8_t)(1 + (m[5] ^ m[3]) % 253);
+     }
+ 
+     memset(r, 0, sizeof r);
+@@ -325,7 +331,7 @@ static int dhcp_answer(const uint8_t *f, int len)
+     *o++ = 53; *o++ = 1; *o++ = (uint8_t)(type == 1 ? 2 : 5);   /* OFFER / ACK */
+     *o++ = 54; *o++ = 4; memcpy(o, sv, 4); o += 4;
+     *o++ = 51; *o++ = 4; *o++ = 0xFF; *o++ = 0xFF; *o++ = 0xFF; *o++ = 0xFF;
+-    if (nat_enabled()) {
++    if (nat_enabled() && !peer) {
+         uint32_t dns[2];
+         int nd = nat_dns_servers(dns), k;
+         *o++ = 1; *o++ = 4; *o++ = 255; *o++ = 0; *o++ = 0; *o++ = 0;          /* 255.0.0.0 */
+@@ -334,6 +340,8 @@ static int dhcp_answer(const uint8_t *f, int len)
+             *o++ = 6; *o++ = (uint8_t)(4 * nd);                               /* DNS */
+             for (k = 0; k < nd; k++) { memcpy(o, &dns[k], 4); o += 4; }
+         }
++    } else if (nat_enabled()) {
++        *o++ = 1; *o++ = 4; *o++ = 255; *o++ = 0; *o++ = 0; *o++ = 0;          /* 255.0.0.0, no router */
+     } else {
+         *o++ = 1;  *o++ = 4; *o++ = 255; *o++ = 255; *o++ = 0; *o++ = 0;
+     }
+@@ -350,13 +358,21 @@ static int dhcp_answer(const uint8_t *f, int len)
+         memcpy(h + 12, sv, 4);
+         h[16] = h[17] = h[18] = h[19] = 255;
+         i = ip_csum(h, 20); h[10] = (uint8_t)(i >> 8); h[11] = (uint8_t)i;
+-        rxq_push(r, 14 + 20 + ulen);
++        if (peer) nvlink_send_xemu(r, 14 + 20 + ulen);
++        else rxq_push(r, 14 + 20 + ulen);
++    }
++    if (peer) {
++        static unsigned npeer;
++        if (npeer++ < 4)
++            fprintf(stderr, "  [NVNET] xemu's DHCP %s answered: same subnet, no router\n", type == 1 ? "discover" : "request");
+     }
+     if (s_trace)
+-        fprintf(stderr, "  [NVNET] DHCP %s -> %u.%u.%u.%u\n", type == 1 ? "discover" : "request", yi[0], yi[1], yi[2], yi[3]);
++        fprintf(stderr, "  [NVNET] DHCP %s ->%u.%u.%u.%u\n", type == 1 ? "discover" : "request", yi[0], yi[1], yi[2], yi[3]);
+     return 1;
+ }
+ 
++static int dhcp_answer(const uint8_t *f, int len) { return dhcp_answer_for(f, len, 0); }
++
+ static int s_dhcp_local = 1;
+ 
+ /* A frame from the router (nvnet_nat.c) for the console: into the receive
+@@ -698,6 +714,8 @@ static DWORD WINAPI nic_thread(LPVOID unused)
+         uint32_t pending;
+         DWORD now = GetTickCount();
+         EnterCriticalSection(&s_lock);
++        if (n > 0 && s_dhcp_local && nvlink_last_from_xemu() && dhcp_answer_for(f, n, 1))
++            n = 0;                          /* xemu's DHCP, answered over the link */
+         if (n > 0) {
+             int ok = rx_accept(f, n);
+             s_rx_link++;
+diff --git a/src/kernel/nvnet_link.c b/src/kernel/nvnet_link.c
+index 35763ce..c4af931 100644
+--- a/src/kernel/nvnet_link.c
++++ b/src/kernel/nvnet_link.c
+@@ -21,6 +21,14 @@
+  * Datagram: "XBL1" then the frame (14-byte Ethernet header first, no FCS).
+  * RECOMP_NET_PORT sets the UDP port (default 30740). The model filters by
+  * MAC; this layer only drops what is not a frame and what this instance sent.
++ *
++ * xemu: its "udp" network backend carries the same frames bare, one per
++ * datagram, between its bind address and one remote address. Its default
++ * "nat" backend keeps system link inside the emulator, and "pcap" puts raw
++ * Ethernet on a network card, which this layer does not read. With
++ * RECOMP_NET_XEMU=<host>:<port> (xemu's bind address; xemu's remote address
++ * is this PC's, port RECOMP_NET_PORT) frames also go there without the tag,
++ * and untagged datagrams from exactly that address are taken as frames.
+  */
+ #if defined(_WIN32)
+ #include <winsock2.h>
+@@ -43,6 +51,8 @@ static int s_ndest;
+ static uint8_t s_mac[6];
+ static unsigned short s_port = 30740;
+ static DWORD s_last_scan;
++static struct sockaddr_in s_xemu;      /* RECOMP_NET_XEMU; sin_port 0: none */
++static int s_last_xemu;                /* the last frame returned came from it */
+ 
+ /* Tailscale peers (network byte order), written by ts_thread, read by scan_dests. */
+ static CRITICAL_SECTION s_ts_lock;
+@@ -361,6 +371,13 @@ int nvlink_open(const uint8_t mac[6])
+     SetHandleInformation((HANDLE)s_sock, HANDLE_FLAG_INHERIT, 0);
+     setsockopt(s_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
+     setsockopt(s_sock, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof on);
++    {   /* A datagram to a closed port (a peer not started yet, xemu between
++         * restarts) makes Windows fail the socket's next receive with
++         * WSAECONNRESET. Turn that report off: UDP has no connection. */
++        BOOL off = FALSE;
++        DWORD got = 0;
++        WSAIoctl(s_sock, _WSAIOW(IOC_VENDOR, 12) /* SIO_UDP_CONNRESET */, &off, sizeof off, NULL, 0, &got, NULL, NULL);
++    }
+     memset(&me, 0, sizeof me);
+     me.sin_family = AF_INET;
+     me.sin_addr.s_addr = htonl(INADDR_ANY);
+@@ -378,6 +395,29 @@ int nvlink_open(const uint8_t mac[6])
+         ts_init = 1;
+     }
+     scan_dests();
++    {
++        const char *x = getenv("RECOMP_NET_XEMU");
++        memset(&s_xemu, 0, sizeof s_xemu);
++        if (x && *x) {
++            char host[256], *colon;
++            struct addrinfo hints, *res = NULL;
++            strncpy(host, x, sizeof host - 1); host[sizeof host - 1] = 0;
++            colon = strrchr(host, ':');
++            if (colon && atoi(colon + 1) > 0 && atoi(colon + 1) < 65536) {
++                *colon = 0;
++                memset(&hints, 0, sizeof hints);
++                hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
++                if (getaddrinfo(host, NULL, &hints, &res) == 0 && res) {
++                    s_xemu.sin_family = AF_INET;
++                    s_xemu.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
++                    s_xemu.sin_port = htons((unsigned short)atoi(colon + 1));
++                    freeaddrinfo(res);
++                }
++            }
++            fprintf(stderr, "  [NVNET] xemu peer: %s\n", s_xemu.sin_port ? "on (untagged frames, its udp backend)"
++                                                                        : "RECOMP_NET_XEMU is not host:port, ignored");
++        }
++    }
+     fprintf(stderr, "  [NVNET] link: UDP port %u, %d destination(s):", s_port, s_ndest);
+     for (i = 0; i < s_ndest; i++) {
+         uint32_t a = ntohl(s_dest[i].sin_addr.s_addr);
+@@ -401,6 +441,16 @@ void nvlink_send(const uint8_t *frame, int len)
+     memcpy(buf + 4, frame, (size_t)len);
+     for (i = 0; i < s_ndest; i++)
+         sendto(s_sock, buf, 4 + len, 0, (const struct sockaddr *)&s_dest[i], sizeof s_dest[i]);
++    if (s_xemu.sin_port)
++        sendto(s_sock, buf + 4, len, 0, (const struct sockaddr *)&s_xemu, sizeof s_xemu);
++}
++
++int nvlink_last_from_xemu(void) { return s_last_xemu; }
++
++void nvlink_send_xemu(const uint8_t *frame, int len)
++{
++    if (s_sock != INVALID_SOCKET && s_xemu.sin_port && len >= 14 && len <= NVLINK_MAX_FRAME)
++        sendto(s_sock, (const char *)frame, len, 0, (const struct sockaddr *)&s_xemu, sizeof s_xemu);
+ }
+ 
+ int nvlink_recv(uint8_t *frame, int max, int timeout_ms)
+@@ -415,14 +465,24 @@ int nvlink_recv(uint8_t *frame, int max, int timeout_ms)
+     tv.tv_sec = 0; tv.tv_usec = timeout_ms * 1000;
+     if (select(0, &rs, NULL, NULL, &tv) <= 0)
+         return 0;
+-    n = recv(s_sock, buf, sizeof buf, 0);
+-    if (n < 4 + 14 || memcmp(buf, LINK_MAGIC, 4) != 0)
+-        return 0;
+-    n -= 4;
+-    if (memcmp(buf + 4 + 6, s_mac, 6) == 0)     /* our own, looped back */
++    int off = 4;
++    s_last_xemu = 0;
++    {
++        struct sockaddr_in from;
++        int fl = sizeof from;
++        n = recvfrom(s_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
++        if (n >= 14 && s_xemu.sin_port && from.sin_port == s_xemu.sin_port &&
++            from.sin_addr.s_addr == s_xemu.sin_addr.s_addr && memcmp(buf, LINK_MAGIC, 4) != 0)
++            off = 0;                            /* xemu's udp backend: a bare frame */
++        else if (n < 4 + 14 || memcmp(buf, LINK_MAGIC, 4) != 0)
++            return 0;
++    }
++    n -= off;
++    s_last_xemu = off == 0;
++    if (memcmp(buf + off + 6, s_mac, 6) == 0)   /* our own, looped back */
+         return 0;
+     if (n > max) n = max;
+-    memcpy(frame, buf + 4, (size_t)n);
++    memcpy(frame, buf + off, (size_t)n);
+     return n;
+ }
+ 
+@@ -432,4 +492,6 @@ int nvlink_recv(uint8_t *frame, int max, int timeout_ms)
+ int  nvlink_open(const uint8_t mac[6]) { (void)mac; return -1; }
+ void nvlink_send(const uint8_t *frame, int len) { (void)frame; (void)len; }
+ int  nvlink_recv(uint8_t *frame, int max, int timeout_ms) { (void)frame; (void)max; (void)timeout_ms; return 0; }
++int  nvlink_last_from_xemu(void) { return 0; }
++void nvlink_send_xemu(const uint8_t *frame, int len) { (void)frame; (void)len; }
+ #endif
+diff --git a/src/kernel/nvnet_link.h b/src/kernel/nvnet_link.h
+index e5f711d..5cdbefc 100644
+--- a/src/kernel/nvnet_link.h
++++ b/src/kernel/nvnet_link.h
+@@ -13,5 +13,9 @@ int  nvlink_open(const uint8_t mac[6]);
+ void nvlink_send(const uint8_t *frame, int len);
+ /* Wait up to timeout_ms for one frame; its length, or 0. */
+ int  nvlink_recv(uint8_t *frame, int max, int timeout_ms);
++/* The RECOMP_NET_XEMU peer: did the frame nvlink_recv just returned come
++ * from it, and send one frame to it alone (untagged). */
++int  nvlink_last_from_xemu(void);
++void nvlink_send_xemu(const uint8_t *frame, int len);
+ 
+ #endif
+-- 
+2.51.0.windows.2
+

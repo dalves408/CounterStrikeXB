@@ -130,6 +130,39 @@ Another VPN works too. For partners the game does not find by itself, list their
 peers=100.64.0.2,100.64.0.3
 ```
 
+### System Link with xemu
+
+Out of the box, System Link plays with other PCs running this game. xemu, like a real Xbox, encrypts System Link
+with a key the BIOS makes for each game, so to play with it, the game needs that key from your own BIOS:
+
+1. In Insignia Setup, fill in your console's hard-drive key with **From BIOS + MCPX** (your console's BIOS image
+   and MCPX boot ROM), then save. Next to the EEPROM it saves `lankey.bin`, the game's System Link key. The BIOS
+   itself is not kept, and no key is built into the game.
+2. Turn it on in `settings.ini`:
+
+   ```ini
+   [network]
+   real_xbox=1
+   ```
+
+With `real_xbox=1` the game plays System Link with xemu, and no longer with copies of this game that leave it off
+(the default). Everyone in one game needs the same setting. A real Xbox has the same key but talks raw Ethernet,
+which the game does not send yet, so consoles cannot join it.
+
+xemu has to be set to send its network to the game. In xemu, open **Machine > Settings > Network**, turn **Enable**
+off, set **Attached to** to **UDP Tunnel**, set **Bind Address** to `0.0.0.0:9368` and **Remote Address** to this
+PC's address with port `30740` (`127.0.0.1:30740` when xemu runs on the same PC), then turn **Enable** on again.
+Then tell the game where xemu listens:
+
+```ini
+[network]
+real_xbox=1
+xemu=127.0.0.1:9368
+```
+
+(use the xemu PC's address instead of `127.0.0.1` when it runs on another PC). Start the game before starting xemu's
+Counter-Strike: the game gives xemu's Xbox its address, which it asks for when it starts.
+
 ### Xbox Live (Insignia)
 
 [Insignia](https://insignia.live) revives the original Xbox Live. The game signs in as your own console, so you need:

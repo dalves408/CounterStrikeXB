@@ -45,6 +45,8 @@ static uint8_t s_eeprom[256];
 static int s_ee_ok, s_acc_ok;
 static uint8_t s_bios_key_sum[20];          /* SHA-1 of a key decrypted from the BIOS (verified) */
 static int s_have_bios_key;
+static uint8_t s_lan_key[16];               /* the game's system-link key, from the BIOS (lankey.bin) */
+static int s_have_lan_key;
 #define ACCOUNT_SECTORS 11                  /* 9 machine account, 10, 11 user directory, 12-19 user slots */
 static uint8_t s_sectors[ACCOUNT_SECTORS][512];   /* the drive's sectors 9..19 */
 static char s_gamertags[256];
@@ -166,11 +168,12 @@ static int try_eeprom_key(const uint8_t *k, uint8_t hd[16])
     return 1;
 }
 
-static int search_2bl(const uint8_t *dec, unsigned n, uint8_t hd[16])
+/* The EEPROM key's offset in the decrypted 2BL plus one, or 0. */
+static unsigned search_2bl(const uint8_t *dec, unsigned n, uint8_t hd[16])
 {
     unsigned p;
     for (p = 0; p + 16 <= n; p++)
-        if (try_eeprom_key(dec + p, hd)) return 1;
+        if (try_eeprom_key(dec + p, hd)) return p + 1;
     return 0;
 }
 
@@ -187,6 +190,35 @@ static uint8_t *read_file(const char *path, size_t *n)
     return b;
 }
 
+/* The game's system-link key, XboxLANKey: what the kernel makes of the title
+ * certificate's LAN key when the game starts, HMAC-SHA1 keyed with its CERT
+ * key, first 16 bytes. The retail 2BL keeps the CERT key in the 16 bytes
+ * after the EEPROM key (checked: with it a real Xbox's system link -- xemu's
+ * -- finds the game). Only this per-game result is kept, as lankey.bin; the
+ * game uses it when settings.ini has [network] real_xbox=1. */
+static int lan_key_from_2bl(const uint8_t *cert_key, uint8_t out[16])
+{
+    char path[MAX_PATH], *sl;
+    size_t n = 0;
+    uint8_t *x, d[20];
+    uint32_t c;
+    int ok = 0;
+    if (getenv("CS_GAME_CWD")) snprintf(path, sizeof path, "%s\\game_files\\default.xbe", getenv("CS_GAME_CWD"));
+    else {
+        if (!GetModuleFileNameA(NULL, path, sizeof path) || !(sl = strrchr(path, '\\'))) return 0;
+        strcpy_s(sl + 1, sizeof path - (size_t)(sl + 1 - path), "game_files\\default.xbe");
+    }
+    if (!(x = read_file(path, &n)) || n < 0x200 || memcmp(x, "XBEH", 4)) { free(x); return 0; }
+    c = rd32(x + 0x118) - rd32(x + 0x104);
+    if (c + 0xC0 <= n && hmac_sha1(cert_key, 16, x + c + 0xB0, 16, d)) {
+        memcpy(out, d, 16);
+        ok = 1;
+    }
+    SecureZeroMemory(d, sizeof d);
+    free(x);
+    return ok;
+}
+
 /* 0: decrypted (hd filled; *rev names the MCPX revision that worked);
  * 1: files unreadable or the wrong size; 2: they do not unlock this EEPROM. */
 static int hdkey_from_bios(const char *bios_path, const char *mcpx_path, uint8_t hd[16], const char **rev)
@@ -196,6 +228,7 @@ static int hdkey_from_bios(const char *bios_path, const char *mcpx_path, uint8_t
     const uint8_t *im;
     uint8_t *dec = NULL;
     int r = 1;
+    unsigned at = 0;
     if (!bios || !mcpx || bn < 0x40000 || mn != 512) goto out;
     im = bios + bn - 0x40000;                    /* flash is mirrored up to the top of memory */
     dec = (uint8_t *)malloc(0x6000);
@@ -210,16 +243,17 @@ static int hdkey_from_bios(const char *bios_path, const char *mcpx_path, uint8_t
         if (sha1(blk, sizeof blk, rk)) {
             memcpy(dec, im + 0x39E00, 0x3600);
             rc4(rk, 20, dec, 0x3600);
-            if (search_2bl(dec, 0x3600, hd)) { *rev = "1.1"; r = 0; goto out; }
+            if ((at = search_2bl(dec, 0x3600, hd)) != 0) { *rev = "1.1"; r = 0; goto out; }
         }
         SecureZeroMemory(blk, sizeof blk); SecureZeroMemory(rk, sizeof rk);
     }
     {   /* MCPX 1.0 */
         memcpy(dec, im + 0x39E00, 0x6000);
         rc4(mcpx + 0x1A5, 16, dec, 0x6000);
-        if (search_2bl(dec, 0x6000, hd)) { *rev = "1.0"; r = 0; goto out; }
+        if ((at = search_2bl(dec, 0x6000, hd)) != 0) { *rev = "1.0"; r = 0; goto out; }
     }
 out:
+    s_have_lan_key = r == 0 && at + 31 < 0x6000 && lan_key_from_2bl(dec + at - 1 + 16, s_lan_key);
     if (dec) { SecureZeroMemory(dec, 0x6000); free(dec); }
     if (bios) { SecureZeroMemory(bios, bn); free(bios); }
     if (mcpx) { SecureZeroMemory(mcpx, mn); free(mcpx); }
@@ -566,6 +600,13 @@ static int save_identity(void)
         return 0;
     }
     SecureZeroMemory(t, sizeof t);
+    if (s_have_lan_key) {                    /* from the BIOS step: for [network] real_xbox=1 */
+        if (!cs_settings_path("lankey.bin", path, sizeof path, 1) || !(f = fopen(path, "wb")) ||
+            fwrite(s_lan_key, 1, 16, f) != 16 || fclose(f) != 0) {
+            tell("The system-link key could not be saved.", MB_ICONERROR);
+            return 0;
+        }
+    }
     return 1;
 }
 
