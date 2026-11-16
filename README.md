@@ -139,7 +139,9 @@ Then choose Xbox Live in the game and pick your gamertag.
 
 Every run writes a log to `%LOCALAPPDATA%\CounterStrikeXB\logs` (the newest five are kept, your Windows user name
 blanked out, the console's network address shortened to its maker prefix). It records the build, the PC, the video
-settings, a `[FREEZE]` report if the picture stops for 10 seconds and a `[CRASH]` report if the game crashes.
+settings and the frame-rate top picked for your monitor, an `[FPS]` line every minute of play (average FPS, 1% low,
+longest frame, frames over 50 and 100 ms), a `[FREEZE]` report if the picture stops for 10 seconds and a `[CRASH]`
+report if the game crashes.
 
 - In `config.exe`, **Report a problem...** opens the logs folder with the newest log selected and a new GitHub issue
   filled in with the game version and PC; describe the problem and drag the log onto it.
