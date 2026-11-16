@@ -32,6 +32,20 @@ if ($head -ne $dep.xboxrecomp.commit) { throw "toolkit HEAD $head != pin $($dep.
 $dirty = & git -C $tk status --porcelain --untracked-files=no
 if ($dirty) { throw "toolkit clone has local modifications:`n$dirty" }
 Write-Host "xboxrecomp pinned at $head"
+# SDL3 for non-Xbox controllers: the official Visual C++ package, checked
+# against its pinned SHA-256, unpacked into .deps\SDL3-<version>.
+$sdl = $dep.sdl3
+$sdlDir = Join-Path $root ".deps\SDL3-$($sdl.version)"
+if (-not (Test-Path -LiteralPath (Join-Path $sdlDir 'include\SDL3\SDL.h'))) {
+    New-Item -ItemType Directory -Force (Join-Path $root '.deps') | Out-Null
+    $zip = Join-Path $root ".deps\SDL3-devel-$($sdl.version)-VC.zip"
+    Invoke-WebRequest -Uri $sdl.url -OutFile $zip -UseBasicParsing
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+    if ($hash -ne $sdl.sha256) { Remove-Item -LiteralPath $zip; throw "SDL3 download hash $hash != pin $($sdl.sha256)" }
+    Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $root '.deps') -Force
+    Remove-Item -LiteralPath $zip
+}
+Write-Host "SDL3 $($sdl.version) in $sdlDir"
 if (-not $SkipPython) {
     & python -m pip install --quiet --target (Join-Path $root '.deps') "capstone==$($dep.capstone)"
     if ($LASTEXITCODE -ne 0) { throw 'pip install capstone failed' }

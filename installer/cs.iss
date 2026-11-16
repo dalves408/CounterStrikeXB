@@ -56,6 +56,9 @@ WelcomeLabel2=This installs the Counter-Strike (Xbox) PC recompilation.%n%nThe g
 Source: "{#BuildDir}\cs2_xbox_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\insignia_setup.exe"; DestDir: "{app}"; Flags: ignoreversion
+; SDL3 (zlib license): PlayStation and other non-Xbox controllers
+Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\SDL3-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\cs_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 ; the title update, as a patch to the disc's default.xbe: used by cs_import, and by the game when an

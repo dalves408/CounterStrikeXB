@@ -1,0 +1,458 @@
+From 71aabe3e87da1e459047ea9b8091a034a687cfb8 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input: PlayStation and other non-Xbox controllers through
+ SDL3
+
+Xbox controllers stay on XInput. sdl3_pads.c loads SDL3.dll from beside
+the program at run time and reads every pad SDL3 does not report as an
+Xbox one (DualSense, DualShock 4, Switch Pro, 8BitDo, ...) on its own
+thread, converted to XINPUT_STATE. Each such pad takes the lowest port
+XInput is not using and keeps it while connected. Rumble goes through
+SDL_RumbleGamepad. xbox_InputHostPad() gives host menus the same view.
+
+Built only when RECOMP_SDL3_INCLUDE_DIR names SDL3's headers; without
+SDL3.dll, or with RECOMP_SDL_PADS=0, only XInput is read.
+---
+ src/input/CMakeLists.txt  |  10 ++
+ src/input/sdl3_pads.c     | 288 ++++++++++++++++++++++++++++++++++++++
+ src/input/sdl3_pads.h     |  25 ++++
+ src/input/xinput_device.c |  33 ++++-
+ src/input/xinput_xbox.h   |   8 ++
+ 5 files changed, 361 insertions(+), 3 deletions(-)
+ create mode 100644 src/input/sdl3_pads.c
+ create mode 100644 src/input/sdl3_pads.h
+
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index ae6228d..54b63d7 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -23,6 +23,16 @@ if(WIN32)
+     # MSVC keeps the plain name. tests/input_xinput_imports checks the result.
+     target_link_libraries(xbox_input PUBLIC platform
+         $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>)
++    # Non-Xbox controllers (DualSense, DualShock 4, Switch Pro, ...) through
++    # SDL3, beside XInput (sdl3_pads.c). Only SDL3's headers are needed to
++    # build: SDL3.dll is loaded at run time from beside the program, and
++    # without it only XInput is read.
++    set(RECOMP_SDL3_INCLUDE_DIR "" CACHE PATH "SDL3 include directory (the one holding SDL3/SDL.h)")
++    target_sources(xbox_input PRIVATE sdl3_pads.c)
++    if(RECOMP_SDL3_INCLUDE_DIR)
++        target_include_directories(xbox_input PRIVATE ${RECOMP_SDL3_INCLUDE_DIR})
++        target_compile_definitions(xbox_input PRIVATE RECOMP_SDL3_PADS=1)
++    endif()
+ else()
+     find_package(SDL2 REQUIRED)
+     # The SDL window's key and focus events into that table.
+diff --git a/src/input/sdl3_pads.c b/src/input/sdl3_pads.c
+new file mode 100644
+index 0000000..3764614
+--- /dev/null
++++ b/src/input/sdl3_pads.c
+@@ -0,0 +1,288 @@
++/*
++ * sdl3_pads.c -- controllers XInput does not see (DualSense, DualShock 4,
++ * Switch Pro, 8BitDo, ...), read through SDL3, on Windows.
++ *
++ * Xbox controllers stay on XInput (xinput_device.c): this module skips any
++ * pad SDL reports as an Xbox one, so no pad counts twice. Each other pad gets
++ * a controller port XInput is not using, the lowest free one first, and keeps
++ * it while it stays connected. Its state is handed over as an XINPUT_STATE,
++ * so the rest of the input layer treats it exactly like an Xbox pad.
++ *
++ * SDL3.dll is loaded at run time from beside the program (never from the
++ * search path): without it, or with RECOMP_SDL_PADS=0, nothing changes.
++ * SDL is only ever touched from this module's own thread, which polls the
++ * pads at about 250 Hz; readers take a snapshot under a lock.
++ *
++ * Button positions follow the Xbox layout: the bottom face button is A
++ * (Cross on PlayStation), right B (Circle), left X (Square), top Y
++ * (Triangle). Options/+/Menu is START, Share/Create/- and the touchpad click
++ * are BACK. Rumble goes to the pad's motors when it has them.
++ */
++#if defined(_WIN32) && defined(RECOMP_SDL3_PADS)
++
++#include <windows.h>
++#include <xinput.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <SDL3/SDL.h>
++
++#include "sdl3_pads.h"
++
++#define MAX_PORTS 4
++#define MAX_SDL   8
++
++typedef struct {
++    SDL_JoystickID id;
++    SDL_Gamepad *pad;
++    int port;                   /* 0-3, or -1 while every port is taken */
++    XINPUT_STATE st;
++    WORD rumble_lo, rumble_hi;  /* asked for */
++    WORD rumble_set_lo, rumble_set_hi;
++} Pad;
++
++static CRITICAL_SECTION s_lock;
++static Pad s_pads[MAX_SDL];
++static int s_running;
++
++/* The SDL3 functions used, looked up in SDL3.dll. */
++static bool (SDLCALL *p_Init)(SDL_InitFlags);
++static bool (SDLCALL *p_SetHint)(const char *, const char *);
++static const char *(SDLCALL *p_GetError)(void);
++static int (SDLCALL *p_GetVersion)(void);
++static SDL_JoystickID *(SDLCALL *p_GetGamepads)(int *);
++static SDL_Gamepad *(SDLCALL *p_OpenGamepad)(SDL_JoystickID);
++static void (SDLCALL *p_CloseGamepad)(SDL_Gamepad *);
++static bool (SDLCALL *p_GamepadConnected)(SDL_Gamepad *);
++static SDL_GamepadType (SDLCALL *p_GetGamepadType)(SDL_Gamepad *);
++static const char *(SDLCALL *p_GetGamepadName)(SDL_Gamepad *);
++static bool (SDLCALL *p_GetGamepadButton)(SDL_Gamepad *, SDL_GamepadButton);
++static Sint16 (SDLCALL *p_GetGamepadAxis)(SDL_Gamepad *, SDL_GamepadAxis);
++static void (SDLCALL *p_UpdateGamepads)(void);
++static bool (SDLCALL *p_RumbleGamepad)(SDL_Gamepad *, Uint16, Uint16, Uint32);
++static void (SDLCALL *p_free)(void *);
++
++static int load_sdl(void)
++{
++    wchar_t path[MAX_PATH], *sl;
++    HMODULE m;
++    if (!GetModuleFileNameW(NULL, path, MAX_PATH) || !(sl = wcsrchr(path, L'\\'))) return 0;
++    wcscpy_s(sl + 1, MAX_PATH - (size_t)(sl + 1 - path), L"SDL3.dll");
++    m = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
++    if (!m) return 0;
++#define GET(var, name) if (!(*(FARPROC *)&var = GetProcAddress(m, name))) { FreeLibrary(m); return 0; }
++    GET(p_Init, "SDL_Init")
++    GET(p_SetHint, "SDL_SetHint")
++    GET(p_GetError, "SDL_GetError")
++    GET(p_GetVersion, "SDL_GetVersion")
++    GET(p_GetGamepads, "SDL_GetGamepads")
++    GET(p_OpenGamepad, "SDL_OpenGamepad")
++    GET(p_CloseGamepad, "SDL_CloseGamepad")
++    GET(p_GamepadConnected, "SDL_GamepadConnected")
++    GET(p_GetGamepadType, "SDL_GetGamepadType")
++    GET(p_GetGamepadName, "SDL_GetGamepadName")
++    GET(p_GetGamepadButton, "SDL_GetGamepadButton")
++    GET(p_GetGamepadAxis, "SDL_GetGamepadAxis")
++    GET(p_UpdateGamepads, "SDL_UpdateGamepads")
++    GET(p_RumbleGamepad, "SDL_RumbleGamepad")
++    GET(p_free, "SDL_free")
++#undef GET
++    return 1;
++}
++
++static int is_xbox(SDL_GamepadType t)
++{
++    return t == SDL_GAMEPAD_TYPE_XBOX360 || t == SDL_GAMEPAD_TYPE_XBOXONE;
++}
++
++/* The ports XInput has a pad on right now. */
++static unsigned xinput_ports(void)
++{
++    unsigned m = 0;
++    DWORD i;
++    for (i = 0; i < MAX_PORTS; i++) {
++        XINPUT_CAPABILITIES c;
++        if (XInputGetCapabilities(i, 0, &c) == ERROR_SUCCESS) m |= 1u << i;
++    }
++    return m;
++}
++
++static Sint16 clamp_neg(Sint16 v) { return (Sint16)(v == -32768 ? 32767 : -v); }   /* SDL's Y is down */
++
++static void read_pad(Pad *p, XINPUT_STATE *out)
++{
++    SDL_Gamepad *g = p->pad;
++    WORD b = 0;
++    Sint16 lt, rt;
++#define BTN(s, x) if (p_GetGamepadButton(g, s)) b |= x;
++    BTN(SDL_GAMEPAD_BUTTON_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP)
++    BTN(SDL_GAMEPAD_BUTTON_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN)
++    BTN(SDL_GAMEPAD_BUTTON_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT)
++    BTN(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT)
++    BTN(SDL_GAMEPAD_BUTTON_START, XINPUT_GAMEPAD_START)
++    BTN(SDL_GAMEPAD_BUTTON_BACK, XINPUT_GAMEPAD_BACK)
++    BTN(SDL_GAMEPAD_BUTTON_TOUCHPAD, XINPUT_GAMEPAD_BACK)
++    BTN(SDL_GAMEPAD_BUTTON_LEFT_STICK, XINPUT_GAMEPAD_LEFT_THUMB)
++    BTN(SDL_GAMEPAD_BUTTON_RIGHT_STICK, XINPUT_GAMEPAD_RIGHT_THUMB)
++    BTN(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER)
++    BTN(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER)
++    BTN(SDL_GAMEPAD_BUTTON_SOUTH, XINPUT_GAMEPAD_A)
++    BTN(SDL_GAMEPAD_BUTTON_EAST, XINPUT_GAMEPAD_B)
++    BTN(SDL_GAMEPAD_BUTTON_WEST, XINPUT_GAMEPAD_X)
++    BTN(SDL_GAMEPAD_BUTTON_NORTH, XINPUT_GAMEPAD_Y)
++#undef BTN
++    memset(&out->Gamepad, 0, sizeof out->Gamepad);
++    out->Gamepad.wButtons = b;
++    lt = p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
++    rt = p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
++    out->Gamepad.bLeftTrigger = (BYTE)(lt > 0 ? lt >> 7 : 0);
++    out->Gamepad.bRightTrigger = (BYTE)(rt > 0 ? rt >> 7 : 0);
++    out->Gamepad.sThumbLX = p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX);
++    out->Gamepad.sThumbLY = clamp_neg(p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY));
++    out->Gamepad.sThumbRX = p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX);
++    out->Gamepad.sThumbRY = clamp_neg(p_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY));
++}
++
++/* Open new pads, drop gone ones, and give each a port XInput is not using. */
++static void rescan(void)
++{
++    int n = 0, i, k;
++    SDL_JoystickID *ids = p_GetGamepads(&n);
++    unsigned xi = xinput_ports(), used;
++    for (i = 0; i < MAX_SDL; i++) {           /* gone */
++        Pad *p = &s_pads[i];
++        if (p->pad && !p_GamepadConnected(p->pad)) {
++            fprintf(stderr, "  [INPUT] SDL3 controller on port %d disconnected\n", p->port + 1);
++            p_CloseGamepad(p->pad);
++            EnterCriticalSection(&s_lock);
++            memset(p, 0, sizeof *p);
++            LeaveCriticalSection(&s_lock);
++        }
++    }
++    for (k = 0; ids && k < n; k++) {         /* new */
++        SDL_Gamepad *g;
++        int known = 0;
++        for (i = 0; i < MAX_SDL; i++) if (s_pads[i].pad && s_pads[i].id == ids[k]) known = 1;
++        if (known) continue;
++        for (i = 0; i < MAX_SDL && s_pads[i].pad; i++) {}
++        if (i == MAX_SDL) break;
++        if (!(g = p_OpenGamepad(ids[k]))) continue;
++        if (is_xbox(p_GetGamepadType(g))) {    /* XInput has it */
++            p_CloseGamepad(g);
++            continue;
++        }
++        EnterCriticalSection(&s_lock);
++        memset(&s_pads[i], 0, sizeof s_pads[i]);
++        s_pads[i].id = ids[k];
++        s_pads[i].pad = g;
++        s_pads[i].port = -1;
++        LeaveCriticalSection(&s_lock);
++        fprintf(stderr, "  [INPUT] SDL3 controller: %s\n", p_GetGamepadName(g) ? p_GetGamepadName(g) : "unnamed");
++    }
++    if (ids) p_free(ids);
++    used = xi;                                /* ports: keep, else the lowest free */
++    EnterCriticalSection(&s_lock);
++    for (i = 0; i < MAX_SDL; i++) {
++        Pad *p = &s_pads[i];
++        if (!p->pad || p->port < 0) continue;
++        if (used & (1u << p->port)) p->port = -1; else used |= 1u << p->port;
++    }
++    for (i = 0; i < MAX_SDL; i++) {
++        Pad *p = &s_pads[i];
++        if (!p->pad || p->port >= 0) continue;
++        for (k = 0; k < MAX_PORTS && (used & (1u << k)); k++) {}
++        if (k < MAX_PORTS) {
++            p->port = k; used |= 1u << k;
++            fprintf(stderr, "  [INPUT] SDL3 controller is controller %d\n", k + 1);
++        }
++    }
++    LeaveCriticalSection(&s_lock);
++}
++
++static DWORD WINAPI sdl_thread(LPVOID unused)
++{
++    DWORD last_scan = 0;
++    int v;
++    (void)unused;
++    p_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");   /* the game's window is not SDL's */
++    p_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
++    if (!p_Init(SDL_INIT_GAMEPAD)) {
++        fprintf(stderr, "  [INPUT] SDL3 could not start (%s): Xbox controllers only\n", p_GetError());
++        return 0;
++    }
++    v = p_GetVersion();
++    fprintf(stderr, "  [INPUT] SDL3 %d.%d.%d: PlayStation and other non-Xbox controllers on\n",
++            SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
++    InterlockedExchange((volatile LONG *)&s_running, 1);
++    for (;;) {
++        int i;
++        DWORD now = GetTickCount();
++        p_UpdateGamepads();
++        if (now - last_scan >= 500) { rescan(); last_scan = now; }
++        for (i = 0; i < MAX_SDL; i++) {
++            Pad *p = &s_pads[i];
++            XINPUT_STATE st;
++            WORD lo, hi;
++            if (!p->pad) continue;
++            read_pad(p, &st);
++            EnterCriticalSection(&s_lock);
++            if (memcmp(&st.Gamepad, &p->st.Gamepad, sizeof st.Gamepad)) {
++                p->st.Gamepad = st.Gamepad;
++                p->st.dwPacketNumber++;
++            }
++            lo = p->rumble_lo; hi = p->rumble_hi;
++            LeaveCriticalSection(&s_lock);
++            if (lo != p->rumble_set_lo || hi != p->rumble_set_hi) {
++                p_RumbleGamepad(p->pad, lo, hi, (lo || hi) ? 0xFFFF : 0);   /* held until changed */
++                p->rumble_set_lo = lo; p->rumble_set_hi = hi;
++            }
++        }
++        Sleep(4);
++    }
++}
++
++void sdl3pads_start(void)
++{
++    static volatile LONG started;
++    const char *e;
++    HANDLE th;
++    if (started || InterlockedExchange(&started, 1)) return;
++    e = getenv("RECOMP_SDL_PADS");
++    if (e && e[0] == '0') { fprintf(stderr, "  [INPUT] SDL3 controllers off (RECOMP_SDL_PADS=0)\n"); return; }
++    if (!load_sdl()) { fprintf(stderr, "  [INPUT] SDL3.dll not found beside the program: Xbox controllers only\n"); return; }
++    InitializeCriticalSection(&s_lock);
++    th = CreateThread(NULL, 0, sdl_thread, NULL, 0, NULL);
++    if (th) CloseHandle(th);
++}
++
++static Pad *pad_on(DWORD port)
++{
++    int i;
++    for (i = 0; i < MAX_SDL; i++)
++        if (s_pads[i].pad && s_pads[i].port == (int)port) return &s_pads[i];
++    return NULL;
++}
++
++int sdl3pads_get(DWORD port, XINPUT_STATE *out)
++{
++    Pad *p;
++    int ok = 0;
++    if (!s_running || port >= MAX_PORTS) return 0;
++    EnterCriticalSection(&s_lock);
++    if ((p = pad_on(port)) != NULL) { *out = p->st; ok = 1; }
++    LeaveCriticalSection(&s_lock);
++    return ok;
++}
++
++int sdl3pads_rumble(DWORD port, WORD lo, WORD hi)
++{
++    Pad *p;
++    int ok = 0;
++    if (!s_running || port >= MAX_PORTS) return 0;
++    EnterCriticalSection(&s_lock);
++    if ((p = pad_on(port)) != NULL) { p->rumble_lo = lo; p->rumble_hi = hi; ok = 1; }
++    LeaveCriticalSection(&s_lock);
++    return ok;
++}
++
++#endif
+diff --git a/src/input/sdl3_pads.h b/src/input/sdl3_pads.h
+new file mode 100644
+index 0000000..78f6b38
+--- /dev/null
++++ b/src/input/sdl3_pads.h
+@@ -0,0 +1,25 @@
++/*
++ * sdl3_pads.h -- non-Xbox controllers through SDL3 on Windows (sdl3_pads.c).
++ * Built when RECOMP_SDL3_PADS is defined (CMake: RECOMP_SDL3_INCLUDE_DIR);
++ * otherwise these are no-ops and only XInput is read.
++ */
++#ifndef SDL3_PADS_H
++#define SDL3_PADS_H
++
++#if defined(_WIN32) && defined(RECOMP_SDL3_PADS)
++#include <windows.h>
++#include <xinput.h>
++/* Start the SDL3 thread (once). Does nothing without SDL3.dll beside the
++ * program or with RECOMP_SDL_PADS=0. */
++void sdl3pads_start(void);
++/* 1 and the pad's state when an SDL3 controller has this port. */
++int sdl3pads_get(DWORD port, XINPUT_STATE *out);
++/* 1 when an SDL3 controller has this port (its motors are set). */
++int sdl3pads_rumble(DWORD port, WORD lo, WORD hi);
++#else
++#define sdl3pads_start() ((void)0)
++#define sdl3pads_get(port, out) 0
++#define sdl3pads_rumble(port, lo, hi) 0
++#endif
++
++#endif
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 368b5be..f4fdd09 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -55,6 +55,25 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+ 
+ #include <xinput.h>
+ #pragma comment(lib, "xinput.lib")
++#include "sdl3_pads.h"      /* non-Xbox controllers (DualSense, DualShock 4, ...) */
++
++/* A host pad on a port: an Xbox controller through XInput, else a controller
++ * SDL3 gave that port (sdl3_pads.c), in XInput's shape either way. */
++static DWORD host_pad(DWORD port, XINPUT_STATE *st)
++{
++    DWORD r;
++    sdl3pads_start();                               /* once; the first read starts it */
++    r = XInputGetState(port, st);
++    if (r != ERROR_SUCCESS && sdl3pads_get(port, st))
++        r = ERROR_SUCCESS;
++    return r;
++}
++
++DWORD xbox_InputHostPad(DWORD port, XINPUT_STATE *st)
++{
++    if (port >= XBOX_MAX_CONTROLLERS || !st) return ERROR_DEVICE_NOT_CONNECTED;
++    return host_pad(port, st);
++}
+ 
+ static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+@@ -79,7 +98,7 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+         return ERROR_DEVICE_NOT_CONNECTED;
+ 
+-    result = XInputGetState(dwPort, &xi_state);
++    result = host_pad(dwPort, &xi_state);
+     if (result != ERROR_SUCCESS) {
+         g_controller_connected[dwPort] = FALSE;
+         if (dwPort == 0) {
+@@ -174,7 +193,9 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+ 
+     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
+     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
+-    return XInputSetState(dwPort, &xi_vib);
++    if (XInputSetState(dwPort, &xi_vib) == ERROR_SUCCESS) return ERROR_SUCCESS;
++    return sdl3pads_rumble(dwPort, xi_vib.wLeftMotorSpeed, xi_vib.wRightMotorSpeed)
++        ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+ BOOL xbox_InputIsConnected(DWORD dwPort)
+@@ -192,7 +213,13 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
+         return ERROR_DEVICE_NOT_CONNECTED;
+ 
+     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+-    if (result != ERROR_SUCCESS) return result;
++    if (result != ERROR_SUCCESS) {
++        XINPUT_STATE st;
++        if (!sdl3pads_get(dwPort, &st)) return result;
++        memset(&xi_caps, 0, sizeof xi_caps);               /* an SDL3 pad: a gamepad */
++        xi_caps.Type = XINPUT_DEVTYPE_GAMEPAD;
++        xi_caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
++    }
+ 
+     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+     pCaps->Type = xi_caps.Type;
+diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
+index b5bb6cb..005f828 100644
+--- a/src/input/xinput_xbox.h
++++ b/src/input/xinput_xbox.h
+@@ -114,6 +114,14 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
+  */
+ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
+ 
++#if defined(_WIN32)
++/* A host controller in XInput's shape: an Xbox pad through XInput, else a
++ * controller SDL3 gave that port (sdl3_pads.c). Raw: no hold, no filter, no
++ * keyboard. For a host's own menus. */
++struct _XINPUT_STATE;
++DWORD xbox_InputHostPad(DWORD dwPort, struct _XINPUT_STATE *pState);
++#endif
++
+ #if !defined(_WIN32)
+ /* The POSIX SDL presenter owns event pumping while its main-thread window is
+  * active, and keeps SDL alive at shutdown while controller handles are open. */
+-- 
+2.51.0.windows.2
+

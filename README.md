@@ -22,7 +22,8 @@ renderer drawing it at up to 3x the original resolution.
 - **Title update 257** (the version Xbox Live expects), made from your own disc: no download needed.
 - **Office and Inferno,** the two downloadable maps, unlocked from the disc.
 - **Settings that apply as you play:** F1 in the game, `config.exe`, or RecompLauncher.
-- **Controller and keyboard:** XInput pads pass straight through; every key can be remapped.
+- **Controller and keyboard:** Xbox pads through XInput; PlayStation 4/5, Switch Pro and other pads through SDL3,
+  with rumble; every key can be remapped.
 - **Logs and problem reports** that RecompLauncher and `config.exe` can attach to a report.
 
 ## Install
@@ -61,8 +62,14 @@ restore damaged files. F1 > Hi-res textures turns it off and on as you play.
 | Q / E | White / Black |
 | 1 / 3 | Left / Right trigger |
 
-A connected XInput controller works as is. `config.exe` (in the game folder) remaps every control, with an
-alternate key for each.
+Controllers need no setup. Xbox controllers are read through XInput; PlayStation 4 and 5, Switch Pro, 8BitDo and
+other controllers through [SDL3](https://libsdl.org) (`SDL3.dll` in the game folder), with their buttons in the
+Xbox places (Cross = A, Circle = B, Square = X, Triangle = Y, Options = START, Share/Create or the touchpad = BACK,
+L1/R1 = White/Black) and rumble. Each takes the first free controller port. If Steam Input or DS4Windows already turns
+your pad into an Xbox one and the game sees it twice, untick "PlayStation and other controllers" on the Controls tab
+of `config.exe` (`[input] other_controllers=0` in `settings.ini`). The mouse pointer is hidden over the game.
+
+`config.exe` (in the game folder) remaps every control, with an alternate key for each.
 
 | Key | |
 | --- | --- |
@@ -165,7 +172,7 @@ Requirements: Windows 10/11 x64, Visual Studio 2022 with the C/C++ desktop workl
 *Counter-Strike (USA)* XISO image (its expected SHA-256 values are in `dependencies.json`).
 
 ```powershell
-# 1. Clone the pinned toolkit into tools\xboxrecomp (v0.17.0 + this project's patches)
+# 1. Clone the pinned toolkit into tools\xboxrecomp (v0.17.0 + this project's patches), and fetch SDL3 into .deps
 powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
 
 # 2. Extract your disc image into game_files\
@@ -216,7 +223,8 @@ checks every file. `python scripts\index_texture_pack.py <asset-root>` builds a 
 CounterStrikeXB is under the [PolyForm Strict License 1.0.0](LICENSE): you may read, study, build and play it for
 personal, noncommercial use, but not change it or share copies, changed or not. Get the game from this project's
 [releases](https://github.com/dalves408/CounterStrikeXB/releases). The toolkit patches in `patches/xboxrecomp/` stay
-under the toolkit's MIT License.
+under the toolkit's MIT License. `SDL3.dll`, shipped beside the game, is SDL's own build under its zlib License
+(`SDL3-LICENSE.txt`).
 
 **Why:** the game signs in to Xbox Live through Insignia, a community-run service shared with players on real
 consoles. Keeping modified builds off it protects everyone there from cheating. Bug reports and suggestions are

@@ -20,6 +20,7 @@
  *
  * The frame:
  *   - keeps the child the size of its client area and gives it the keyboard;
+ *   - hides the mouse pointer over the game;
  *   - does fullscreen (F11 / Alt+Enter and the F1 menu in the game ask it with
  *     the toolkit's WM_APP + 0x46; settings.ini's fullscreen at start);
  *   - on close, asks the game window to close (its own exit path writes the end
@@ -164,6 +165,15 @@ static LRESULT CALLBACK frame_proc(HWND h, UINT m, WPARAM w, LPARAM l)
             TerminateJobObject(s_job, 0);
         }
         return 0;
+    case WM_SETCURSOR:
+        /* No mouse pointer over the game, as on the console. The game's
+         * window is our child: Windows asks the parent first, and TRUE here
+         * keeps its arrow from being set. Title bar and borders keep theirs. */
+        if (LOWORD(l) == HTCLIENT) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:

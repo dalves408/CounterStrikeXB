@@ -31,6 +31,19 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH "xb
 if(NOT EXISTS "${XBOXRECOMP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "xboxrecomp missing at ${XBOXRECOMP_DIR}; run scripts/setup.ps1")
 endif()
+# SDL3 for PlayStation and other non-Xbox controllers (Xbox ones stay on
+# XInput): the pinned release in dependencies.json, unpacked into .deps by
+# scripts/setup.ps1. The toolkit needs only its headers; SDL3.dll goes beside
+# the game, which loads it at run time and reads XInput alone without it.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/dependencies.json" CS_DEPS_JSON)
+string(JSON CS_SDL3_VERSION GET "${CS_DEPS_JSON}" sdl3 version)
+set(CS_SDL3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps/SDL3-${CS_SDL3_VERSION}")
+if(EXISTS "${CS_SDL3_DIR}/include/SDL3/SDL.h")
+    set(RECOMP_SDL3_INCLUDE_DIR "${CS_SDL3_DIR}/include" CACHE PATH "" FORCE)
+else()
+    message(WARNING "SDL3 ${CS_SDL3_VERSION} missing at ${CS_SDL3_DIR}; run scripts/setup.ps1 (Xbox controllers only)")
+    set(RECOMP_SDL3_INCLUDE_DIR "" CACHE PATH "" FORCE)
+endif()
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # Pure pipeline output; never edited by hand.
@@ -102,6 +115,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>
     winmm dbghelp
 )
+if(RECOMP_SDL3_INCLUDE_DIR)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CS_SDL3_DIR}/lib/x64/SDL3.dll" "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CS_SDL3_DIR}/LICENSE.txt" "$<TARGET_FILE_DIR:${PROJECT_NAME}>/SDL3-LICENSE.txt")
+endif()
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
     # The player build names its .pdb without the build folder (symbolize_log.py finds it by id).

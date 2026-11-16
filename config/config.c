@@ -42,7 +42,8 @@ static const char *const VIDEO_LABEL[NVIDEO] = {
 static const char *const T_OFFON[2] = { "Off", "On" };
 static const char *const T_STRETCH[2] = { "Off (keep 4:3)", "On (fill the window)" };
 
-enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200, ID_REPORT = 330 };
+enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200, ID_REPORT = 330, ID_OTHER_PADS = 331 };
+static HWND s_other_pads;      /* [input] other_controllers: PlayStation and other pads through SDL3 */
 enum { PAGE_VIDEO, PAGE_CONTROLS };
 
 static CsSettings s_set;
@@ -250,7 +251,8 @@ static void show_page(int page)
     for (i = 0; i < s_nc; i++) ShowWindow(s_cpage[i], page == PAGE_CONTROLS ? SW_SHOW : SW_HIDE);
     status(page == PAGE_VIDEO
            ? "Video: the same options as the game's F1 menu. Saved changes apply the next time the game starts."
-           : "Controls: select a control, click Change key (or double-click it), then press the key you want.");
+           : "Controls: select a control, click Change key (or double-click it), then press the key you want. "
+             "Controllers need no setup.");
 }
 
 static void do_reset(void)
@@ -270,7 +272,10 @@ static void do_reset(void)
 
 static int do_save(void)
 {
-    if (!cs_settings_save(&s_set) || !save_keys()) {
+    char ini[MAX_PATH];
+    int other = SendMessageA(s_other_pads, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!cs_settings_save(&s_set) || !save_keys() || !cs_settings_path("settings.ini", ini, sizeof ini, 1)
+        || !WritePrivateProfileStringA("input", "other_controllers", other ? "1" : "0", ini)) {
         MessageBoxA(s_main, "The settings could not be saved.", "Counter-Strike", MB_ICONERROR);
         return 0;
     }
@@ -340,6 +345,13 @@ static void make_ui(HWND h)
     s_cpage[s_nc++] = mk("BUTTON", "Change key", WS_TABSTOP | BS_PUSHBUTTON, 20, 458, 100, 28, ID_CHANGE, f);
     s_cpage[s_nc++] = mk("BUTTON", "Change alternate", WS_TABSTOP | BS_PUSHBUTTON, 126, 458, 120, 28, ID_ALT, f);
     s_cpage[s_nc++] = mk("BUTTON", "Clear", WS_TABSTOP | BS_PUSHBUTTON, 252, 458, 70, 28, ID_CLEAR, f);
+    s_other_pads = mk("BUTTON", "PlayStation and other controllers", WS_TABSTOP | BS_AUTOCHECKBOX, 340, 461, 240, 22, ID_OTHER_PADS, f);
+    {
+        char ini[MAX_PATH];
+        int on = !cs_settings_path("settings.ini", ini, sizeof ini, 0) || GetPrivateProfileIntA("input", "other_controllers", 1, ini);
+        SendMessageA(s_other_pads, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    s_cpage[s_nc++] = s_other_pads;
 
     s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 520, 580, 20, ID_STATUS, f);
     mk("BUTTON", "Reset to defaults", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 10, 548, 130, 28, ID_RESET, f);
@@ -380,6 +392,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             status("Cleared. That control has no key until you give it one.");
             return 0;
         }
+        case ID_OTHER_PADS:
+            s_dirty = 1;
+            status("PlayStation, Switch Pro and other controllers work beside Xbox ones. Turn this off if Steam Input "
+                   "or DS4Windows already makes your pad an Xbox one (it would count twice). Click Save to keep it.");
+            return 0;
         case ID_RESET: do_reset(); return 0;
         case ID_REPORT: do_report(h); return 0;
         case ID_SAVE:  do_save(); return 0;

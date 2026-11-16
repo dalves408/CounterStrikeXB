@@ -171,6 +171,13 @@ void cs_settings_startup(void)
             SecureZeroMemory(key, sizeof key);
         }
     }
+    /* [input] other_controllers=0: Xbox controllers (XInput) only. On by
+     * default: PlayStation, Switch Pro and other controllers through SDL3
+     * (toolkit sdl3_pads.c). Off is for a pad Steam Input or DS4Windows already
+     * presents as an Xbox one, which would otherwise count twice. */
+    if (!getenv("RECOMP_SDL_PADS") && cs_settings_path("settings.ini", path, sizeof path, 0)
+        && GetPrivateProfileIntA("input", "other_controllers", 1, path) == 0)
+        _putenv_s("RECOMP_SDL_PADS", "0");
     /* [network] peers=host[,host...]: system link partners the LAN broadcast
      * does not reach (another subnet, a VPN such as Tailscale). The toolkit's
      * NIC link sends each frame to them too (nvnet_link.c). */

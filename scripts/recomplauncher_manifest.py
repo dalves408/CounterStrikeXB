@@ -120,7 +120,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f'CounterStrike-v{args.version}-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
-        for name in ('cs2_xbox_recomp.exe', 'cs_import.exe', 'config.exe', 'insignia_setup.exe', 'cs_tu.xbepatch'):
+        for name in ('cs2_xbox_recomp.exe', 'cs_import.exe', 'config.exe', 'insignia_setup.exe', 'cs_tu.xbepatch',
+                     'SDL3.dll', 'SDL3-LICENSE.txt'):
             package.write(args.build / name, name)
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

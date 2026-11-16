@@ -35,6 +35,7 @@
 extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
 extern int  xbox_InputKeyFaceButton(int vk); /* toolkit input/keyboard.c: 0 A, 1 B, ... or -1 */
 extern void xbox_InputSetHold(int on);      /* toolkit input/xinput_device.c */
+extern DWORD xbox_InputHostPad(DWORD port, XINPUT_STATE *st);   /* Xbox pad, else an SDL3 one (PlayStation, ...) */
 
 /* Port 0's state as the toolkit hands it to the title (input/xinput_xbox.h,
  * mirrored here: that header brings the Xbox's own Windows types). */
@@ -289,7 +290,7 @@ static LRESULT CALLBACK ov_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_TIMER && !s_active && s_pad_release) {
         /* closed: give the pad back once the button that closed the menu is up */
         XINPUT_STATE st;
-        if (XInputGetState(0, &st) != ERROR_SUCCESS || (st.Gamepad.wButtons == 0
+        if (xbox_InputHostPad(0, &st) != ERROR_SUCCESS || (st.Gamepad.wButtons == 0
                 && st.Gamepad.sThumbLX > -16000 && st.Gamepad.sThumbLX < 16000
                 && st.Gamepad.sThumbLY > -16000 && st.Gamepad.sThumbLY < 16000)) {
             s_pad_release = 0;
@@ -428,7 +429,7 @@ static void pad_tick(void)
     XINPUT_STATE st;
     WORD b, press;
     DWORD now = GetTickCount();
-    if (XInputGetState(0, &st) != ERROR_SUCCESS) { s_pad_prev = 0; s_pad_seen = 1; return; }
+    if (xbox_InputHostPad(0, &st) != ERROR_SUCCESS) { s_pad_prev = 0; s_pad_seen = 1; return; }
     b = st.Gamepad.wButtons;
     if (st.Gamepad.sThumbLY > 16000) b |= XINPUT_GAMEPAD_DPAD_UP;
     if (st.Gamepad.sThumbLY < -16000) b |= XINPUT_GAMEPAD_DPAD_DOWN;
