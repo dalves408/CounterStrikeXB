@@ -88,6 +88,12 @@ drawn over the game and changes these as you play, saving them as you go:
 72 FPS is the game's own limit, as on the PC version of the time. It is offered only where it looks smooth: on a
 144 Hz monitor (two refreshes per frame) or one with FreeSync/G-Sync Compatible; on other monitors 60 is the top,
 which is smooth on 60, 120 and 240 Hz. A native G-Sync monitor that does not report adaptive sync gets 72 at 144 Hz.
+Where the cap divides the monitor's refresh rate (30 on 60 Hz, 60 on 120 Hz, 72 on 144 Hz) the display paces it,
+one frame every few refreshes, so every frame is shown for the same time.
+
+**Xbox Live matches always run at 30 FPS,** as on the console. The game sends one movement command per frame, and
+Insignia's hosts (consoles and xemu) correct the movement of a faster client, which makes the view stutter whenever
+you move. Menus, single player and System Link keep your cap.
 
 `config.exe` has the same options, and changes made there or in RecompLauncher while the game runs apply within a
 second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` and `keymap.ini`.
@@ -133,7 +139,7 @@ peers=100.64.0.2,100.64.0.3
 Insignia briefly starts the game, which signs your console in, fetches the account and closes by itself. The recovery
 number is never logged or stored. Creating a brand-new account still needs the Xbox dashboard on a console.
 
-Then choose Xbox Live in the game and pick your gamertag.
+Then choose Xbox Live in the game and pick your gamertag. Matches run at 30 FPS, like everyone else's on Insignia.
 
 ### Problem reports and logs
 

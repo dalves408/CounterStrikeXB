@@ -58,6 +58,7 @@
 #include "cs_texture_pack.h"
 #include "cs_settings.h"
 #include "cs_overlay.h"
+#include "cs_launch.h"
 #include "video/video_player.h"
 #include "nv2a_backend.h"
 #include "cs_vsh_hlsl.h"
@@ -2339,6 +2340,9 @@ static void frame_latency_limit(void)
 
 /* The title's front buffer (and the video overlay) on the window. `fresh`:
  * compose the video overlay again (else the last one is drawn). */
+static int pace_hz(void);
+static UINT pace_interval(void);
+
 static void present_frame(HWND h, uint32_t fb_va, int fresh)
 {
     Rt *rt = NULL;
@@ -2431,8 +2435,19 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
         }
     }
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
-    sync = g_cs_settings.vsync ? 1u : 0u;
+    sync = pace_interval();
+    if (!sync) sync = g_cs_settings.vsync ? 1u : 0u;
     flags = (!sync && s_tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    {   /* the log says how frames are paced, when that changes */
+        static int last_hz = -1; static UINT last_sync = 99;
+        int hz = pace_hz();
+        if (hz != last_hz || sync != last_sync) {
+            fprintf(stderr, "[CS-SET] frame rate %d%s, %s\n", hz,
+                    cs_launch_xbox_live_match() ? " (Xbox Live match)" : "",
+                    sync > 1 ? "paced by the display (one frame every few refreshes)" : sync ? "VSync and timer" : "timer");
+            last_hz = hz; last_sync = sync;
+        }
+    }
     {
         HRESULT hr = IDXGISwapChain1_Present(s_sc, sync, flags);
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
@@ -2449,6 +2464,31 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
 /* The top cap for the window's monitor (cs_settings_rate_max), looked up again every two seconds: the window can move
  * to another monitor, or the refresh rate change. */
 static volatile LONG s_rate_max = 60;
+static int s_mon_hz;                /* the window's monitor, Hz (0 = unknown) */
+
+/* The frame rate the game runs at now: the setting held to the monitor's top, and 30 in an Xbox Live match (as on the
+ * console: the game sends one movement command per frame, and Insignia's hosts correct a 60 FPS client's movement,
+ * which stutters). */
+static int pace_hz(void)
+{
+    int hz = cs_settings_rate_effective(g_cs_settings.frame_rate, (int)s_rate_max);
+    if (cs_launch_xbox_live_match()) hz = 30;     /* always: Insignia's hosts expect a console's 30 */
+    return hz;
+}
+
+int cs_d3d11_pace_hz(void) { return pace_hz(); }
+
+/* Present every Nth refresh when the rate divides the monitor's (30 on 60 Hz, 60 on 120 Hz, 72 on 144 Hz): the display
+ * paces every frame exactly, as the Xbox's presentation interval does, where a timer on top of VSync 1 lets some frames
+ * stay up one refresh and others two. 0: not a whole divisor, the timer paces. */
+static UINT pace_interval(void)
+{
+    int hz = pace_hz(), n;
+    if (hz <= 0 || s_mon_hz <= hz) return 0;
+    n = (s_mon_hz + hz / 2) / hz;
+    if (n < 2 || n > 4 || abs(s_mon_hz - n * hz) > 1) return 0;
+    return (UINT)n;
+}
 
 int cs_d3d11_rate_max(void) { return (int)s_rate_max; }
 
@@ -2476,6 +2516,7 @@ static void rate_max_update(void)
     last_mon = mon; last_hz = hz;
     top = cs_settings_rate_max(mon, &hz, &vrr);
     InterlockedExchange(&s_rate_max, top);
+    s_mon_hz = hz;
     fprintf(stderr, "[CS-SET] frame rate top %d (monitor %d Hz, adaptive sync %s)\n", top, hz, vrr ? "yes" : "no");
 }
 
@@ -2488,8 +2529,8 @@ static void frame_cap(void)
     LONGLONG period;
     int hz;
     rate_max_update();
-    hz = cs_settings_rate_effective(g_cs_settings.frame_rate, (int)s_rate_max);
-    if (hz <= 0) { next.QuadPart = 0; return; }
+    hz = pace_hz();
+    if (hz <= 0 || pace_interval()) { next.QuadPart = 0; return; }   /* uncapped, or the display paces it */
     if (!f.QuadPart) QueryPerformanceFrequency(&f);
     if (!timer_res) { timer_res = 1; timeBeginPeriod(1); }
     period = f.QuadPart / hz;

@@ -7,6 +7,8 @@ double cs_now_ms(void);
 /* The top frame-rate cap for the monitor the game window is on (60 or 72, cs_settings_rate_max), checked every
  * two seconds by the renderer; the F1 menu offers 72 only when this is 72. */
 int cs_d3d11_rate_max(void);
+/* The frame rate the game is paced at now (0 = uncapped): the setting, the monitor's top, 30 in an Xbox Live match. */
+int cs_d3d11_pace_hz(void);
 /* The F1 menu changed a setting (g_cs_settings): apply it between frames. */
 void cs_d3d11_settings_changed(void);
 #endif

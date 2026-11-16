@@ -58,6 +58,8 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);   /* kernel_bridge.c */
 
 static uint32_t s_hal_va;
 static int s_from_parent;
+static int s_live;
+#define CS_LAUNCH_MODE_LIVE 5u
 
 static int cs_is_self_launch(uint32_t page)
 {
@@ -300,4 +302,11 @@ void cs_launch_restore(void)
     fprintf(stderr, "[CS2-LAUNCH] relaunched with launch page at 0x%08X"
                     " (type %u, title 0x%08X)\n", page, MEM32(page), MEM32(page + 4));
     cs_log_launch_data(page);
+    /* The game's own launch data names the match it reboots into: its first word is 5 for an Xbox Live match (4
+     * System Link, 1 back to the menus), followed by the Live session. Read, never written. */
+    s_live = MEM32(page + 4) == 0x4D530036u && MEM32(page + 0x400) == CS_LAUNCH_MODE_LIVE;
+    if (s_live)
+        fprintf(stderr, "[CS2-LAUNCH] an Xbox Live match\n");
 }
+
+int cs_launch_xbox_live_match(void) { return s_live; }

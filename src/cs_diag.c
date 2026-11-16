@@ -32,7 +32,8 @@
 #include "cs_diag.h"
 #include "cs_settings.h"
 
-extern unsigned cs_d3d11_frames(void);          /* cs_d3d11.c: flips presented so far */
+extern unsigned cs_d3d11_frames(void);
+extern int cs_d3d11_pace_hz(void);            /* cs_d3d11.c: the rate frames are paced at */          /* cs_d3d11.c: flips presented so far */
 extern int xbox_FramebufferIsFullscreen(void);    /* toolkit fb_present.c */
 extern void *xbox_FramebufferWindowHwnd(void);
 
@@ -463,7 +464,7 @@ void cs_diag_frame(void)
         if (low_ms > longest) low_ms = longest;
         putf("[FPS] last %.0f s: %.1f fps average, 1%% low %.1f fps, longest frame %.1f ms, %u frame(s) over 50 ms, "
              "%u over 100 ms (cap %d, vsync %d)\n", total / 1000.0, frames * 1000.0 / total,
-             low_ms > 0 ? 1000.0 / low_ms : 0.0, longest, over50, over100, g_cs_settings.frame_rate,
+             low_ms > 0 ? 1000.0 / low_ms : 0.0, longest, over50, over100, cs_d3d11_pace_hz(),
              g_cs_settings.vsync);
         memset(hist, 0, sizeof hist);
         frames = over50 = over100 = 0;
