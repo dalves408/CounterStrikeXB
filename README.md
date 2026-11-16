@@ -16,7 +16,8 @@ renderer drawing it at up to 5x the original resolution (4K).
   laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
 - **System link:** LAN play between PCs, and online with friends over a VPN, no Xbox needed: Tailscale is found by
-  itself, any other VPN works with a peer list.
+  itself, any other VPN works with a peer list. Optionally with xemu too, using the System Link key from your own
+  console's BIOS.
 - **Xbox Live through [Insignia](https://insignia.live)** with your own console's identity: sign in, play online,
   and recover your Insignia account straight into the game.
 - **Title update 257** (the version Xbox Live expects), made from your own disc: no download needed.
@@ -83,7 +84,7 @@ drawn over the game and changes these as you play, saving them as you go:
 
 | Setting | Choices |
 | --- | --- |
-| Render scale | 1x (480p, the original, default), 2x (1080p), 3x (1440p), 4x (4K, lighter), 4.5x (4K), 5x (4K, sharpest) |
+| Render scale | 1x (480p, the original, default), 2x (1080p), 3x (1440p), 4x (4K, lighter), 4.5x (4K), 5x (4K, sharpest); pick your screen, 4x and up need a fast graphics card |
 | Fullscreen | borderless, on the window's monitor (default on) |
 | Stretch image | fill the window instead of keeping 4:3 |
 | VSync | on / off |
@@ -107,7 +108,8 @@ second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` an
 
 ### System link
 
-System Link works between PCs on the same network: the games find each other by themselves.
+System Link works between PCs on the same network: the games find each other by themselves. Over the internet it
+runs through a VPN (below), and it can also play with xemu ([System Link with xemu](#system-link-with-xemu)).
 
 ### Online without an Xbox: System Link over a VPN
 
@@ -188,6 +190,9 @@ console.
 
 Without an EEPROM and a hard-drive key the game never contacts Insignia: it blocks all internet traffic and plays
 system link only.
+
+Its optional step 4, **System Link key...**, is separate from Xbox Live: it makes the key for System Link with
+xemu (see [System Link with xemu](#system-link-with-xemu)) and changes nothing else.
 
 Then choose Xbox Live in the game and pick your gamertag. Matches run at 30 FPS, like everyone else's on Insignia.
 
@@ -273,5 +278,6 @@ This repository contains original source code, scripts and documentation, plus a
 `cs.png`) made from the game's logo. It contains no Counter-Strike game code, assets or disc
 images, and nothing from the Xbox dashboard. Release builds contain code translated from the game; the game files
 come from the player's own disc. Xbox Live play goes through Insignia, an independent revival service.
-Counter-Strike is a trademark of Valve Corporation; this project is not affiliated with or endorsed by Valve,
-Microsoft or Insignia.
+Counter-Strike is a trademark of Valve Corporation; PlayStation, DualShock and DualSense are trademarks of Sony
+Interactive Entertainment, and Nintendo Switch of Nintendo. This project is not affiliated with or endorsed by Valve,
+Microsoft, Sony, Nintendo, Insignia, xemu or Tailscale.
