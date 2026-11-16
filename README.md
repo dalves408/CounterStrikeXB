@@ -135,15 +135,19 @@ peers=100.64.0.2,100.64.0.3
 Out of the box, System Link plays with other PCs running this game. xemu, like a real Xbox, encrypts System Link
 with a key the BIOS makes for each game, so to play with it, the game needs that key from your own BIOS:
 
-1. In Insignia Setup, fill in your console's hard-drive key with **From BIOS + MCPX** (your console's BIOS image
-   and MCPX boot ROM), then save. Next to the EEPROM it saves `lankey.bin`, the game's System Link key. The BIOS
-   itself is not kept, and no key is built into the game.
-2. Turn it on in `settings.ini`:
+1. In Insignia Setup, with your console's EEPROM in step 1, click **System Link key...** in step 4 and choose your
+   console's BIOS image and MCPX boot ROM. It saves only `lankey.bin`, the game's System Link key: your hard-drive
+   key and account stay as they are, so if you already set up Insignia there is nothing to redo. (Filling in step 2
+   with **From BIOS + MCPX** and saving makes the key too.) The BIOS is not kept, and no key is built into the game.
+2. Turn it on: Insignia Setup asks right after saving the key, or set it in `settings.ini`:
 
    ```ini
    [network]
    real_xbox=1
    ```
+
+   From a command line, `insignia_setup.exe --bios BIOS.bin --mcpx MCPX.bin --real-xbox 1` does both, using the
+   EEPROM you saved before.
 
 With `real_xbox=1` the game plays System Link with xemu, and no longer with copies of this game that leave it off
 (the default). Everyone in one game needs the same setting. A real Xbox has the same key but talks raw Ethernet,

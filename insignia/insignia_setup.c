@@ -38,7 +38,8 @@
 #pragma comment(lib, "comctl32.lib")
 
 enum { ID_EE_EDIT = 100, ID_EE_BROWSE, ID_EE_STATUS, ID_KEY_EDIT, ID_KEY_SHOW, ID_KEY_FILE, ID_KEY_BIOS, ID_KEY_STATUS,
-       ID_ACC_EDIT, ID_ACC_BROWSE, ID_ACC_STATUS, ID_CREATE, ID_SAVE, ID_CLOSE, ID_STATUS };
+       ID_ACC_EDIT, ID_ACC_BROWSE, ID_ACC_STATUS, ID_CREATE, ID_SAVE, ID_CLOSE, ID_STATUS,
+       ID_LAN_KEY, ID_LAN_STATUS };
 
 static HWND s_main, s_ee, s_ee_st, s_key, s_key_st, s_acc, s_acc_st, s_status;
 static uint8_t s_eeprom[256];
@@ -285,6 +286,71 @@ static void key_from_bios(const char *bios_path, const char *mcpx_path)
         snprintf(msg, sizeof msg, "OK: hard-drive key decrypted from your BIOS (MCPX %s) and verified against the EEPROM.", rev);
         say(s_key_st, msg);
     }
+}
+
+/* ---- 4. System Link with xemu: only the game's LAN key, from the BIOS -------------------------- */
+/* For players who set up Insignia before this existed, or never will: the
+ * BIOS and MCPX are checked against the EEPROM already loaded (the saved
+ * eeprom.bin), and only lankey.bin is written -- identity, hard-drive key and
+ * account stay as they are. The switch that uses it is separate and off by
+ * default: with it on, System Link no longer finds this game's other players
+ * who leave it off. */
+static const char k_real_xbox_warning[] =
+    "Turn on System Link with xemu now?\n\n"
+    "With it on, the game uses the real Xbox System Link key, so System Link only finds:\n"
+    "    - players of this game who turned it on too\n"
+    "    - xemu (set to UDP Tunnel, see the README)\n\n"
+    "It no longer finds players of this game who leave it off (the default), whether or not they "
+    "set up an EEPROM. Real Xbox consoles cannot join yet.\n\n"
+    "You can turn it off again in settings.ini: [network] real_xbox=0.";
+
+/* 0 saved; 1 no EEPROM; 2 files unreadable; 3 they do not unlock it; 4 not saved. */
+static int lan_key_from_bios(const char *bios_path, const char *mcpx_path)
+{
+    uint8_t hd[16];
+    const char *rev = "";
+    char path[MAX_PATH];
+    FILE *f;
+    int r;
+    if (!s_ee_ok) return 1;
+    s_have_lan_key = 0;
+    r = hdkey_from_bios(bios_path, mcpx_path, hd, &rev);
+    SecureZeroMemory(hd, sizeof hd);
+    if (r == 1) return 2;
+    if (r != 0 || !s_have_lan_key) return 3;
+    if (!cs_settings_path("lankey.bin", path, sizeof path, 1) || !(f = fopen(path, "wb"))) return 4;
+    r = fwrite(s_lan_key, 1, 16, f) == 16;
+    if (fclose(f) != 0 || !r) return 4;
+    return 0;
+}
+
+static int set_real_xbox(int on)
+{
+    char ini[MAX_PATH];
+    return cs_settings_path("settings.ini", ini, sizeof ini, 1) &&
+           WritePrivateProfileStringA("network", "real_xbox", on ? "1" : "0", ini);
+}
+
+static const char *const k_lan_why[] = {
+    "",
+    "Choose your console's EEPROM in step 1 first: the BIOS is checked against it.",
+    "Those are not a BIOS image (256 KB-1 MB) and an MCPX boot ROM (512 bytes).",
+    "That BIOS and MCPX ROM do not unlock this EEPROM. Use your own console's BIOS, with MCPX 1.0 "
+    "for an Xbox 1.0 or MCPX 1.1 for an Xbox 1.1-1.6.",
+    "The System Link key could not be saved.",
+};
+
+static HWND s_lan_st;
+
+static void lan_key_ui(const char *bios_path, const char *mcpx_path)
+{
+    int r = lan_key_from_bios(bios_path, mcpx_path);
+    if (r) { say(s_lan_st, k_lan_why[r]); return; }
+    if (MessageBoxA(s_main, k_real_xbox_warning, "Insignia Setup", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES &&
+        set_real_xbox(1))
+        say(s_lan_st, "Key saved. System Link with xemu is on.");
+    else
+        say(s_lan_st, "Key saved. System Link with xemu stays off until [network] real_xbox=1.");
 }
 
 /* ---- reading a drive: raw, or xemu's qcow2 ---------------------------------------------------- */
@@ -833,6 +899,10 @@ static void load_current(void)
         if (t[0]) { SetWindowTextA(s_key, t); check_key(); }
         SecureZeroMemory(t, sizeof t);
     }
+    if (cs_settings_path("lankey.bin", path, sizeof path, 0) && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+        say(s_lan_st, GetPrivateProfileIntA("network", "real_xbox", 0, ini) == 1
+                      ? "On: System Link plays with xemu and players who turned it on."
+                      : "Key saved, switch off: System Link plays with this game's default players.");
 }
 
 /* ---- window ----------------------------------------------------------------------------------- */
@@ -872,6 +942,11 @@ static void make_ui(void)
     s_acc_st = mk("STATIC", "Optional: an account from a drive, or recover one from Insignia.", SS_LEFT, 24, y + 88, 360, 20, ID_ACC_STATUS);
     mk("BUTTON", "Recover from Insignia...", BS_PUSHBUTTON | WS_TABSTOP, 394, y + 84, 176, 25, ID_CREATE);
     y += 140;
+    mk("BUTTON", "4. System Link with xemu (optional)", BS_GROUPBOX, 10, y, 572, 58, 0);
+    s_lan_st = mk("STATIC", "Off. Needs the System Link key from your BIOS + MCPX.",
+                  SS_LEFT, 24, y + 25, 400, 28, ID_LAN_STATUS);
+    mk("BUTTON", "System Link key...", BS_PUSHBUTTON | WS_TABSTOP, 434, y + 22, 136, 25, ID_LAN_KEY);
+    y += 70;
     s_status = mk("STATIC", "", SS_LEFT, 16, y + 6, 360, 20, ID_STATUS);
     mk("BUTTON", "Save", BS_DEFPUSHBUTTON | WS_TABSTOP, 386, y, 92, 28, ID_SAVE);
     mk("BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, 488, y, 92, 28, ID_CLOSE);
@@ -920,6 +995,20 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 check_accounts(path);
             }
             return 0;
+        case ID_LAN_KEY: {
+            char mcpx[MAX_PATH];
+            if (!s_ee_ok) { say(s_lan_st, k_lan_why[1]); return 0; }
+            MessageBoxA(s_main, "Choose your console's BIOS image first, then its MCPX boot ROM:\n\n"
+                        "MCPX 1.0 for an Xbox 1.0 (kernels 3944, 4034, 4036, 4627)\n"
+                        "MCPX 1.1 for an Xbox 1.1-1.6 (kernels 4817 to 5838)\n\n"
+                        "Only the game's System Link key is made from them and saved. Your EEPROM, "
+                        "hard-drive key and account stay as they are, and the BIOS is not kept.",
+                        "Insignia Setup", MB_ICONINFORMATION);
+            if (browse("BIOS image (*.bin)\0*.bin\0All files\0*.*\0", path, sizeof path) &&
+                browse("MCPX boot ROM (*.bin)\0*.bin\0All files\0*.*\0", mcpx, sizeof mcpx))
+                lan_key_ui(path, mcpx);
+            return 0;
+        }
         case ID_CREATE: recover(); return 0;
         case ID_SAVE: save(); return 0;
         case ID_CLOSE: DestroyWindow(h); return 0;
@@ -935,10 +1024,13 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 /* insignia_setup.exe --eeprom FILE (--hdd-key HEX | --hddinfo FILE) --drive FILE
  * does what the window does, without it (scripted installs, tests). The
  * window's controls are still made, hidden, so the checks and the save are
- * the same code. Exit 0 when saved; the reason goes to a message box. */
+ * the same code. Exit 0 when saved; the reason goes to a message box.
+ * insignia_setup.exe --bios FILE --mcpx FILE [--real-xbox 1|0] only saves the
+ * System Link key (step 4) against the saved EEPROM; --real-xbox alone sets
+ * the switch. Exit 6 with the reason on the console when that fails. */
 static int run_args(void)
 {
-    const char *ee = NULL, *key = NULL, *info = NULL, *drive = NULL, *bios = NULL, *mcpx = NULL;
+    const char *ee = NULL, *key = NULL, *info = NULL, *drive = NULL, *bios = NULL, *mcpx = NULL, *real_xbox = NULL;
     char t[128];
     int i;
     for (i = 1; i + 1 < __argc; i += 2) {
@@ -948,12 +1040,30 @@ static int run_args(void)
         else if (!strcmp(__argv[i], "--drive")) drive = __argv[i + 1];
         else if (!strcmp(__argv[i], "--bios")) bios = __argv[i + 1];
         else if (!strcmp(__argv[i], "--mcpx")) mcpx = __argv[i + 1];
+        else if (!strcmp(__argv[i], "--real-xbox")) real_xbox = __argv[i + 1];
         else return 2;
     }
     s_cli = 1;
     if (AttachConsole(ATTACH_PARENT_PROCESS)) freopen("CONOUT$", "w", stderr);
+    /* --bios FILE --mcpx FILE [--real-xbox 1|0] alone: only the System Link
+     * key, checked against the saved eeprom.bin (an earlier setup's). */
+    if (!ee && !key && !info && !drive && ((bios && mcpx) || real_xbox)) {
+        char path[MAX_PATH];
+        if (bios && mcpx) {
+            if (cs_settings_path("eeprom.bin", path, sizeof path, 0)) check_eeprom(path);
+            if ((i = lan_key_from_bios(bios, mcpx)) != 0) { fprintf(stderr, "%s\n", k_lan_why[i]); return 6; }
+            fprintf(stderr, "System Link key saved (lankey.bin).\n");
+        }
+        if (real_xbox) {
+            if (!set_real_xbox(real_xbox[0] == '1')) { fprintf(stderr, "settings.ini could not be written.\n"); return 6; }
+            fprintf(stderr, "System Link with xemu %s ([network] real_xbox=%c).\n", real_xbox[0] == '1' ? "on" : "off",
+                    real_xbox[0] == '1' ? '1' : '0');
+        }
+        return 0;
+    }
     if (!ee || (!key && !info && !(bios && mcpx))) {
-        fprintf(stderr, "usage: insignia_setup --eeprom FILE (--hdd-key HEX | --hddinfo FILE) [--drive FILE]\n");
+        fprintf(stderr, "usage: insignia_setup --eeprom FILE (--hdd-key HEX | --hddinfo FILE | --bios FILE --mcpx FILE) [--drive FILE]\n"
+                        "       insignia_setup --bios FILE --mcpx FILE [--real-xbox 1|0]   (System Link key only)\n");
         return 2;
     }
     check_eeprom(ee);
@@ -974,7 +1084,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 592, 470 };
+    RECT r = { 0, 0, 592, 512 };
     (void)prev; (void)cmd;
     InitCommonControls();
     memset(&wc, 0, sizeof wc);
