@@ -377,7 +377,7 @@ static void make_ui(HWND h)
     SendMessageA(s_mouse_inv, BM_SETCHECK, s_set.mouse_invert ? BST_CHECKED : BST_UNCHECKED, 0);
     s_cpage[s_nc++] = s_mouse_inv;
 
-    s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 520, 580, 20, ID_STATUS, f);
+    s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 515, 580, 32, ID_STATUS, f);   /* two lines */
     mk("BUTTON", "Reset to defaults", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 10, 548, 130, 28, ID_RESET, f);
     mk("BUTTON", "Report a problem...", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 150, 548, 140, 28, ID_REPORT, f);
     mk("BUTTON", "Save", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 444, 548, 70, 28, ID_SAVE, f);
@@ -420,8 +420,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             s_set.mouse_aim = SendMessageA(s_mouse_aim, BM_GETCHECK, 0, 0) == BST_CHECKED;
             s_dirty = 1;
             status(s_set.mouse_aim
-                   ? "Mouse aim on: the mouse aims and its buttons fire. Xbox Live will not sign in while it is on "
-                     "(it is controller only there); single player and System Link keep it. Click Save to keep it."
+                   ? "Mouse aim on: Xbox Live is not available while it is on (controller only there). "
+                     "Single player and System Link keep it. Click Save to keep it."
                    : "Mouse aim off. Click Save to keep it.");
             return 0;
         case ID_MOUSE_SENS:

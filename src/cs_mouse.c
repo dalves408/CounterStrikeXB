@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "recomp_types.h"
@@ -92,6 +93,33 @@ static void putf(uint32_t va, float f) { uint32_t u; memcpy(&u, &f, 4); MEM32(va
  * and the look update ran lately (every frame of play, the buy menu included). */
 static volatile LONG s_play_tick;
 
+int cs_mouse_ui_command(uint32_t text_va)
+{
+    /* the main menu's Xbox Live item runs "!enterLive"; the Live pages open as
+     * "open SuperLauncher_Live..." */
+    static const char enter[] = "!enterLive", live[] = "open SuperLauncher_Live";
+    char t[96];
+    unsigned i;
+    if (!text_va) return 0;
+    for (i = 0; i < sizeof t - 1 && MEM8(text_va + i); i++) t[i] = (char)MEM8(text_va + i);
+    t[i] = 0;
+    if (!g_cs_settings.mouse_aim || cs_launch_xbox_live_match())
+        return 0;
+    if (strncmp(t, enter, sizeof enter - 1) != 0 && strncmp(t, live, sizeof live - 1) != 0)
+        return 0;
+    fprintf(stderr, "[CS-MOUSE] mouse aim is on: the Xbox Live menu stays closed\n");
+    cs_overlay_live_refused();
+    return 1;
+}
+
+int cs_mouse_ui_refuse(void)
+{
+    if (!cs_mouse_ui_command(g_edx))
+        return 0;
+    g_esp += 4;                              /* ret: as if the command had run */
+    return 1;
+}
+
 int cs_mouse_menu_clicks(void)
 {
     int r = 0;
@@ -144,17 +172,12 @@ static int live_gate(void)
     if (!g_cs_settings.mouse_aim || cs_launch_xbox_live_match())
         return 0;
     now = GetTickCount();
-    if (now - (DWORD)last > 8000) {          /* logged once per sign-in attempt, not per packet */
-        static volatile LONG shown;
+    if (now - (DWORD)last > 8000) {          /* logged once per attempt, not per packet */
         InterlockedExchange(&last, (LONG)now);
-        fprintf(stderr, "[CS-MOUSE] mouse aim is on: Xbox Live refused (controller only)\n");
-        /* The menu says why once per copy of the game: a session already
-         * signed in when mouse aim was turned on keeps retrying, and the menu
-         * must not keep coming back. */
-        if (!InterlockedExchange(&shown, 1))
-            cs_overlay_live_refused();
+        fprintf(stderr, "[CS-MOUSE] mouse aim is on: Xbox Live traffic refused (controller only)\n");
     }
-    return 1;
+    return 1;              /* quietly: the notice is for choosing Xbox Live (!enterLive), not
+                            * for the game's own silent sign-in at start-up */
 }
 
 void cs_mouse_apply(void)
@@ -165,12 +188,24 @@ void cs_mouse_apply(void)
     xbox_InputSetMouseKeys(on);   /* the buttons and wheel, bound in keymap.ini */
 }
 
+static DWORD WINAPI test_notice(LPVOID unused)
+{
+    (void)unused;
+    Sleep(8000);
+    cs_overlay_live_refused();
+    return 0;
+}
+
 void cs_mouse_init(void)
 {
     mkb_set_mouse_only(1);
     mkb_set_mouse_stick(0);       /* the view angles, not the stick (cs_mouse_look) */
     nat_set_internet_gate(live_gate);
     cs_mouse_apply();
+    {   /* CS_TEST_LIVE_NOTICE=1: show the Xbox Live notice 8 s after start (to look at it) */
+        const char *t = getenv("CS_TEST_LIVE_NOTICE");
+        if (t && *t == '1') CloseHandle(CreateThread(NULL, 0, test_notice, NULL, 0, NULL));
+    }
     if (g_cs_settings.mouse_aim)
         fprintf(stderr, "[CS-MOUSE] mouse aim %s (sensitivity %d%%%s)\n",
                 cs_launch_xbox_live_match() ? "off in this Xbox Live match" : "on",

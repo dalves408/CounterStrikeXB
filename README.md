@@ -79,9 +79,10 @@ asks for a key): by default left click fires (right trigger), right click is the
 side buttons are White and Black. In the intros and menus, left click is START and right click is B. While mouse aim
 is on the pointer stays hidden in the middle of the picture; F9 frees it.
 
-**Xbox Live stays controller only**, because it is shared with players on Xboxes and xemu: while mouse aim is on the
-game will not sign in to Xbox Live (the F1 menu says why; turn mouse aim off and sign in again), and a match started
-from Xbox Live never reads the mouse. Single player, training and System Link, including over a VPN, keep it.
+**Xbox Live stays controller only**, because it is shared with players on Xboxes and xemu: while mouse aim is on,
+choosing Xbox Live does not open it. A notice says why and turns mouse aim off with one button (OFF), after which
+Xbox Live opens as usual. Nothing reaches Insignia while mouse aim is on, and a match started from Xbox Live never
+reads the mouse. Single player, training and System Link, including over a VPN, keep it.
 
 | Key | |
 | --- | --- |

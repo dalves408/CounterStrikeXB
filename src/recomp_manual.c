@@ -118,6 +118,16 @@ void sub_0019E1F0_enter(void)
     cs_mouse_look();
 }
 
+/* The game's UI command runner (edx: the command text, e.g. "open
+ * SuperLauncher_Live"): with mouse aim on, the Xbox Live pages do not open
+ * (src/cs_mouse.c). Refused, it returns as if it had run (a plain ret). */
+extern void sub_000CA3B0_gen(void);
+void sub_000CA3B0(void)
+{
+    if (cs_mouse_ui_refuse()) return;
+    sub_000CA3B0_gen();
+}
+
 /* ── ICALL failure logging ─────────────────────────────────── */
 
 /*
