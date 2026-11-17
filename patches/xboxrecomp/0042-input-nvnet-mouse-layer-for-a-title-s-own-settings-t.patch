@@ -1,0 +1,372 @@
+From c84fe7c348804ffbf4bc673408af0b793bfb5ecd Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input, nvnet: mouse layer for a title's own settings; title
+ internet gate
+
+Mouse layer (mkb_input.c), for a title that offers mouse aim as a setting:
+- mkb_set_enabled turns it on or off at run time (RECOMP_MKB still works);
+  turned off it gives the pointer back;
+- mkb_set_mouse_only leaves the keyboard to the key map (keyboard.c);
+- mkb_set_aim sets sensitivity and vertical inversion;
+- mkb_set_mouse_stick(0) and mkb_take_mouse hand the raw counts to the
+  title (to turn its view angles itself) instead of the aim stick.
+The game counts as in front when the foreground window has one of its
+windows as a child (RECOMP_FB_PARENT: a frame owned by another process),
+so capture works in a framed title. The pointer is pinned to one point
+in the middle of the picture while captured, so it cannot reach the
+title bar or a border. Mouse buttons stay down while held and a click
+between two polls still counts (they were cleared at every poll).
+
+Router (nvnet_nat.c): nat_set_internet_gate(blocked) lets a title refuse
+internet traffic by its own rule, checked per packet, after the console
+identity check.
+---
+ src/input/mkb_input.c  | 135 ++++++++++++++++++++++++++++++++---------
+ src/input/mkb_input.h  |  20 +++++-
+ src/kernel/nvnet_nat.c |   6 ++
+ src/kernel/nvnet_nat.h |   6 ++
+ 4 files changed, 136 insertions(+), 31 deletions(-)
+
+diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
+index d6f0042..4514039 100644
+--- a/src/input/mkb_input.c
++++ b/src/input/mkb_input.c
+@@ -135,10 +135,15 @@ static void mkb_load_config(void)
+  * with InterlockedAdd, the poll takes everything with Exchange(0). */
+ static volatile LONG s_dx, s_dy;
+ static volatile LONG s_wheel;        /* wheel steps since last poll   */
+-static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2    */
++static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
++static volatile LONG s_mouse_tap;    /* pressed since the last poll: a click
++                                        between two polls still counts */
+ static volatile unsigned char s_vk_down[256];
+ 
+ static volatile LONG s_active = 1;   /* F9 toggles this               */
++static volatile LONG s_on = -1;      /* -1: RECOMP_MKB decides; else mkb_set_enabled */
++static volatile LONG s_mouse_only;   /* mkb_set_mouse_only             */
++static volatile LONG s_mouse_stick = 1;  /* mkb_set_mouse_stick         */
+ static volatile LONG s_thread_up;
+ 
+ /* F9 is read on the input thread, so the toggle works even while the
+@@ -163,23 +168,23 @@ static void mkb_handle_raw(HRAWINPUT h)
+             if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
+         }
+         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
+-            InterlockedOr(&s_mouse_btn, 1);
++            { InterlockedOr(&s_mouse_btn, 1); InterlockedOr(&s_mouse_tap, 1); }
+         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
+             InterlockedAnd(&s_mouse_btn, ~1);
+         if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)
+-            InterlockedOr(&s_mouse_btn, 2);
++            { InterlockedOr(&s_mouse_btn, 2); InterlockedOr(&s_mouse_tap, 2); }
+         if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)
+             InterlockedAnd(&s_mouse_btn, ~2);
+         if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)
+-            InterlockedOr(&s_mouse_btn, 4);
++            { InterlockedOr(&s_mouse_btn, 4); InterlockedOr(&s_mouse_tap, 4); }
+         if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)
+             InterlockedAnd(&s_mouse_btn, ~4);
+         if (m->usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)
+-            InterlockedOr(&s_mouse_btn, 8);
++            { InterlockedOr(&s_mouse_btn, 8); InterlockedOr(&s_mouse_tap, 8); }
+         if (m->usButtonFlags & RI_MOUSE_BUTTON_4_UP)
+             InterlockedAnd(&s_mouse_btn, ~8);
+         if (m->usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)
+-            InterlockedOr(&s_mouse_btn, 16);
++            { InterlockedOr(&s_mouse_btn, 16); InterlockedOr(&s_mouse_tap, 16); }
+         if (m->usButtonFlags & RI_MOUSE_BUTTON_5_UP)
+             InterlockedAnd(&s_mouse_btn, ~16);
+         if (m->usButtonFlags & RI_MOUSE_WHEEL) {
+@@ -271,39 +276,75 @@ static DWORD WINAPI mkb_thread(LPVOID unused)
+ 
+ /* ---- poll side --------------------------------------------------------- */
+ 
++static void mkb_start(void)
++{
++    static LONG started = 0;
++    if (InterlockedCompareExchange(&started, 1, 0) == 0) {
++        mkb_load_config();
++        CloseHandle(CreateThread(NULL, 0, mkb_thread, NULL, 0, NULL));
++    }
++}
++
+ int mkb_enabled(void)
+ {
+-    static int on = -1;
++    LONG on = InterlockedCompareExchange(&s_on, 0, 0);
+     if (on < 0) {
+         /* Opt-in, like RECOMP_KEYBOARD: a keyboard silently acting as
+          * player 1 is surprising when a real pad is what you meant to use.
+-         * RECOMP_MKB=1 turns the layer on. */
++         * RECOMP_MKB=1 turns the layer on; a title can instead decide with
++         * mkb_set_enabled. */
+         const char *v = getenv("RECOMP_MKB");
+         on = v && *v && *v != '0';
+-        if (on) {
+-            mkb_load_config();
+-            if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
+-                static LONG started = 0;
+-                if (InterlockedCompareExchange(&started, 1, 0) == 0)
+-                    CloseHandle(CreateThread(NULL, 0, mkb_thread,
+-                                             NULL, 0, NULL));
+-            }
+-        }
++        InterlockedCompareExchange(&s_on, on, -1);
++        on = InterlockedCompareExchange(&s_on, 0, 0);
++        if (on) mkb_start();
+     }
+-    return on;
++    return on > 0;
++}
++
++void mkb_set_enabled(int on)
++{
++    InterlockedExchange(&s_on, on ? 1 : 0);
++    if (on) mkb_start();
++}
++
++void mkb_set_mouse_only(int on) { InterlockedExchange(&s_mouse_only, on ? 1 : 0); }
++void mkb_set_mouse_stick(int on) { InterlockedExchange(&s_mouse_stick, on ? 1 : 0); }
++
++void mkb_set_aim(double sens, int invert_y)
++{
++    if (sens > 0.0 && sens < 100.0) s_cfg.sens = sens;
++    s_cfg.invert_y = invert_y != 0;
+ }
+ 
+ /* The recompiled game's process is the foreground one. Raw input with
+  * INPUTSINK keeps arriving while the user is in another app, and the
+  * mouse must go on behaving normally there. */
++static BOOL CALLBACK mkb_child_is_ours(HWND h, LPARAM found)
++{
++    DWORD pid = 0;
++    GetWindowThreadProcessId(h, &pid);
++    if (pid != GetCurrentProcessId())
++        return TRUE;
++    *(int *)found = 1;
++    return FALSE;
++}
++
++/* The game's window may be a child of another process's top-level window
++ * (RECOMP_FB_PARENT: a title's frame that outlives each relaunch), so the
++ * foreground window counts when one of its children is ours. */
+ static int game_is_foreground(void)
+ {
+     DWORD pid = 0;
++    int found = 0;
+     HWND fg = GetForegroundWindow();
+     if (!fg)
+         return 0;
+     GetWindowThreadProcessId(fg, &pid);
+-    return pid == GetCurrentProcessId();
++    if (pid == GetCurrentProcessId())
++        return 1;
++    EnumChildWindows(fg, mkb_child_is_ours, (LPARAM)&found);
++    return found;
+ }
+ 
+ /* Hide and confine the pointer while captured. Aiming with raw deltas
+@@ -321,10 +362,19 @@ static void mkb_manage_cursor(int capture)
+     last = now;
+ 
+     if (capture) {
++        /* Pinned to one point in the middle of the picture, as shooters do:
++         * aim comes from raw deltas, so the pointer need not move, and one
++         * that may roam reaches the title bar (Close) or a border, where it
++         * turns into a resize arrow. */
+         RECT r;
++        POINT o = { 0, 0 };
+         HWND fg = GetForegroundWindow();
+-        if (fg && GetWindowRect(fg, &r))
+-            ClipCursor(&r);
++        if (fg && GetClientRect(fg, &r) && ClientToScreen(fg, &o) && r.right > 0 && r.bottom > 0) {
++            RECT pin;
++            pin.left = o.x + r.right / 2; pin.top = o.y + r.bottom / 2;
++            pin.right = pin.left + 1; pin.bottom = pin.top + 1;
++            ClipCursor(&pin);
++        }
+         if (hidden < 5) { ShowCursor(FALSE); hidden++; }
+     } else {
+         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
+@@ -354,6 +404,19 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
+     *out_y = (SHORT)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+ }
+ 
++int mkb_take_mouse(long *dx, long *dy)
++{
++    *dx = *dy = 0;
++    if (!mkb_enabled() || !s_thread_up || !s_active || !game_is_foreground()) {
++        InterlockedExchange(&s_dx, 0);
++        InterlockedExchange(&s_dy, 0);
++        return 0;
++    }
++    *dx = InterlockedExchange(&s_dx, 0);
++    *dy = InterlockedExchange(&s_dy, 0);
++    return *dx || *dy;
++}
++
+ #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
+ 
+ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -365,8 +428,15 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     int any = 0, i;
+     static DWORD packet;
+ 
+-    if (!pState || dwPort != 0 || !mkb_enabled())
++    if (!pState || dwPort != 0)
+         return 0;
++    if (!mkb_enabled()) {
++        if (s_thread_up)                 /* turned off: give the pointer back */
++            mkb_manage_cursor(0);
++        InterlockedExchange(&s_dx, 0);
++        InterlockedExchange(&s_dy, 0);
++        return 0;
++    }
+     if (!s_thread_up)
+         return 0;
+ 
+@@ -385,10 +455,13 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     }
+     mkb_manage_cursor(1);
+ 
+-    dx    = InterlockedExchange(&s_dx, 0);
+-    dy    = InterlockedExchange(&s_dy, 0);
++    if (s_mouse_stick) {             /* else mkb_take_mouse has them */
++        dx = InterlockedExchange(&s_dx, 0);
++        dy = InterlockedExchange(&s_dy, 0);
++    } else
++        dx = dy = 0;
+     wheel = InterlockedExchange(&s_wheel, 0);
+-    btn   = InterlockedExchange(&s_mouse_btn, 0);
++    btn   = InterlockedCompareExchange(&s_mouse_btn, 0, 0) | InterlockedExchange(&s_mouse_tap, 0);
+ 
+     memset(analog, 0, sizeof analog);
+ 
+@@ -397,8 +470,8 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+     if (btn & 0x04) b |= 0;                              /* M: below  */
+ 
+-    /* ---- keyboard: WASD movement ---- */
+-    {
++    /* ---- keyboard: WASD movement (not in mouse-only mode: the key map has it) ---- */
++    if (!s_mouse_only) {
+         int mx = 0, my = 0;
+         if (MK_VK('W')) my += 1;
+         if (MK_VK('S')) my -= 1;
+@@ -416,14 +489,13 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+         mkb_aim_vector(ax, ay, &aim_x, &aim_y);
+     }
+ 
+-    /* ---- keyboard: buttons (Black's layout) ---- */
++    /* ---- keyboard: buttons (Black's layout; not in mouse-only mode) ---- */
++    if (!s_mouse_only) {
+     if (MK_VK(VK_SPACE))  analog[XBOX_BUTTON_A]     = 255; /* use/jump */
+     if (MK_VK('R'))       analog[XBOX_BUTTON_X]     = 255; /* reload    */
+     if (MK_VK('E'))       analog[XBOX_BUTTON_B]     = 255; /* alt use   */
+     if (MK_VK('Q'))       analog[XBOX_BUTTON_WHITE] = 255; /* grenade   */
+     if (MK_VK('F'))       analog[XBOX_BUTTON_BLACK] = 255; /* alt gren. */
+-    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
+-    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
+     if (MK_VK(VK_RETURN) || MK_VK(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
+     if (MK_VK(VK_TAB))                         b |= XBOX_GAMEPAD_BACK;
+     if (MK_VK(VK_LSHIFT))                      b |= XBOX_GAMEPAD_LEFT_THUMB;
+@@ -432,6 +504,9 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     if (MK_VK(VK_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
+     if (MK_VK(VK_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
+     if (MK_VK(VK_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
++    }
++    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
++    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
+ 
+     /* ---- wheel / middle button: cycle weapon ---- */
+     if (wheel || (btn & 0x04))
+diff --git a/src/input/mkb_input.h b/src/input/mkb_input.h
+index 664efad..d0f65a0 100644
+--- a/src/input/mkb_input.h
++++ b/src/input/mkb_input.h
+@@ -35,9 +35,27 @@
+ extern "C" {
+ #endif
+ 
+-/* True when the layer is enabled (RECOMP_MKB not "0"). Cheap; cached. */
++/* True when the layer is enabled (RECOMP_MKB not "0", or mkb_set_enabled). Cheap. */
+ int mkb_enabled(void);
+ 
++/* For a title's own settings, at any time:
++ *   mkb_set_enabled   turn the layer on or off (starts its input thread once);
++ *   mkb_set_mouse_only  1: only the mouse (aim, buttons, wheel); the keyboard is
++ *                     left to the key map (keyboard.c) instead of this layer's
++ *                     fixed layout;
++ *   mkb_set_aim       sensitivity multiplier and vertical inversion. */
++void mkb_set_enabled(int on);
++void mkb_set_mouse_only(int on);
++void mkb_set_aim(double sens, int invert_y);
++
++/* Mouse aim through the title's own view angles instead of the stick:
++ *   mkb_set_mouse_stick(0)  the mouse no longer deflects the aim stick;
++ *   mkb_take_mouse          the raw counts since the last call (x right, y
++ *                           down), 0 when there are none or the layer is off,
++ *                           released (F9) or the game is not in front. */
++void mkb_set_mouse_stick(int on);
++int  mkb_take_mouse(long *dx, long *dy);
++
+ /*
+  * Merge the mouse+keyboard virtual pad on top of *pState, in place.
+  * Buttons OR in, analog buttons take the larger value, and the aim
+diff --git a/src/kernel/nvnet_nat.c b/src/kernel/nvnet_nat.c
+index 3c7881f..b282f4c 100644
+--- a/src/kernel/nvnet_nat.c
++++ b/src/kernel/nvnet_nat.c
+@@ -74,6 +74,7 @@ static uint16_t s_ip_id = 1;
+ static unsigned s_log_dns, s_log_hosts, s_log_tcp;
+ static unsigned long s_out, s_in;
+ static int s_identity;                  /* 1: the player's EEPROM and hard-drive key are loaded */
++static int (*volatile s_gate)(void);     /* nat_set_internet_gate */
+ static unsigned s_log_blocked;
+ 
+ static uint16_t csum(const uint8_t *p, int n, uint32_t s)
+@@ -255,6 +256,8 @@ static void ip_out(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *p,
+                                 "blocked, Xbox Live is off. Run Insignia Setup to add yours.\n");
+             return;
+         }
++        if (s_gate && s_gate())                 /* the title's own rule */
++            return;
+         if (dp == 53) log_dns(p + 8, n - 8);
+         if (!(m = udp_for(sp))) return;
+         if (dp == 53 && s_ndns && dst != ntohl(s_dns[0]) && n >= 10 && dns_is_xboxlive(p + 8, n - 8)) {
+@@ -415,6 +418,8 @@ int nat_dns_servers(uint32_t out[2])
+     return s_ndns;
+ }
+ 
++void nat_set_internet_gate(int (*blocked)(void)) { s_gate = blocked; }
++
+ void nat_init(void (*inject)(const uint8_t *frame, int len))
+ {
+     const char *d = getenv("RECOMP_NET_DNS");
+@@ -449,6 +454,7 @@ void nat_init(void (*inject)(const uint8_t *frame, int len))
+ #include <string.h>
+ const uint8_t g_nat_router_mac[6] = { 0x00, 0x50, 0xF2, 0x00, 0x00, 0x01 };
+ void nat_init(void (*inject)(const uint8_t *frame, int len)) { (void)inject; }
++void nat_set_internet_gate(int (*blocked)(void)) { (void)blocked; }
+ int  nat_enabled(void) { return 0; }
+ int  nat_dns_servers(uint32_t out[2]) { (void)out; return 0; }
+ int  nat_from_console(const uint8_t *frame, int len) { (void)frame; (void)len; return 0; }
+diff --git a/src/kernel/nvnet_nat.h b/src/kernel/nvnet_nat.h
+index 3a60447..96a3877 100644
+--- a/src/kernel/nvnet_nat.h
++++ b/src/kernel/nvnet_nat.h
+@@ -23,4 +23,10 @@ int  nat_dns_servers(uint32_t out[2]);
+  * router or the internet), 0 to send it on the system link. */
+ int  nat_from_console(const uint8_t *frame, int len);
+ 
++/* A title's own rule for the internet, asked for every packet bound beyond
++ * the router: nonzero drops it (the console sees no answer, as with no
++ * console identity). NULL (the default) lets everything out. Called on the
++ * NIC's thread, so it must be quick. */
++void nat_set_internet_gate(int (*blocked)(void));
++
+ #endif
+-- 
+2.51.0.windows.2
+

@@ -69,6 +69,7 @@ set(GAME_SOURCES
     src/cs_diag.c
     src/cs_frame.c
     src/cs_content.c
+    src/cs_mouse.c
     installer/tu_apply.c
     resources/cs.rc
 )

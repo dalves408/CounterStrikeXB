@@ -54,6 +54,11 @@ def manifest():
                 [('Off', 1), ('2x', 2), ('4x', 4), ('8x', 8), ('16x', 16)], 1),
         setting('hires-textures', 'Hi-res textures', 'display/hires_textures', toggle, 1,
                 'Uses the hi-res texture pack (a texture_pack folder beside the game) when it is installed.'),
+        setting('mouse-aim', 'Mouse aim', 'input/mouse_aim', toggle, 0,
+                'The mouse turns the view, as in the PC game. Xbox Live will not sign in while it is on: it is '
+                'controller only, shared with players on Xbox and xemu. Single player and System Link keep it.'),
+        setting('mouse-sensitivity', 'Mouse sensitivity', 'input/mouse_sensitivity',
+                [('0.5x', 50), ('0.75x', 75), ('1x', 100), ('1.5x', 150), ('2x', 200), ('3x', 300)], 100),
     ]
     return {
         '$schema': 'https://recomplauncher.com/schema/recomplauncher.json',

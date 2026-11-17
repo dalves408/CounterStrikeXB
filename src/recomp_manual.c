@@ -23,6 +23,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include "cs_kernel.h"
 #include "cs_launch.h"
+#include "cs_mouse.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -104,6 +105,17 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
         return f ? f : (recomp_func_t)cs_kernel_override(xbox_va);
     }
     return (recomp_func_t)0;
+}
+
+/* ── Entry hooks ─────────────────────────────────────────────── */
+
+/* The client's look update (Half-Life's IN_JoyMove as the Xbox port has it,
+ * called from CL_CreateMove each frame): mouse aim adds the mouse's turn to
+ * the view angles first (src/cs_mouse.c). The translator calls this at the
+ * top of the generated sub_0019E1F0 (scripts/pipeline.py --exclude-manual). */
+void sub_0019E1F0_enter(void)
+{
+    cs_mouse_look();
 }
 
 /* ── ICALL failure logging ─────────────────────────────────── */

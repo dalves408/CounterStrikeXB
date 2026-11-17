@@ -1,0 +1,198 @@
+From 39a5899af862c14bdcf3485be2dc19945a0c733c Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input, nvnet: mouse buttons and wheel as keys; title gate
+ first
+
+The mouse buttons were the mouse layer's own fixed buttons. They are keys
+in the key map now, like the keyboard: mouse1..mouse5 (already named)
+plus mwheelup and mwheeldown, two codes Windows leaves unassigned, each a
+70 ms press per notch (wheel deltas finer than a notch add up instead of
+being dropped). The default map gives the triggers, Y, White and Black
+the mouse as their alternate. xbox_InputSetMouseKeys turns them on, for a
+title's mouse aim setting; off (the default) they count for nothing, so a
+click that brings the window to the front is not a press. In mouse-only
+mode the mouse layer no longer presses buttons itself.
+
+The router asks the title's internet gate before the console identity
+check, so a title's reason is the one given even with no identity.
+---
+ src/input/input_map.c  |  3 ++-
+ src/input/keyboard.c   | 19 ++++++++++++++++++-
+ src/input/keyboard.h   |  7 +++++++
+ src/input/mkb_input.c  | 23 +++++++++++++++++++++--
+ src/kernel/nvnet_nat.c |  4 ++--
+ 5 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/src/input/input_map.c b/src/input/input_map.c
+index da54ee9..0dbc567 100644
+--- a/src/input/input_map.c
++++ b/src/input/input_map.c
+@@ -68,10 +68,11 @@ typedef struct KeyName { const char *name; int vk; } KeyName;
+ 
+ /* The first name listed for a code is the one written back. Letters, digits,
+  * function keys and the numeric pad's digits are generated rather than listed.
+- * The mouse wheel has no virtual-key code, so it has no name here. */
++ * The wheel has no virtual-key code; it gets two unassigned ones (keyboard.h). */
+ static const KeyName k_keys[] = {
+     { "mouse1", XBOX_VK_LBUTTON }, { "mouse2", XBOX_VK_RBUTTON }, { "mouse3", XBOX_VK_MBUTTON },
+     { "mouse4", XBOX_VK_XBUTTON1 }, { "mouse5", XBOX_VK_XBUTTON2 },
++    { "mwheelup", XBOX_VK_MWHEELUP }, { "mwheeldown", XBOX_VK_MWHEELDOWN },
+     { "backspace", XBOX_VK_BACK }, { "tab", XBOX_VK_TAB }, { "enter", XBOX_VK_RETURN }, { "return", XBOX_VK_RETURN },
+     { "shift", XBOX_VK_SHIFT }, { "ctrl", XBOX_VK_CONTROL }, { "control", XBOX_VK_CONTROL }, { "alt", XBOX_VK_MENU },
+     { "pause", XBOX_VK_PAUSE }, { "capslock", XBOX_VK_CAPITAL },
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index 080cbae..b5bd05d 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -26,6 +26,16 @@
+  * thread and read only by the game's poll, one byte at a time, and a press
+  * seen a poll late is indistinguishable from one made a poll later. */
+ static volatile unsigned char s_key_down[256];
++static volatile int s_mouse_keys;       /* xbox_InputSetMouseKeys */
++
++void xbox_InputSetMouseKeys(int on) { s_mouse_keys = on != 0; }
++
++static int is_mouse_vk(int vk)
++{
++    return vk == XBOX_VK_LBUTTON || vk == XBOX_VK_RBUTTON || vk == XBOX_VK_MBUTTON ||
++           vk == XBOX_VK_XBUTTON1 || vk == XBOX_VK_XBUTTON2 ||
++           vk == XBOX_VK_MWHEELUP || vk == XBOX_VK_MWHEELDOWN;
++}
+ 
+ void xbox_InputKeySet(int vk, int down)
+ {
+@@ -114,6 +124,13 @@ const xbox_key_row xbox_key_map[] = {
+     { "K",               { 'K' },            XBOX_KEY_AXIS,   XBOX_KEY_RY,             -1, "Right stick down" },
+     { "J",               { 'J' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             -1, "Right stick left" },
+     { "L",               { 'L' },            XBOX_KEY_AXIS,   XBOX_KEY_RX,             +1, "Right stick right" },
++    /* The mouse, as each control's alternate. Counted only while a title's
++     * mouse aim is on (xbox_InputSetMouseKeys). */
++    { "Left click",      { XBOX_VK_LBUTTON },  XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER, 0, "Right trigger" },
++    { "Right click",     { XBOX_VK_RBUTTON },  XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER, 0, "Left trigger" },
++    { "Wheel up",        { XBOX_VK_MWHEELUP }, XBOX_KEY_ANALOG, XBOX_BUTTON_Y,        0, "Y" },
++    { "Mouse button 4",  { XBOX_VK_XBUTTON1 }, XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE,    0, "White" },
++    { "Mouse button 5",  { XBOX_VK_XBUTTON2 }, XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK,    0, "Black" },
+ };
+ const size_t xbox_key_map_count = sizeof xbox_key_map / sizeof xbox_key_map[0];
+ 
+@@ -240,7 +257,7 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
+ 
+     /* One snapshot of the table, so a poll sees one set of keys. */
+     for (int vk = 0; vk < INPUT_KEY_COUNT; vk++)
+-        down[vk] = s_key_down[vk];
++        down[vk] = (s_mouse_keys || !is_mouse_vk(vk)) ? s_key_down[vk] : 0;
+     xbox_InputKeyboardBindings(&b);
+ 
+     memset(out, 0, sizeof *out);
+diff --git a/src/input/keyboard.h b/src/input/keyboard.h
+index d93f78b..ac1d812 100644
+--- a/src/input/keyboard.h
++++ b/src/input/keyboard.h
+@@ -33,6 +33,8 @@ extern "C" {
+ #define XBOX_VK_MBUTTON   0x04
+ #define XBOX_VK_XBUTTON1  0x05
+ #define XBOX_VK_XBUTTON2  0x06
++#define XBOX_VK_MWHEELUP  0x0E      /* the wheel: codes Windows leaves unassigned, */
++#define XBOX_VK_MWHEELDOWN 0x0F     /* one short press per notch (mkb_input.c) */
+ #define XBOX_VK_BACK      0x08
+ #define XBOX_VK_TAB       0x09
+ #define XBOX_VK_RETURN    0x0D
+@@ -102,6 +104,11 @@ int  xbox_InputWin32SideVk(int vk, uint32_t lparam);
+  * set, or 0 for any other message. wparam is the message's wParam, whose
+  * high word says which X button. */
+ int  xbox_InputWin32MouseVk(unsigned msg, uint32_t wparam, int *down);
++
++/* Mouse buttons and the wheel count as keys only while this is on (a title's
++ * mouse aim setting): otherwise the click that brings the window to the
++ * front would also be a shot. Off by default. */
++void xbox_InputSetMouseKeys(int on);
+ /* Non-zero while that virtual key is held in the game's window. Always zero
+  * when there is no window, which is the right answer: with nothing to focus
+  * there is nothing to type into. Kept under its old name for usb_gamepad.c's
+diff --git a/src/input/mkb_input.c b/src/input/mkb_input.c
+index 4514039..88f53e2 100644
+--- a/src/input/mkb_input.c
++++ b/src/input/mkb_input.c
+@@ -30,6 +30,7 @@
+ #define _CRT_SECURE_NO_WARNINGS
+ 
+ #include "mkb_input.h"
++#include "keyboard.h"
+ 
+ #include <windows.h>
+ #include <stdio.h>
+@@ -135,6 +136,7 @@ static void mkb_load_config(void)
+  * with InterlockedAdd, the poll takes everything with Exchange(0). */
+ static volatile LONG s_dx, s_dy;
+ static volatile LONG s_wheel;        /* wheel steps since last poll   */
++static volatile LONG s_wheel_part;   /* part of a step: touchpads and fine wheels send less than one */
+ static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2: held */
+ static volatile LONG s_mouse_tap;    /* pressed since the last poll: a click
+                                         between two polls still counts */
+@@ -189,7 +191,11 @@ static void mkb_handle_raw(HRAWINPUT h)
+             InterlockedAnd(&s_mouse_btn, ~16);
+         if (m->usButtonFlags & RI_MOUSE_WHEEL) {
+             SHORT d = (SHORT)m->usButtonData;
+-            InterlockedAdd(&s_wheel, d / WHEEL_DELTA);
++            LONG t = InterlockedAdd(&s_wheel_part, d);
++            if (t >= WHEEL_DELTA || t <= -WHEEL_DELTA) {
++                InterlockedAdd(&s_wheel_part, -(t / WHEEL_DELTA) * WHEEL_DELTA);
++                InterlockedAdd(&s_wheel, t / WHEEL_DELTA);
++            }
+         }
+     } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
+         const RAWKEYBOARD *k = &ri->data.keyboard;
+@@ -430,6 +436,17 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ 
+     if (!pState || dwPort != 0)
+         return 0;
++    {   /* the wheel's key taps (mouse-only mode) end on time, on every path */
++        static DWORD up_until, down_until;
++        DWORD now = GetTickCount();
++        if (s_mouse_only && mkb_enabled() && s_thread_up && s_active) {
++            LONG w = InterlockedExchange(&s_wheel, 0);
++            if (w > 0) { xbox_InputKeySet(XBOX_VK_MWHEELUP, 1); up_until = now + 70; }
++            if (w < 0) { xbox_InputKeySet(XBOX_VK_MWHEELDOWN, 1); down_until = now + 70; }
++        }
++        if (up_until && (LONG)(now - up_until) >= 0) { xbox_InputKeySet(XBOX_VK_MWHEELUP, 0); up_until = 0; }
++        if (down_until && (LONG)(now - down_until) >= 0) { xbox_InputKeySet(XBOX_VK_MWHEELDOWN, 0); down_until = 0; }
++    }
+     if (!mkb_enabled()) {
+         if (s_thread_up)                 /* turned off: give the pointer back */
+             mkb_manage_cursor(0);
+@@ -465,7 +482,9 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ 
+     memset(analog, 0, sizeof analog);
+ 
+-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
++    /* ---- mouse buttons, as the Xbox pad sees them (in mouse-only mode they
++     *      are keys in the key map instead: mouse1..mouse5, mwheelup/down) ---- */
++    if (s_mouse_only) btn = 0, wheel = 0;
+     if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
+     if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
+     if (btn & 0x04) b |= 0;                              /* M: below  */
+diff --git a/src/kernel/nvnet_nat.c b/src/kernel/nvnet_nat.c
+index b282f4c..e77e686 100644
+--- a/src/kernel/nvnet_nat.c
++++ b/src/kernel/nvnet_nat.c
+@@ -250,14 +250,14 @@ static void ip_out(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *p,
+         UdpMap *m;
+         struct sockaddr_in to;
+         if (dst == NAT_ROUTER_IP) return;
++        if (s_gate && s_gate())                 /* the title's own rule, first: it says why */
++            return;
+         if (!s_identity) {
+             if (!s_log_blocked++)
+                 fprintf(stderr, "  [NAT] no console identity (EEPROM and hard-drive key): internet traffic "
+                                 "blocked, Xbox Live is off. Run Insignia Setup to add yours.\n");
+             return;
+         }
+-        if (s_gate && s_gate())                 /* the title's own rule */
+-            return;
+         if (dp == 53) log_dns(p + 8, n - 8);
+         if (!(m = udp_for(sp))) return;
+         if (dp == 53 && s_ndns && dst != ntohl(s_dns[0]) && n >= 10 && dns_is_xboxlive(p + 8, n - 8)) {
+-- 
+2.51.0.windows.2
+

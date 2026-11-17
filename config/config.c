@@ -42,8 +42,10 @@ static const char *const VIDEO_LABEL[NVIDEO] = {
 static const char *const T_OFFON[2] = { "Off", "On" };
 static const char *const T_STRETCH[2] = { "Off (keep 4:3)", "On (fill the window)" };
 
-enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200, ID_REPORT = 330, ID_OTHER_PADS = 331 };
+enum { ID_TAB = 100, ID_LIST, ID_CHANGE, ID_ALT, ID_CLEAR, ID_RESET, ID_SAVE, ID_CLOSE, ID_STATUS, ID_VIDEO0 = 200, ID_REPORT = 330, ID_OTHER_PADS = 331,
+       ID_MOUSE_AIM = 332, ID_MOUSE_SENS = 333, ID_MOUSE_INV = 334 };
 static HWND s_other_pads;      /* [input] other_controllers: PlayStation and other pads through SDL3 */
+static HWND s_mouse_aim, s_mouse_sens, s_mouse_inv;   /* [input] mouse_aim, mouse_sensitivity, mouse_invert */
 enum { PAGE_VIDEO, PAGE_CONTROLS };
 
 static CsSettings s_set;
@@ -118,7 +120,15 @@ static void video_set(int i, int v)
 static void key_label(int vk, char *out, size_t n)
 {
     const char *name = vk ? xbox_InputMap_KeyName(vk) : NULL;
+    static const struct { int vk; const char *label; } mouse[] = {
+        { 0x01, "Left click" }, { 0x02, "Right click" }, { 0x04, "Middle click" },
+        { 0x05, "Mouse button 4" }, { 0x06, "Mouse button 5" },
+        { 0x0E, "Wheel up" }, { 0x0F, "Wheel down" },
+    };
+    size_t m;
     if (!vk) { snprintf(out, n, "(none)"); return; }
+    for (m = 0; m < sizeof mouse / sizeof mouse[0]; m++)
+        if (mouse[m].vk == vk) { snprintf(out, n, "%s", mouse[m].label); return; }
     if (name) {
         size_t i;
         snprintf(out, n, "%s", name);
@@ -206,16 +216,18 @@ static void begin_wait(int slot)
     int row = ListView_GetNextItem(s_list, -1, LVNI_SELECTED);
     if (row < 0) { status("Select a control in the list first."); return; }
     s_wait_row = row; s_wait_slot = slot;
-    snprintf(m, sizeof m, "Press the new %s for \"%s\" (Esc cancels).", slot ? "alternate key" : "key", CONTROL_LABEL[row]);
+    snprintf(m, sizeof m, "Press the new %s for \"%s\", or click or turn the wheel for a mouse button "
+             "(Esc cancels).", slot ? "alternate key" : "key", CONTROL_LABEL[row]);
     status(m);
     SetFocus(s_main);
+    SetCapture(s_main);                          /* a click anywhere is the answer, not a click on a control */
 }
 
 static void assign(int vk)
 {
     char m[220], n[64];
     int i, s, moved = 0;
-    if (vk == VK_ESCAPE) { s_wait_row = -1; status("Cancelled."); return; }
+    if (vk == VK_ESCAPE) { s_wait_row = -1; ReleaseCapture(); status("Cancelled."); return; }
     if (vk == VK_F1 || vk == VK_F11 || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN) {
         status("That key belongs to the game itself (F1 settings, F11 or Alt+Enter fullscreen, Esc quit). Press another key.");
         return;
@@ -239,6 +251,7 @@ static void assign(int vk)
         status(m);
     }
     s_wait_row = -1;
+    ReleaseCapture();
     s_dirty = 1;
 }
 
@@ -352,6 +365,17 @@ static void make_ui(HWND h)
         SendMessageA(s_other_pads, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
     }
     s_cpage[s_nc++] = s_other_pads;
+    s_mouse_aim = mk("BUTTON", "Mouse aim (not on Xbox Live)", WS_TABSTOP | BS_AUTOCHECKBOX, 20, 490, 200, 22, ID_MOUSE_AIM, f);
+    SendMessageA(s_mouse_aim, BM_SETCHECK, s_set.mouse_aim ? BST_CHECKED : BST_UNCHECKED, 0);
+    s_cpage[s_nc++] = s_mouse_aim;
+    s_cpage[s_nc++] = mk("STATIC", "Sensitivity", SS_LEFT, 236, 493, 66, 20, 0, f);
+    s_mouse_sens = mk("COMBOBOX", "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 304, 489, 76, 200, ID_MOUSE_SENS, f);
+    for (i = 0; i < CS_SET_SENSES; i++) SendMessageA(s_mouse_sens, CB_ADDSTRING, 0, (LPARAM)CS_SET_SENS_TEXT[i]);
+    SendMessageA(s_mouse_sens, CB_SETCURSEL, (WPARAM)cs_settings_index(CS_SET_SENS_PCT, CS_SET_SENSES, s_set.mouse_sens), 0);
+    s_cpage[s_nc++] = s_mouse_sens;
+    s_mouse_inv = mk("BUTTON", "Invert mouse", WS_TABSTOP | BS_AUTOCHECKBOX, 396, 490, 110, 22, ID_MOUSE_INV, f);
+    SendMessageA(s_mouse_inv, BM_SETCHECK, s_set.mouse_invert ? BST_CHECKED : BST_UNCHECKED, 0);
+    s_cpage[s_nc++] = s_mouse_inv;
 
     s_status = mk("STATIC", "", SS_LEFT | WS_VISIBLE, 10, 520, 580, 20, ID_STATUS, f);
     mk("BUTTON", "Reset to defaults", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 10, 548, 130, 28, ID_RESET, f);
@@ -392,6 +416,25 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             status("Cleared. That control has no key until you give it one.");
             return 0;
         }
+        case ID_MOUSE_AIM:
+            s_set.mouse_aim = SendMessageA(s_mouse_aim, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            s_dirty = 1;
+            status(s_set.mouse_aim
+                   ? "Mouse aim on: the mouse aims and its buttons fire. Xbox Live will not sign in while it is on "
+                     "(it is controller only there); single player and System Link keep it. Click Save to keep it."
+                   : "Mouse aim off. Click Save to keep it.");
+            return 0;
+        case ID_MOUSE_SENS:
+            if (HIWORD(w) == CBN_SELCHANGE) {
+                int v = (int)SendMessageA(s_mouse_sens, CB_GETCURSEL, 0, 0);
+                if (v >= 0 && v < CS_SET_SENSES) s_set.mouse_sens = CS_SET_SENS_PCT[v];
+                s_dirty = 1;
+            }
+            return 0;
+        case ID_MOUSE_INV:
+            s_set.mouse_invert = SendMessageA(s_mouse_inv, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            s_dirty = 1;
+            return 0;
         case ID_OTHER_PADS:
             s_dirty = 1;
             status("PlayStation, Switch Pro and other controllers work beside Xbox ones. Turn this off if Steam Input "
@@ -433,6 +476,22 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_KEYUP: case WM_SYSKEYUP:
         if (s_wait_row >= 0) return 0;
+        break;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
+        if (s_wait_row >= 0) {                   /* a mouse button as the key (keymap.ini mouse1..mouse5) */
+            assign(m == WM_LBUTTONDOWN ? 0x01 : m == WM_RBUTTONDOWN ? 0x02 : m == WM_MBUTTONDOWN ? 0x04
+                   : HIWORD(w) == XBUTTON1 ? 0x05 : 0x06);
+            return m == WM_XBUTTONDOWN ? TRUE : 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (s_wait_row >= 0) {                   /* mwheelup / mwheeldown */
+            assign(GET_WHEEL_DELTA_WPARAM(w) > 0 ? 0x0E : 0x0F);
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (s_wait_row >= 0 && (HWND)l != h) { s_wait_row = -1; status("Cancelled."); }
         break;
     case WM_CLOSE:
         if (s_dirty) {

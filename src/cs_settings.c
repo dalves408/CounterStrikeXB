@@ -10,6 +10,8 @@ const int CS_SET_RATE_HZ[CS_SET_RATES] = { 30, 60, 72 };
 const int CS_SET_MSAA_N[CS_SET_MSAAS] = { 1, 2, 4, 8 };
 const int CS_SET_ANISO_N[CS_SET_ANISOS] = { 1, 2, 4, 8, 16 };
 const int CS_SET_SCALE_X2[CS_SET_SCALES] = { 2, 4, 6, 8, 9, 10 };
+const int CS_SET_SENS_PCT[CS_SET_SENSES] = { 50, 75, 100, 150, 200, 300 };
+const char *const CS_SET_SENS_TEXT[CS_SET_SENSES] = { "0.5x", "0.75x", "1x", "1.5x", "2x", "3x" };
 const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES] = {
     "1x  (480p)", "2x  (1080p)", "3x  (1440p)", "4x  (4K, lighter)", "4.5x  (4K)", "5x  (4K, sharpest)" };
 const char *const CS_SET_RATE_TEXT[CS_SET_RATES] = {
@@ -29,6 +31,9 @@ void cs_settings_defaults(CsSettings *s)
     s->msaa = 1;
     s->aniso = 1;
     s->hires = 1;
+    s->mouse_aim = 0;
+    s->mouse_sens = 100;
+    s->mouse_invert = 0;
 }
 
 int cs_settings_path(const char *name, char *out, unsigned n, int make_dir)
@@ -82,6 +87,10 @@ void cs_settings_load(CsSettings *s)
     s->msaa = CS_SET_MSAA_N[cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, get(path, "msaa", s->msaa))];
     s->aniso = CS_SET_ANISO_N[cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, get(path, "anisotropy", s->aniso))];
     s->hires = get(path, "hires_textures", s->hires) != 0;
+    s->mouse_aim = GetPrivateProfileIntA("input", "mouse_aim", s->mouse_aim, path) != 0;
+    s->mouse_sens = CS_SET_SENS_PCT[cs_settings_index(CS_SET_SENS_PCT, CS_SET_SENSES,
+                                    (int)GetPrivateProfileIntA("input", "mouse_sensitivity", s->mouse_sens, path))];
+    s->mouse_invert = GetPrivateProfileIntA("input", "mouse_invert", s->mouse_invert, path) != 0;
 }
 
 static int put(const char *path, const char *key, int v)
@@ -138,6 +147,13 @@ int cs_settings_save(const CsSettings *s)
     ok &= put(path, "msaa", s->msaa);
     ok &= put(path, "anisotropy", s->aniso);
     ok &= put(path, "hires_textures", s->hires);
+    {
+        char v[16];
+        ok &= WritePrivateProfileStringA("input", "mouse_aim", s->mouse_aim ? "1" : "0", path) != 0;
+        snprintf(v, sizeof v, "%d", s->mouse_sens);
+        ok &= WritePrivateProfileStringA("input", "mouse_sensitivity", v, path) != 0;
+        ok &= WritePrivateProfileStringA("input", "mouse_invert", s->mouse_invert ? "1" : "0", path) != 0;
+    }
     cs_settings_mark_seen();
     return ok;
 }

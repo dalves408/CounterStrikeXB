@@ -46,6 +46,7 @@
 #include "cs_launch.h"
 #include "cs_settings.h"
 #include "cs_overlay.h"
+#include "cs_mouse.h"
 #include "cs_diag.h"
 #include "cs_frame.h"
 #include "tu_apply.h"
@@ -560,6 +561,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* CS2: XLaunchNewImage back into this XBE (src/cs_launch.c): restore the
      * launch data page the previous instance handed over, if any. */
     cs_launch_restore();
+    cs_mouse_init();          /* mouse aim, off in an Xbox Live match (src/cs_mouse.c) */
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

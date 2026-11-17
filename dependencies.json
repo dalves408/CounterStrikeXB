@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "e9ba7582709b1c7086e418f45e2600e2a7736299",
+                       "commit":  "39a5899af862c14bdcf3485be2dc19945a0c733c",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -45,7 +45,9 @@
                                              "patches/xboxrecomp/0038-nvnet-no-internet-without-the-player-s-console-ident.patch",
                                              "patches/xboxrecomp/0039-input-PlayStation-and-other-non-Xbox-controllers-thr.patch",
                                              "patches/xboxrecomp/0040-nv2a-pass-texture-stages-bump-matrix-and-cube-flag-t.patch",
-                                             "patches/xboxrecomp/0041-nvnet-kernel-system-link-with-xemu-and-real-Xboxes.patch"
+                                             "patches/xboxrecomp/0041-nvnet-kernel-system-link-with-xemu-and-real-Xboxes.patch",
+                                             "patches/xboxrecomp/0042-input-nvnet-mouse-layer-for-a-title-s-own-settings-t.patch",
+                                             "patches/xboxrecomp/0043-input-nvnet-mouse-buttons-and-wheel-as-keys-title-ga.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

@@ -17,6 +17,12 @@
  *   msaa              1, 2, 4, 8 samples
  *   anisotropy        1, 2, 4, 8, 16
  *   hires_textures    0/1       use the BC7 texture pack when one is installed (default 1)
+ * [input]:
+ *   mouse_aim         0/1       the mouse aims (the right stick) and its buttons press the
+ *                               triggers (default 0). Xbox Live refuses to sign in while it is
+ *                               on, and an Xbox Live match never reads the mouse.
+ *   mouse_sensitivity 50..300   percent (default 100)
+ *   mouse_invert      0/1       invert vertical mouse aim
  * %LOCALAPPDATA%\CounterStrikeXB\keymap.ini, [keys]: the keyboard, one line
  * per Xbox control in the toolkit's names (src/input/input_map.h), read by the
  * toolkit at start through RECOMP_KEYMAP.
@@ -35,6 +41,9 @@ typedef struct {
     int msaa;         /* 1, 2, 4, 8 */
     int aniso;        /* 1, 2, 4, 8, 16 */
     int hires;        /* 0/1: hi-res texture pack */
+    int mouse_aim;    /* 0/1 ([input]) */
+    int mouse_sens;   /* percent: 50, 75, 100, 150, 200, 300 */
+    int mouse_invert; /* 0/1 */
 } CsSettings;
 
 /* The choices each option offers, in menu order, and their names. */
@@ -42,10 +51,13 @@ typedef struct {
 #define CS_SET_RATES 3
 #define CS_SET_MSAAS 4
 #define CS_SET_ANISOS 5
+#define CS_SET_SENSES 6
 extern const int CS_SET_RATE_HZ[CS_SET_RATES];        /* 30, 60, 72 */
 extern const int CS_SET_MSAA_N[CS_SET_MSAAS];         /* 1, 2, 4, 8 */
 extern const int CS_SET_ANISO_N[CS_SET_ANISOS];       /* 1, 2, 4, 8, 16 */
 extern const int CS_SET_SCALE_X2[CS_SET_SCALES];      /* 2, 4, 6, 8, 9, 10 */
+extern const int CS_SET_SENS_PCT[CS_SET_SENSES];      /* 50, 75, 100, 150, 200, 300 */
+extern const char *const CS_SET_SENS_TEXT[CS_SET_SENSES];
 extern const char *const CS_SET_SCALE_TEXT[CS_SET_SCALES];
 extern const char *const CS_SET_RATE_TEXT[CS_SET_RATES];
 extern const char *const CS_SET_MSAA_TEXT[CS_SET_MSAAS];

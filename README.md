@@ -72,6 +72,17 @@ of `config.exe` (`[input] other_controllers=0` in `settings.ini`). The mouse poi
 
 `config.exe` (in the game folder) remaps every control, with an alternate key for each.
 
+**Mouse aim** (off by default; F1 or `config.exe`'s Controls tab): the mouse turns the view directly, as in the PC
+game, at Half-Life's default speed times the sensitivity you pick (0.5x to 3x), optionally inverted. In a match the
+mouse buttons and wheel are keys in the key map, set like any other in `config.exe` (click or turn the wheel when it
+asks for a key): by default left click fires (right trigger), right click is the left trigger, wheel up is Y and the
+side buttons are White and Black. In the intros and menus, left click is START and right click is B. While mouse aim
+is on the pointer stays hidden in the middle of the picture; F9 frees it.
+
+**Xbox Live stays controller only**, because it is shared with players on Xboxes and xemu: while mouse aim is on the
+game will not sign in to Xbox Live (the F1 menu says why; turn mouse aim off and sign in again), and a match started
+from Xbox Live never reads the mouse. Single player, training and System Link, including over a VPN, keep it.
+
 | Key | |
 | --- | --- |
 | F1, or hold BACK and press START on the pad | Settings menu |

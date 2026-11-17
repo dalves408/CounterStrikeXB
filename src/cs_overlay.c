@@ -30,6 +30,7 @@
 #include "cs_settings.h"
 #include "cs_d3d11.h"
 #include "cs_diag.h"
+#include "cs_mouse.h"
 #include "video/video_player.h"
 
 extern void xbox_InputKeysClear(void);      /* toolkit input/keyboard.c */
@@ -50,10 +51,13 @@ typedef struct CsPadState {
 extern void xbox_InputSetPort0Filter(void (*filter)(CsPadState *));
 
 enum { MODE_QUIT, MODE_SETTINGS };
-enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_HIRES, IT_CLOSE, IT_QUIT, IT_COUNT };
+enum { IT_SCALE, IT_FULLSCREEN, IT_STRETCH, IT_VSYNC, IT_RATE, IT_MSAA, IT_ANISO, IT_HIRES,
+       IT_MOUSE, IT_MSENS, IT_MINV, IT_CLOSE, IT_QUIT, IT_COUNT };
 static const char *const ITEM_LABEL[IT_COUNT] = {
     "Render scale", "Fullscreen", "Stretch image", "VSync", "Frame rate cap",
-    "Anti-aliasing", "Anisotropic filtering", "Hi-res textures", "Back to the game", "Quit Counter-Strike" };
+    "Anti-aliasing", "Anisotropic filtering", "Hi-res textures",
+    "Mouse aim", "Mouse sensitivity", "Invert mouse", "Back to the game", "Quit Counter-Strike" };
+static const char *const MOUSE_AIM[2] = { "Off", "On (not on Xbox Live)" };
 static const char *const OFFON[2] = { "Off", "On" };
 static const char *const STRETCH[2] = { "Off (4:3)", "On (fill the window)" };
 
@@ -65,6 +69,7 @@ static RECT s_row[IT_COUNT], s_btn[2];
 static WORD s_pad_prev;
 static DWORD s_pad_repeat;
 static int s_pad_seen, s_pad_release;
+static volatile LONG s_live_note;          /* Xbox Live refused for mouse aim: say why (cs_mouse.c) */
 
 int cs_overlay_active(void) { return s_active != 0; }
 
@@ -76,7 +81,8 @@ static int item_count(int i)
     case IT_RATE:  return cs_settings_rate_choices(cs_d3d11_rate_max());   /* 72 only where it is smooth */
     case IT_MSAA:  return CS_SET_MSAAS;
     case IT_ANISO: return CS_SET_ANISOS;
-    case IT_FULLSCREEN: case IT_STRETCH: case IT_VSYNC: case IT_HIRES: return 2;
+    case IT_MSENS: return CS_SET_SENSES;
+    case IT_FULLSCREEN: case IT_STRETCH: case IT_VSYNC: case IT_HIRES: case IT_MOUSE: case IT_MINV: return 2;
     }
     return 0;
 }
@@ -94,6 +100,9 @@ static int item_get(int i)
     case IT_MSAA: return cs_settings_index(CS_SET_MSAA_N, CS_SET_MSAAS, s->msaa);
     case IT_ANISO: return cs_settings_index(CS_SET_ANISO_N, CS_SET_ANISOS, s->aniso);
     case IT_HIRES: return s->hires;
+    case IT_MOUSE: return s->mouse_aim;
+    case IT_MSENS: return cs_settings_index(CS_SET_SENS_PCT, CS_SET_SENSES, s->mouse_sens);
+    case IT_MINV: return s->mouse_invert;
     }
     return 0;
 }
@@ -107,7 +116,9 @@ static const char *item_text(int i)
     case IT_MSAA: return CS_SET_MSAA_TEXT[v];
     case IT_ANISO: return CS_SET_ANISO_TEXT[v];
     case IT_STRETCH: return STRETCH[v];
-    case IT_FULLSCREEN: case IT_VSYNC: case IT_HIRES: return OFFON[v];
+    case IT_MOUSE: return MOUSE_AIM[v];
+    case IT_MSENS: return CS_SET_SENS_TEXT[v];
+    case IT_FULLSCREEN: case IT_VSYNC: case IT_HIRES: case IT_MINV: return OFFON[v];
     }
     return "";
 }
@@ -127,6 +138,9 @@ static void item_set(int i, int v)
     case IT_MSAA: s->msaa = CS_SET_MSAA_N[v]; cs_d3d11_settings_changed(); break;
     case IT_ANISO: s->aniso = CS_SET_ANISO_N[v]; cs_d3d11_settings_changed(); break;
     case IT_HIRES: s->hires = v; cs_d3d11_settings_changed(); break;
+    case IT_MOUSE: s->mouse_aim = v; cs_mouse_apply(); if (!v) InterlockedExchange(&s_live_note, 0); break;
+    case IT_MSENS: s->mouse_sens = CS_SET_SENS_PCT[v]; cs_mouse_apply(); break;
+    case IT_MINV: s->mouse_invert = v; cs_mouse_apply(); break;
     }
     cs_settings_save(s);
     cs_diag_log_video("settings changed");      /* the log says what a report's picture was drawn with */
@@ -149,6 +163,7 @@ void cs_settings_watch(void)
         xbox_FramebufferToggleFullscreen();
     g_cs_settings = n;
     cs_d3d11_settings_changed();
+    cs_mouse_apply();
     cs_diag_log_video("settings.ini changed");
 }
 
@@ -248,9 +263,15 @@ static void draw(void)
         SetTextColor(dc, C_DIM);
         SetRect(&r, panel.left + rh / 3, panel.top + rh * 13 / 10 + IT_COUNT * rh + rh / 8,
                 panel.right - rh / 3, panel.bottom - rh / 8);
-        DrawTextA(dc, "Up/Down choose, Left/Right change, Enter confirms. Saved as you go. "
-                      "F1, Esc or B closes. The game keeps running underneath.",
-                  -1, &r, DT_LEFT | DT_WORDBREAK);
+        if (s_live_note) {
+            SetTextColor(dc, C_FRAME);
+            DrawTextA(dc, "Xbox Live is controller only: it is shared with players on Xbox and xemu. "
+                          "Turn Mouse aim off, then sign in again. Single player and System Link keep the mouse.",
+                      -1, &r, DT_LEFT | DT_WORDBREAK);
+        } else
+            DrawTextA(dc, "Up/Down choose, Left/Right change, Enter confirms. Saved as you go. "
+                          "F1, Esc or B closes. The game keeps running underneath.",
+                      -1, &r, DT_LEFT | DT_WORDBREAK);
     } else {
         int bw = pw * 3 / 10, bh = rh * 9 / 10, by = panel.top + rh * 2;
         SetRect(&r, panel.left, panel.top + rh / 3, panel.right, panel.top + rh * 3 / 2);
@@ -344,6 +365,7 @@ static void menu_open(HWND game, int mode)
 static void menu_close(void)
 {
     if (!s_active) return;
+    InterlockedExchange(&s_live_note, 0);        /* a refused sign-in says so again next time */
     ShowWindow(s_ov, SW_HIDE);                   /* the timer runs on until the pad is given back */
     xbox_InputKeysClear();
     InterlockedExchange(&s_active, 0);
@@ -404,8 +426,10 @@ static int key_filter(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
     int repeat = (l & (1L << 30)) != 0;
     if (w == VK_F1) {
         if (down && !repeat) {
-            if (!s_active) menu_open((HWND)hwnd, MODE_SETTINGS);
-            else if (s_mode == MODE_SETTINGS) menu_close();
+            if (!s_active) {
+                menu_open((HWND)hwnd, MODE_SETTINGS);
+                if (s_live_note) { s_sel = IT_MOUSE; draw(); }
+            } else if (s_mode == MODE_SETTINGS) menu_close();
             else { s_mode = MODE_SETTINGS; s_sel = 0; draw(); }
         }
         return 1;
@@ -458,6 +482,14 @@ static void pad_tick(void)
 static void pad_filter(CsPadState *s)
 {
     static int chord, start_was;
+    if (!s_active) {
+        /* Mouse aim on, outside play (menus, intros): left click is START (it
+         * passes the title screen and the prompts), right click B, instead of
+         * the triggers they are in a match. */
+        int c = cs_mouse_menu_clicks();
+        if (c & 1) { s->wButtons |= PAD_START; s->bAnalogButtons[7] = 0; s->dwPacketNumber++; }
+        if (c & 2) { s->bAnalogButtons[1] = 255; s->bAnalogButtons[6] = 0; s->dwPacketNumber++; }
+    }
     WORD b = s->wButtons;
     int start = (b & PAD_START) != 0, back = (b & PAD_BACK) != 0;
     if (chord) {
@@ -473,6 +505,19 @@ static void pad_filter(CsPadState *s)
         }
     }
     start_was = start;
+}
+
+/* Xbox Live was refused because mouse aim is on (cs_mouse.c, on the NIC's
+ * thread): open the settings menu on Mouse aim with the reason, through the F1
+ * key's own path on the window thread, as BACK+START does. */
+void cs_overlay_live_refused(void)
+{
+    HWND h = (HWND)xbox_FramebufferWindowHwnd();
+    InterlockedExchange(&s_live_note, 1);
+    if (h && !s_active) {
+        PostMessageA(h, WM_KEYDOWN, VK_F1, 1);
+        PostMessageA(h, WM_KEYUP, VK_F1, (LPARAM)(1u | 3u << 30));
+    }
 }
 
 void cs_overlay_init(void)
