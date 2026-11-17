@@ -1,5 +1,7 @@
 # CounterStrikeXB
 
+[![Get it on RecompLauncher](https://recomplauncher.com/assets/press/launcher/badge-dark.svg)](https://recomplauncher.com/game/counterstrikexb)
+
 A static recompilation of the original Xbox **Counter-Strike** (2003) into a native Windows x64 program, built on the
 [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit. The game's own code is translated to C and runs
 natively, with the Xbox's kernel, GPU, audio, USB and network hardware modelled around it, and a Direct3D 11
