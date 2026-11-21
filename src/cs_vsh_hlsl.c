@@ -91,7 +91,7 @@ static uint32_t reads_of(uint32_t mac, uint32_t ilu)
 static const char k_head[] =
 "cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint opaque; uint dbg; uint3 pad; };\n"
 "cbuffer V : register(b2) { float4 c[192]; };\n"
-"cbuffer P : register(b3) { uint in_base; uint in_n; float2 aa; uint fog_en; uint fog_mode; float2 fog_p; };\n"
+"cbuffer P : register(b3) { uint in_base; uint in_n; float2 aa; uint fog_en; uint fog_mode; float2 fog_p; float2 wx; float2 wpad; };\n"
 "Buffer<float4> vin : register(t0);\n"
 "struct VO { float4 pos : SV_Position; float4 c : COLOR0; float4 d1 : TEXCOORD1;\n"
 "            float4 t0 : TEXCOORD2; float4 t1 : TEXCOORD3; float4 t2 : TEXCOORD4; float4 t3 : TEXCOORD5; float fog : TEXCOORD6; };\n"
@@ -120,7 +120,7 @@ static const char k_head[] =
 
 static const char k_tail[] =
 "  VO o; float4 P = R[12]; float w = P.w; if (asuint(w) == 0u) w = 1.0;\n"
-"  float nx = P.x * aa.x / surf.x * 2.0 - 1.0, ny = 1.0 - P.y * aa.y / surf.y * 2.0;\n"
+"  float nx = (P.x * wx.x + wx.y) * aa.x / surf.x * 2.0 - 1.0, ny = 1.0 - P.y * aa.y / surf.y * 2.0;\n"
 "  float nz = min(P.z / 16777215.0, 1.0);\n"
 "  o.pos = float4(nx * w, ny * w, nz * w, w);\n"
 "  o.c = saturate(O[3]); o.d1 = saturate(O[4]); o.t0 = O[9]; o.t1 = O[10]; o.t2 = O[11]; o.t3 = O[12];\n"

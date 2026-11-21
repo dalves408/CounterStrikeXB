@@ -1,0 +1,77 @@
+From fc20a89f8e1f24f66fc7718381e06a522d578499 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input: reload the key map while the title runs
+
+xbox_InputKeyboardReload reads RECOMP_KEYMAP again, so a title's own
+settings menu can rebind a key and have it take effect at once. The map
+is read into a copy and published whole, so a poll never sees one half
+read.
+---
+ src/input/keyboard.c | 19 +++++++++++++++----
+ src/input/keyboard.h |  2 ++
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index b5bd05d..9ad647d 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -194,11 +194,14 @@ static void keymap_load(void)
+     FILE *f;
+     char line[512];
+     int in_keys = 0, lines = 0, bad = 0;
++    InputBindings b;
+ 
+-    s_keymap_state = 1;
+-    default_bindings(&s_keymap);
+-    if (!path || !*path || !(f = fopen(path, "r")))
++    default_bindings(&b);
++    if (!path || !*path || !(f = fopen(path, "r"))) {
++        s_keymap = b;
++        s_keymap_state = 1;
+         return;
++    }
+     while (fgets(line, sizeof line, f)) {
+         char *p = line, *eq, *e;
+         int c;
+@@ -218,15 +221,23 @@ static void keymap_load(void)
+         c = xbox_InputMap_ControlFromName(p);
+         if (c < 0) { bad++; continue; }
+         for (p = eq + 1; *p == ' ' || *p == '\t'; p++) ;
+-        bad += xbox_InputMap_BindingsParse(&s_keymap, c, p) > 0;
++        bad += xbox_InputMap_BindingsParse(&b, c, p) > 0;
+         lines++;
+     }
+     fclose(f);
++    s_keymap = b;           /* whole, so a reload never shows a half-read map */
+     s_keymap_state = 2;
+     fprintf(stderr, "  [KEYS] key map %s: %d control(s) set%s\n", path, lines,
+             bad ? ", some names not understood (kept the rest)" : "");
+ }
+ 
++/* The key map file changed (a title's own menu rebound a key): read it again
++ * now, so the next poll uses it. */
++void xbox_InputKeyboardReload(void)
++{
++    keymap_load();
++}
++
+ void xbox_InputKeyboardBindings(InputBindings *b)
+ {
+     if (!s_keymap_state)
+diff --git a/src/input/keyboard.h b/src/input/keyboard.h
+index ac1d812..897b0ca 100644
+--- a/src/input/keyboard.h
++++ b/src/input/keyboard.h
+@@ -123,6 +123,8 @@ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out);
+  * resolves, and what xbox_InputMap_BindingsFormat writes as text. */
+ struct InputBindings;
+ void xbox_InputKeyboardBindings(struct InputBindings *b);
++/* Read RECOMP_KEYMAP again, after a title's own menu wrote it. */
++void xbox_InputKeyboardReload(void);
+ /* The face button (0 A, 1 B, 2 X, 3 Y) a key is bound to in the key map, or -1. */
+ int xbox_InputKeyFaceButton(int vk);
+ /* 0 when RECOMP_KEYBOARD is off, else 1 with *out filled by
+-- 
+2.56.1.windows.1
+

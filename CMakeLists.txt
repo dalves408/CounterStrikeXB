@@ -66,10 +66,13 @@ set(GAME_SOURCES
     src/cs_launch.c
     src/cs_settings.c
     src/cs_overlay.c
+    src/cs_ui.c
+    src/cs_keys.c
     src/cs_diag.c
     src/cs_frame.c
     src/cs_content.c
     src/cs_mouse.c
+    src/cs_wide.c
     installer/tu_apply.c
     resources/cs.rc
 )
@@ -151,6 +154,8 @@ add_executable(config WIN32
     config/config.c
     resources/config.rc
     src/cs_settings.c
+    src/cs_keys.c
+    src/cs_ui.c
     ${XBOXRECOMP_DIR}/src/input/input_map.c
     ${XBOXRECOMP_DIR}/src/input/keyboard.c
 )
@@ -169,9 +174,10 @@ add_executable(insignia_setup WIN32
     insignia/insignia_setup.c
     resources/insignia.rc
     src/cs_settings.c
+    src/cs_ui.c
 )
 target_include_directories(insignia_setup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(insignia_setup PRIVATE comctl32 comdlg32 shell32 user32 advapi32)
+target_link_libraries(insignia_setup PRIVATE comctl32 comdlg32 shell32 user32 advapi32 gdi32)
 
 add_executable(cs_import installer/cs_import.c installer/tu_apply.c)
 target_include_directories(cs_import PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/installer)

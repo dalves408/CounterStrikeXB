@@ -93,6 +93,19 @@ static void putf(uint32_t va, float f) { uint32_t u; memcpy(&u, &f, 4); MEM32(va
  * and the look update ran lately (every frame of play, the buy menu included). */
 static volatile LONG s_play_tick;
 
+/* Xbox Live stays closed while mouse aim or widescreen (cs_wide.c) is on: it is
+ * shared with Xbox and xemu players, on a controller and 4:3. */
+static int live_closed(void)
+{
+    return (g_cs_settings.mouse_aim || g_cs_settings.widescreen) && !cs_launch_xbox_live_match();
+}
+
+static const char *live_why(void)
+{
+    return g_cs_settings.mouse_aim ? (g_cs_settings.widescreen ? "mouse aim and widescreen are" : "mouse aim is")
+                                   : "widescreen is";
+}
+
 int cs_mouse_ui_command(uint32_t text_va)
 {
     /* the main menu's Xbox Live item runs "!enterLive"; the Live pages open as
@@ -103,11 +116,11 @@ int cs_mouse_ui_command(uint32_t text_va)
     if (!text_va) return 0;
     for (i = 0; i < sizeof t - 1 && MEM8(text_va + i); i++) t[i] = (char)MEM8(text_va + i);
     t[i] = 0;
-    if (!g_cs_settings.mouse_aim || cs_launch_xbox_live_match())
+    if (!live_closed())
         return 0;
     if (strncmp(t, enter, sizeof enter - 1) != 0 && strncmp(t, live, sizeof live - 1) != 0)
         return 0;
-    fprintf(stderr, "[CS-MOUSE] mouse aim is on: the Xbox Live menu stays closed\n");
+    fprintf(stderr, "[CS-MOUSE] %s on: the Xbox Live menu stays closed\n", live_why());
     cs_overlay_live_refused();
     return 1;
 }
@@ -169,12 +182,12 @@ static int live_gate(void)
 {
     static volatile LONG last;
     DWORD now;
-    if (!g_cs_settings.mouse_aim || cs_launch_xbox_live_match())
+    if (!live_closed())
         return 0;
     now = GetTickCount();
     if (now - (DWORD)last > 8000) {          /* logged once per attempt, not per packet */
         InterlockedExchange(&last, (LONG)now);
-        fprintf(stderr, "[CS-MOUSE] mouse aim is on: Xbox Live traffic refused (controller only)\n");
+        fprintf(stderr, "[CS-MOUSE] %s on: Xbox Live traffic refused\n", live_why());
     }
     return 1;              /* quietly: the notice is for choosing Xbox Live (!enterLive), not
                             * for the game's own silent sign-in at start-up */

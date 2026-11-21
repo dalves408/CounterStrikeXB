@@ -13,6 +13,7 @@ build_release. Output: CounterStrike-HiRes-Textures-<version>-Setup.exe and its 
 import argparse
 from hashlib import file_digest
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,8 +21,12 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPILERS = [Path('C:/Users/dynam/AppData/Local/Programs/Inno Setup 6/ISCC.exe'),
-             Path('C:/Program Files (x86)/Inno Setup 6/ISCC.exe')]
+# Inno Setup 6: ISCC_EXE if set, else this user's own install (the default for a non-admin install), else a
+# machine-wide one -- not one PC's user folder.
+COMPILERS = [Path(p) for p in (os.environ.get('ISCC_EXE', ''),
+                               os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'Inno Setup 6', 'ISCC.exe'),
+                               'C:/Program Files (x86)/Inno Setup 6/ISCC.exe',
+                               'C:/Program Files/Inno Setup 6/ISCC.exe') if p]
 HELPER = ROOT / 'build_release/RelWithDebInfo/cs_texture_download.exe'
 
 

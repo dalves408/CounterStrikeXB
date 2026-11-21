@@ -8,6 +8,10 @@
  *                               1080p, 1440p, then 4K (4.5x is exactly its 2160 lines).
  *   fullscreen        0/1       borderless fullscreen at start (F11 / Alt+Enter toggle)
  *   stretch           0/1       fill the window instead of keeping 4:3
+ *   widescreen        0/1       on: the picture takes the shape of the screen the game is on
+ *                               (16:9, 16:10, up to 21:9), showing more of the world at the
+ *                               sides with the HUD kept at its shape (cs_wide.c). Xbox Live
+ *                               stays 4:3: its menu stays closed while it is on. (Older 2 = on.)
  *   vsync             0/1
  *   frame_rate        30, 60 (default), 72. The game's own limit (its fps_max)
  *                               is 72, and 72 is only offered on a monitor it
@@ -23,6 +27,10 @@
  *                               on, and an Xbox Live match never reads the mouse.
  *   mouse_sensitivity 50..300   percent (default 100)
  *   mouse_invert      0/1       invert vertical mouse aim
+ *   other_controllers 0, 1, 2   PlayStation, Switch Pro and other pads through SDL3: 0 Xbox
+ *                               controllers only, 1 auto (default: a pad Steam Input or
+ *                               DS4Windows also shows as an Xbox one is seen once, as that one),
+ *                               2 every pad. Read at start: a change applies the next start.
  * %LOCALAPPDATA%\CounterStrikeXB\keymap.ini, [keys]: the keyboard, one line
  * per Xbox control in the toolkit's names (src/input/input_map.h), read by the
  * toolkit at start through RECOMP_KEYMAP.
@@ -36,6 +44,7 @@ typedef struct {
     int scale_x2;     /* twice the render scale: 2, 4, 6, 8, 9, 10 (4.5x is 9) */
     int fullscreen;   /* 0/1 */
     int stretch;      /* 0/1 */
+    int widescreen;   /* 0/1: off (4:3), or the screen's own shape */
     int vsync;        /* 0/1 */
     int frame_rate;   /* Hz: 30, 60, 72 */
     int msaa;         /* 1, 2, 4, 8 */
@@ -44,6 +53,7 @@ typedef struct {
     int mouse_aim;    /* 0/1 ([input]) */
     int mouse_sens;   /* percent: 50, 75, 100, 150, 200, 300 */
     int mouse_invert; /* 0/1 */
+    int other_pads;   /* 0 Xbox only, 1 auto, 2 all ([input] other_controllers) */
 } CsSettings;
 
 /* The choices each option offers, in menu order, and their names. */
@@ -84,6 +94,12 @@ int cs_settings_index(const int *list, int n, int v);
  * more (120 Hz included), or when its refresh rate is a multiple of 72
  * (144 Hz); else 60. *hz and *vrr, when given, say why. */
 int cs_settings_rate_max(void *monitor, int *hz, int *vrr);
+/* Widescreen: the picture's aspect (width / height) for the monitor that
+ * window (an HWND; NULL: the main monitor) is on -- its resolution's shape,
+ * 21:9 at most -- or 0 when widescreen is off or the screen is 4:3 or narrower. */
+float cs_settings_wide_aspect(const CsSettings *s, void *window);
+/* "16:9", "16:10", "21:9"... for an aspect (or "1.85:1"); 0 gives "4:3". */
+const char *cs_settings_aspect_name(float aspect);
 /* How many of CS_SET_RATE_HZ a monitor with that top offers, and a setting
  * held to it. */
 int cs_settings_rate_choices(int rate_max);

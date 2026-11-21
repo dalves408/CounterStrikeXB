@@ -47,6 +47,8 @@
 #include "cs_settings.h"
 #include "cs_overlay.h"
 #include "cs_mouse.h"
+#include "cs_wide.h"
+#include "cs_keys.h"
 #include "cs_diag.h"
 #include "cs_frame.h"
 #include "tu_apply.h"
@@ -447,6 +449,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("=== Counter-Strike (Xbox) - Static Recompilation ===\n");
     /* The player's settings (settings.ini / keymap.ini: F1 menu, config.exe),
      * before the window and the keyboard read theirs; then the ESC/F1 menus. */
+    cs_keys_startup();        /* keymap.ini with the PC-style defaults, the first time (src/cs_keys.c) */
     cs_settings_startup();
     cs_content_install();     /* Office and Inferno, the downloadable maps (src/cs_content.c) */
     cs_overlay_init();
@@ -562,6 +565,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * launch data page the previous instance handed over, if any. */
     cs_launch_restore();
     cs_mouse_init();          /* mouse aim, off in an Xbox Live match (src/cs_mouse.c) */
+    cs_wide_init();           /* widescreen, 4:3 in an Xbox Live match (src/cs_wide.c) */
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;

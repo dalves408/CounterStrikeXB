@@ -370,14 +370,17 @@ begin
     if TexturePartCaches[I] <> '' then Any := True;
   if not Any then Exit;
   TextureCacheChoiceAsked := True;
+  { Deleting is the default: the pack is installed and the archives only take
+    space. /KEEPTEXTUREBIN=1 keeps them (silent installs delete otherwise). }
   Choice := ExpandConstant('{param:KEEPTEXTUREBIN|}');
-  if Choice = '0' then TextureDeleteCacheOnExit := True
-  else if (Choice = '1') or WizardSilent then TextureDeleteCacheOnExit := False
+  if Choice = '1' then TextureDeleteCacheOnExit := False
+  else if (Choice = '0') or WizardSilent then TextureDeleteCacheOnExit := True
   else
     TextureDeleteCacheOnExit := MsgBox(
-      'Keep the downloaded texture archives for future repairs or reinstalls?' + #13#10#13#10 +
-      'Yes keeps them. No deletes them when Setup closes.',
-      mbConfirmation, MB_YESNO) = IDNO;
+      'Delete the downloaded texture archives now? (recommended)' + #13#10#13#10 +
+      'The texture pack is installed, so they are no longer needed. Yes deletes them when Setup closes. ' +
+      'No keeps them for future repairs or reinstalls.',
+      mbConfirmation, MB_YESNO) = IDYES;
   if TextureDeleteCacheOnExit then Log('The cached texture archives will be deleted on exit.')
   else Log('The cached texture archives are kept.');
 end;

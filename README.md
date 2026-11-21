@@ -14,8 +14,8 @@ renderer drawing it at up to 5x the original resolution (4K).
 - **The whole game:** training, single player with bots, every map, at 60 FPS (72 on 144 Hz and FreeSync/G-Sync
   monitors).
 - **Direct3D 11 renderer:** render scale from 1x (480p) to 5x (4K), MSAA up to 8x, anisotropic filtering up
-  to 16x, VSync, a frame-rate cap of 30, 60 or 72, fullscreen, 4:3 or stretched. Picks the fast GPU on
-  laptops with two.
+  to 16x, VSync, a frame-rate cap of 30, 60 or 72, fullscreen. True widescreen in your screen's shape (16:9,
+  16:10, up to 21:9) with the HUD kept in shape, or 4:3. Picks the fast GPU on laptops with two.
 - **Optional hi-res texture pack:** 5,362 recreated 4x textures (BC7), loaded in the background as they appear.
 - **System link:** LAN play between PCs, and online with friends over a VPN, no Xbox needed: Tailscale is found by
   itself, any other VPN works with a peer list. Optionally with xemu too, using the System Link key from your own
@@ -24,9 +24,10 @@ renderer drawing it at up to 5x the original resolution (4K).
   and recover your Insignia account straight into the game.
 - **Title update 257** (the version Xbox Live expects), made from your own disc: no download needed.
 - **Office and Inferno,** the two downloadable maps, unlocked from the disc.
-- **Settings that apply as you play:** F1 in the game, `config.exe`, or RecompLauncher.
-- **Controller and keyboard:** Xbox pads through XInput; PlayStation 4/5, Switch Pro and other pads through SDL3,
-  with rumble; every key can be remapped.
+- **Settings that apply as you play:** F1 in the game (keyboard, mouse or pad), `config.exe`, or RecompLauncher,
+  drawn in the look of the game's manual.
+- **Controller, keyboard and mouse:** Xbox pads through XInput; PlayStation 4/5, Switch Pro and other pads through
+  SDL3, with rumble, found by themselves; the PC game's keys by default, every one remappable in the game; mouse aim.
 - **Logs and problem reports** that RecompLauncher and `config.exe` can attach to a report.
 
 ## Install
@@ -49,42 +50,58 @@ starts fullscreen; an upgrade or repair keeps your settings.
 Tick the texture task in Setup, or install it later with `CounterStrike-HiRes-Textures-<version>-Setup.exe` from the
 [textures release](https://github.com/dalves408/CounterStrikeXB/releases/tag/textures-1.0.0). Either one uses the
 `texture-NN.bin` parts placed beside it or downloads the missing ones (resumable, each checked by size and SHA-256),
-and puts the pack in `texture_pack` in the game folder (6.26 GB). Run the add-on again with `/REPAIRTEXTURES=1` to
+and puts the pack in `texture_pack` in the game folder (6.26 GB). After a successful install it offers to delete the
+downloaded parts (the default); keep them if you want to repair or reinstall without downloading again
+(`/KEEPTEXTUREBIN=1` for a silent install). Run the add-on again with `/REPAIRTEXTURES=1` to
 restore damaged files. F1 > Hi-res textures turns it off and on as you play.
 
 ## Playing
 
-| Key | Xbox pad |
+The keys are the PC game's where the Xbox game has the same action:
+
+| Key | Action |
 | --- | --- |
-| Arrow keys | D-pad |
-| Enter | START |
-| Backspace | BACK |
-| Z / X / C / V | A / B / X / Y |
-| W A S D | Left stick |
-| I J K L | Right stick |
-| Q / E | White / Black |
-| 1 / 3 | Left / Right trigger |
+| W A S D | Move and strafe |
+| Space | Jump |
+| Ctrl | Crouch |
+| Shift (hold) / B | Walk / Buy menu (one Xbox button: hold it to walk, tap it for the buy menu) |
+| Left click / Right click | Fire / Alternate fire (with mouse aim on) |
+| R, E | Reload / use |
+| Q, mouse wheel | Cycle weapons |
+| 4 | Cycle grenades |
+| G | Drop weapon |
+| Enter, M | In-game menu (team) |
+| Tab | Scores |
+| Z, X, C, V (or the arrows) | Radio: Follow me, Hold position, Report in, Taking fire |
+| I J K L | Look (without mouse aim) |
+
+Flashlight, night vision and chat have no key: the Xbox game has no such action. Change any key in the F1 menu's
+**Controls** tab or in `config.exe`: click a key (or Enter), then press the new key, mouse button or wheel. Each action
+takes up to three keys; a key does one thing, so giving it to another action moves it. Changes made in the F1 menu
+work at once. A key map made by an earlier version is kept; Reset to defaults brings in these keys.
 
 Controllers need no setup. Xbox controllers are read through XInput; PlayStation 4 and 5, Switch Pro, 8BitDo and
 other controllers through [SDL3](https://libsdl.org) (`SDL3.dll` in the game folder), with their buttons in the
 Xbox places (Cross = A, Circle = B, Square = X, Triangle = Y, Options = START, Share/Create or the touchpad = BACK,
-L1/R1 = White/Black) and rumble. Each takes the first free controller port. If Steam Input or DS4Windows already turns
-your pad into an Xbox one and the game sees it twice, untick "PlayStation and other controllers" on the Controls tab
-of `config.exe` (`[input] other_controllers=0` in `settings.ini`). The mouse pointer is hidden over the game.
+L1/R1 = White/Black) and rumble. Each takes the first free controller port. If Steam Input or DS4Windows also turns
+your pad into an Xbox one, the game notices (its presses show up on that Xbox pad too) and uses it once, as the Xbox
+pad with your Steam or DS4Windows layout. **Other controllers** in the settings is Auto by default; Xbox only and All
+(no check) are there too (`[input] other_controllers` 1, 0, 2 in `settings.ini`), applied at the next start.
 
-`config.exe` (in the game folder) remaps every control, with an alternate key for each.
+**Mouse aim** (off by default; F1 or `config.exe`): the mouse turns the view directly, as in the PC game, at
+Half-Life's default speed times the sensitivity you pick (0.5x to 3x), optionally inverted. In a match the mouse
+buttons and wheel are keys like any other. In the intros and menus, left click is START and right click is B. While
+mouse aim is on the pointer stays hidden in the middle of the picture; F9 frees it.
 
-**Mouse aim** (off by default; F1 or `config.exe`'s Controls tab): the mouse turns the view directly, as in the PC
-game, at Half-Life's default speed times the sensitivity you pick (0.5x to 3x), optionally inverted. In a match the
-mouse buttons and wheel are keys in the key map, set like any other in `config.exe` (click or turn the wheel when it
-asks for a key): by default left click fires (right trigger), right click is the left trigger, wheel up is Y and the
-side buttons are White and Black. In the intros and menus, left click is START and right click is B. While mouse aim
-is on the pointer stays hidden in the middle of the picture; F9 frees it.
+**Widescreen** (F1 or `config.exe`) takes the shape of the screen the game is on, 16:9, 16:10 or up to 21:9, and shows
+more of the world at the sides, keeping the vertical view. The HUD keeps its shape (the radar at the left edge, the
+bottom row with its 4:3 spacing), and the menus stay 4:3 in the middle. The window opens in that shape too.
 
-**Xbox Live stays controller only**, because it is shared with players on Xboxes and xemu: while mouse aim is on,
-choosing Xbox Live does not open it. A notice says why and turns mouse aim off with one button (OFF), after which
-Xbox Live opens as usual. Nothing reaches Insignia while mouse aim is on, and a match started from Xbox Live never
-reads the mouse. Single player, training and System Link, including over a VPN, keep it.
+**Xbox Live stays controller only and 4:3**, because it is shared with players on Xboxes and xemu: while mouse aim or
+widescreen is on, choosing Xbox Live does not open it. A notice says why and turns them off with one button (Off),
+after which Xbox Live opens as usual. Nothing reaches Insignia while mouse aim is on, and a match started from Xbox
+Live never reads the mouse and is always 4:3. Single player, training and System Link, including over a VPN, keep
+both.
 
 | Key | |
 | --- | --- |
@@ -92,20 +109,24 @@ reads the mouse. Single player, training and System Link, including over a VPN, 
 | Esc | "Quit Counter-Strike?" |
 | F11 or Alt+Enter | Fullscreen on/off |
 
-Both menus work with the controller too: D-pad or left stick to move, A to confirm, B to close (the keys mapped to A
-and B do the same). The settings menu also has Quit Counter-Strike, so the game can be closed from the pad. It is
-drawn over the game and changes these as you play, saving them as you go:
+The menus work with the keyboard, the mouse (point and click; right click steps back; the wheel scrolls) and the
+controller (D-pad or left stick to move, A to confirm, B to close, the shoulder buttons to switch tabs). The settings
+menu also has Quit Counter-Strike, so the game can be closed from the pad. It is drawn over the game and changes
+these as you play, saving them as you go:
 
 | Setting | Choices |
 | --- | --- |
 | Render scale | 1x (480p, the original, default), 2x (1080p), 3x (1440p), 4x (4K, lighter), 4.5x (4K), 5x (4K, sharpest); pick your screen, 4x and up need a fast graphics card |
 | Fullscreen | borderless, on the window's monitor (default on) |
-| Stretch image | fill the window instead of keeping 4:3 |
+| Stretch image | fill the window instead of keeping its shape |
+| Widescreen | off (4:3, default) / on (your screen's shape; not on Xbox Live) |
 | VSync | on / off |
 | Frame rate cap | 30, 60 (default), 72 (on 144 Hz or FreeSync/G-Sync monitors) |
 | Anti-aliasing | off, 2x, 4x, 8x MSAA |
 | Anisotropic filtering | off, 2x to 16x |
 | Hi-res textures | on / off (when the pack is installed) |
+| Mouse aim, Sensitivity, Invert | see above |
+| Other controllers | Auto (default), Xbox only, All |
 
 72 FPS is the game's own limit, as on the PC version of the time. It is offered only where it looks smooth: on a
 144 Hz monitor (two refreshes per frame) or one with FreeSync/G-Sync Compatible; on other monitors 60 is the top,
@@ -117,8 +138,8 @@ one frame every few refreshes, so every frame is shown for the same time.
 Insignia's hosts (consoles and xemu) correct the movement of a faster client, which makes the view stutter whenever
 you move. Menus, single player and System Link keep your cap.
 
-`config.exe` has the same options, and changes made there or in RecompLauncher while the game runs apply within a
-second. Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` and `keymap.ini`.
+`config.exe` has the same options and the same Controls tab, and changes made there or in RecompLauncher while the
+game runs apply within a second (keys and other controllers at the next start). Everything is stored in `%LOCALAPPDATA%\CounterStrikeXB\settings.ini` and `keymap.ini`.
 
 ### System link
 

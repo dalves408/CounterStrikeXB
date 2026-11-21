@@ -50,6 +50,30 @@ static HANDLE s_job, s_port;
 static volatile LONG s_exit_code;
 static int s_full, s_closing, s_children = -1;
 static RECT s_saved;
+static int s_wide = -1;                /* [display] widescreen the window was last shaped for */
+
+/* The window's picture shape: 4:3, or with widescreen the shape of the screen
+ * it is on (cs_settings_wide_aspect, as the game uses: cs_wide.c). */
+static int frame_width(int height, const CsSettings *set, HWND on)
+{
+    float a = cs_settings_wide_aspect(set, on);
+    return (int)(height * (a > 0.0f ? a : 4.0f / 3.0f) + 0.5f);
+}
+
+/* Widescreen changed (F1 menu, config.exe): a window that is not fullscreen or
+ * maximised takes the new shape at the same height, so the picture fills it. */
+static void frame_reshape(HWND h)
+{
+    CsSettings set;
+    RECT c, r;
+    cs_settings_load(&set);
+    if (set.widescreen == s_wide) return;
+    s_wide = set.widescreen;
+    if (s_full || IsZoomed(h) || IsIconic(h) || !GetClientRect(h, &c) || c.bottom <= 0) return;
+    r.left = r.top = 0; r.right = frame_width(c.bottom, &set, h); r.bottom = c.bottom;
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE);
+}
 static LONG_PTR s_saved_style;
 
 static BOOL CALLBACK first_child(HWND h, LPARAM l)
@@ -152,6 +176,8 @@ static LRESULT CALLBACK frame_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_WATCH) {        /* a copy of the game came or went */
             HWND g = game_window();
             int n = g != NULL;
+            static unsigned tick;
+            if (++tick % 10 == 0) frame_reshape(h);   /* twice a second at most: reads settings.ini */
             if (n != s_children) {
                 s_children = n;
                 if (g) {
@@ -293,8 +319,10 @@ int cs_frame_main(int *exit_code)
     if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
         work.left = work.top = 0; work.right = 1920; work.bottom = 1080;
     }
+    cs_settings_load(&set);
+    s_wide = set.widescreen;
     for (scale = 2;; scale--) {
-        r.left = r.top = 0; r.right = 640 * scale; r.bottom = 480 * scale;
+        r.left = r.top = 0; r.right = frame_width(480 * scale, &set, NULL); r.bottom = 480 * scale;
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         if (scale <= 1 || (r.right - r.left <= work.right - work.left && r.bottom - r.top <= work.bottom - work.top))
             break;
@@ -305,7 +333,6 @@ int cs_frame_main(int *exit_code)
                               r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
     if (!s_frame)
         return 0;                      /* no frame: the game makes its own window */
-    cs_settings_load(&set);
     ShowWindow(s_frame, SW_SHOWNORMAL);
     if (set.fullscreen) toggle_fullscreen();
     UpdateWindow(s_frame);

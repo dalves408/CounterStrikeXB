@@ -1,0 +1,181 @@
+From cb2dcca3a92f80bab556c0027fcac84f96477c26 Mon Sep 17 00:00:00 2001
+From: CounterStrikeXB2 <cs2@local>
+Date: Wed, 11 Nov 2026 06:00:00 -0800
+Subject: [PATCH] input: set aside an SDL pad that mirrors an XInput one
+
+Steam Input and DS4Windows present a PlayStation pad as a virtual Xbox
+pad while SDL still sees the real one, so every press counted twice.
+Each SDL pad's button presses are now compared with the XInput pads':
+three presses matched within 120 ms, hardly ever one alone, and the SDL
+pad is that pad's mirror. It is set aside (no controller port) and the
+virtual pad, with the player's Steam or DS4Windows layout, plays. It
+comes back if that XInput pad goes away. RECOMP_SDL_PADS=1 keeps every
+SDL pad as before; unset or "auto" is the new check.
+---
+ src/input/sdl3_pads.c | 92 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/src/input/sdl3_pads.c b/src/input/sdl3_pads.c
+index 3764614..f99f4f9 100644
+--- a/src/input/sdl3_pads.c
++++ b/src/input/sdl3_pads.c
+@@ -8,8 +8,19 @@
+  * it while it stays connected. Its state is handed over as an XINPUT_STATE,
+  * so the rest of the input layer treats it exactly like an Xbox pad.
+  *
++ * A pad Steam Input or DS4Windows also presents as an Xbox one would count
++ * twice: SDL sees the PlayStation pad, XInput the virtual Xbox pad made from
++ * it. Each SDL pad's button presses are compared with the XInput pads': when
++ * an XInput pad presses the same buttons at the same moments (three in a row,
++ * within 120 ms, hardly ever alone), the SDL pad is that pad's mirror and is
++ * set aside -- the virtual pad, with the player's Steam or DS4Windows layout,
++ * is the one that plays. If that XInput pad goes away (Steam or DS4Windows
++ * closed), the SDL pad comes back.
++ *
+  * SDL3.dll is loaded at run time from beside the program (never from the
+  * search path): without it, or with RECOMP_SDL_PADS=0, nothing changes.
++ * RECOMP_SDL_PADS=1 keeps every SDL pad, mirrors included; unset (or "auto")
++ * sets mirrors aside.
+  * SDL is only ever touched from this module's own thread, which polls the
+  * pads at about 250 Hz; readers take a snapshot under a lock.
+  *
+@@ -39,8 +50,20 @@ typedef struct {
+     XINPUT_STATE st;
+     WORD rumble_lo, rumble_hi;  /* asked for */
+     WORD rumble_set_lo, rumble_set_hi;
++    /* Mirror check (see the top of the file). */
++    int mirror;                 /* the XInput port it mirrors, or -1 */
++    WORD prev_buttons;
++    DWORD edge_at[16];          /* when each button went down, until checked (0: none) */
++    int match[MAX_PORTS], miss;
+ } Pad;
+ 
++#define MIRROR_WINDOW_MS 120
++#define MIRROR_MATCHES   3
++static int s_auto = 1;                       /* set mirrors aside (RECOMP_SDL_PADS not "1") */
++static unsigned s_xi_mask;                   /* XInput ports with a pad (rescan) */
++static WORD s_xi_prev[MAX_PORTS];
++static DWORD s_xi_edge[MAX_PORTS][16];       /* when each XInput button last went down */
++
+ static CRITICAL_SECTION s_lock;
+ static Pad s_pads[MAX_SDL];
+ static int s_running;
+@@ -176,12 +199,24 @@ static void rescan(void)
+         s_pads[i].id = ids[k];
+         s_pads[i].pad = g;
+         s_pads[i].port = -1;
++        s_pads[i].mirror = -1;
+         LeaveCriticalSection(&s_lock);
+         fprintf(stderr, "  [INPUT] SDL3 controller: %s\n", p_GetGamepadName(g) ? p_GetGamepadName(g) : "unnamed");
+     }
+     if (ids) p_free(ids);
++    s_xi_mask = xi;
+     used = xi;                                /* ports: keep, else the lowest free */
+     EnterCriticalSection(&s_lock);
++    for (i = 0; i < MAX_SDL; i++) {           /* a mirror whose Xbox pad is gone plays again */
++        Pad *p = &s_pads[i];
++        if (p->pad && p->mirror >= 0 && !(xi & (1u << p->mirror))) {
++            fprintf(stderr, "  [INPUT] SDL3 controller: the Xbox controller it mirrored is gone; it plays again\n");
++            p->mirror = -1;
++            memset(p->match, 0, sizeof p->match);
++            p->miss = 0;
++        }
++        if (p->pad && p->mirror >= 0) p->port = -1;
++    }
+     for (i = 0; i < MAX_SDL; i++) {
+         Pad *p = &s_pads[i];
+         if (!p->pad || p->port < 0) continue;
+@@ -189,7 +224,7 @@ static void rescan(void)
+     }
+     for (i = 0; i < MAX_SDL; i++) {
+         Pad *p = &s_pads[i];
+-        if (!p->pad || p->port >= 0) continue;
++        if (!p->pad || p->port >= 0 || p->mirror >= 0) continue;
+         for (k = 0; k < MAX_PORTS && (used & (1u << k)); k++) {}
+         if (k < MAX_PORTS) {
+             p->port = k; used |= 1u << k;
+@@ -199,6 +234,58 @@ static void rescan(void)
+     LeaveCriticalSection(&s_lock);
+ }
+ 
++/* The XInput pads' button presses, for the mirror check. */
++static void xinput_edges(DWORD now)
++{
++    DWORD port;
++    for (port = 0; port < MAX_PORTS; port++) {
++        XINPUT_STATE x;
++        WORD down;
++        int bit;
++        if (!(s_xi_mask & (1u << port)) || XInputGetState(port, &x) != ERROR_SUCCESS) continue;
++        down = (WORD)(x.Gamepad.wButtons & ~s_xi_prev[port]);
++        s_xi_prev[port] = x.Gamepad.wButtons;
++        for (bit = 0; bit < 16; bit++) if (down & (1u << bit)) s_xi_edge[port][bit] = now;
++    }
++}
++
++/* One SDL pad's presses against the XInput pads': each press is checked once
++ * the window has passed, so an XInput press a little later still counts. */
++static void mirror_check(Pad *p, WORD buttons, DWORD now)
++{
++    WORD down = (WORD)(buttons & ~p->prev_buttons);
++    int bit, port;
++    p->prev_buttons = buttons;
++    if (!s_auto || p->mirror >= 0) return;
++    for (bit = 0; bit < 16; bit++) {
++        if (down & (1u << bit)) p->edge_at[bit] = now ? now : 1;
++        if (!p->edge_at[bit] || now - p->edge_at[bit] < MIRROR_WINDOW_MS) continue;
++        {
++            int hit = 0;
++            for (port = 0; port < MAX_PORTS; port++) {
++                DWORD x = s_xi_edge[port][bit];
++                if ((s_xi_mask & (1u << port)) && x &&
++                    (x - p->edge_at[bit] <= MIRROR_WINDOW_MS || p->edge_at[bit] - x <= MIRROR_WINDOW_MS)) {
++                    p->match[port]++;
++                    hit = 1;
++                }
++            }
++            if (!hit) p->miss++;
++        }
++        p->edge_at[bit] = 0;
++    }
++    for (port = 0; port < MAX_PORTS; port++)
++        if (p->match[port] >= MIRROR_MATCHES && p->match[port] >= 3 * p->miss) {
++            EnterCriticalSection(&s_lock);
++            p->mirror = port;
++            p->port = -1;
++            LeaveCriticalSection(&s_lock);
++            fprintf(stderr, "  [INPUT] SDL3 controller mirrors Xbox controller %d (Steam Input or DS4Windows): "
++                    "that one plays, this copy is set aside\n", port + 1);
++            return;
++        }
++}
++
+ static DWORD WINAPI sdl_thread(LPVOID unused)
+ {
+     DWORD last_scan = 0;
+@@ -219,12 +306,14 @@ static DWORD WINAPI sdl_thread(LPVOID unused)
+         DWORD now = GetTickCount();
+         p_UpdateGamepads();
+         if (now - last_scan >= 500) { rescan(); last_scan = now; }
++        if (s_auto && s_xi_mask) xinput_edges(now);
+         for (i = 0; i < MAX_SDL; i++) {
+             Pad *p = &s_pads[i];
+             XINPUT_STATE st;
+             WORD lo, hi;
+             if (!p->pad) continue;
+             read_pad(p, &st);
++            if (s_xi_mask) mirror_check(p, st.Gamepad.wButtons, now);
+             EnterCriticalSection(&s_lock);
+             if (memcmp(&st.Gamepad, &p->st.Gamepad, sizeof st.Gamepad)) {
+                 p->st.Gamepad = st.Gamepad;
+@@ -249,6 +338,7 @@ void sdl3pads_start(void)
+     if (started || InterlockedExchange(&started, 1)) return;
+     e = getenv("RECOMP_SDL_PADS");
+     if (e && e[0] == '0') { fprintf(stderr, "  [INPUT] SDL3 controllers off (RECOMP_SDL_PADS=0)\n"); return; }
++    s_auto = !(e && e[0] == '1');            /* 1: every SDL pad, mirrors too */
+     if (!load_sdl()) { fprintf(stderr, "  [INPUT] SDL3.dll not found beside the program: Xbox controllers only\n"); return; }
+     InitializeCriticalSection(&s_lock);
+     th = CreateThread(NULL, 0, sdl_thread, NULL, 0, NULL);
+-- 
+2.56.1.windows.1
+

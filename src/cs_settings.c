@@ -26,6 +26,7 @@ void cs_settings_defaults(CsSettings *s)
     s->scale_x2 = 2;
     s->fullscreen = 1;      /* a fresh install starts fullscreen; settings.ini keeps the player's choice */
     s->stretch = 0;
+    s->widescreen = 0;
     s->vsync = 0;
     s->frame_rate = 60;
     s->msaa = 1;
@@ -34,6 +35,7 @@ void cs_settings_defaults(CsSettings *s)
     s->mouse_aim = 0;
     s->mouse_sens = 100;
     s->mouse_invert = 0;
+    s->other_pads = 1;
 }
 
 int cs_settings_path(const char *name, char *out, unsigned n, int make_dir)
@@ -78,6 +80,7 @@ void cs_settings_load(CsSettings *s)
     }
     s->fullscreen = get(path, "fullscreen", s->fullscreen) != 0;
     s->stretch = get(path, "stretch", s->stretch) != 0;
+    s->widescreen = get(path, "widescreen", s->widescreen) > 0;   /* older 1 (16:9) and 2 (16:10): on */
     s->vsync = get(path, "vsync", s->vsync) != 0;
     {   /* 72 is the game's own limit: older choices above it, and uncapped (0), are 72 */
         int r = get(path, "frame_rate", s->frame_rate);
@@ -91,6 +94,8 @@ void cs_settings_load(CsSettings *s)
     s->mouse_sens = CS_SET_SENS_PCT[cs_settings_index(CS_SET_SENS_PCT, CS_SET_SENSES,
                                     (int)GetPrivateProfileIntA("input", "mouse_sensitivity", s->mouse_sens, path))];
     s->mouse_invert = GetPrivateProfileIntA("input", "mouse_invert", s->mouse_invert, path) != 0;
+    s->other_pads = GetPrivateProfileIntA("input", "other_controllers", s->other_pads, path);
+    if (s->other_pads < 0 || s->other_pads > 2) s->other_pads = 1;
 }
 
 static int put(const char *path, const char *key, int v)
@@ -142,6 +147,7 @@ int cs_settings_save(const CsSettings *s)
     }
     ok &= put(path, "fullscreen", s->fullscreen);
     ok &= put(path, "stretch", s->stretch);
+    ok &= put(path, "widescreen", s->widescreen);
     ok &= put(path, "vsync", s->vsync);
     ok &= put(path, "frame_rate", s->frame_rate);
     ok &= put(path, "msaa", s->msaa);
@@ -153,6 +159,7 @@ int cs_settings_save(const CsSettings *s)
         snprintf(v, sizeof v, "%d", s->mouse_sens);
         ok &= WritePrivateProfileStringA("input", "mouse_sensitivity", v, path) != 0;
         ok &= WritePrivateProfileStringA("input", "mouse_invert", s->mouse_invert ? "1" : "0", path) != 0;
+        ok &= WritePrivateProfileStringA("input", "other_controllers", s->other_pads == 0 ? "0" : s->other_pads == 2 ? "2" : "1", path) != 0;
     }
     cs_settings_mark_seen();
     return ok;
@@ -194,13 +201,16 @@ void cs_settings_startup(void)
             SecureZeroMemory(key, sizeof key);
         }
     }
-    /* [input] other_controllers=0: Xbox controllers (XInput) only. On by
-     * default: PlayStation, Switch Pro and other controllers through SDL3
-     * (toolkit sdl3_pads.c). Off is for a pad Steam Input or DS4Windows already
-     * presents as an Xbox one, which would otherwise count twice. */
-    if (!getenv("RECOMP_SDL_PADS") && cs_settings_path("settings.ini", path, sizeof path, 0)
-        && GetPrivateProfileIntA("input", "other_controllers", 1, path) == 0)
-        _putenv_s("RECOMP_SDL_PADS", "0");
+    /* [input] other_controllers: PlayStation, Switch Pro and other controllers
+     * through SDL3 (toolkit sdl3_pads.c). 1, the default, is automatic: a pad
+     * Steam Input or DS4Windows also presents as an Xbox one is noticed (its
+     * presses show up on that Xbox pad) and plays once, as the Xbox pad. 0 is
+     * Xbox controllers (XInput) only; 2 keeps every SDL pad. */
+    if (!getenv("RECOMP_SDL_PADS") && cs_settings_path("settings.ini", path, sizeof path, 0)) {
+        int v = (int)GetPrivateProfileIntA("input", "other_controllers", 1, path);
+        if (v == 0) _putenv_s("RECOMP_SDL_PADS", "0");
+        else if (v == 2) _putenv_s("RECOMP_SDL_PADS", "1");
+    }
     /* [network] peers=host[,host...]: system link partners the LAN broadcast
      * does not reach (another subnet, a VPN such as Tailscale). The toolkit's
      * NIC link sends each frame to them too (nvnet_link.c). */
@@ -308,6 +318,37 @@ static int monitor_vrr(const char *display)
         RegCloseKey(k);
     }
     return 0;
+}
+
+float cs_settings_wide_aspect(const CsSettings *s, void *window)
+{
+    MONITORINFO mi;
+    HMONITOR m;
+    float a;
+    if (!s->widescreen) return 0.0f;
+    m = window ? MonitorFromWindow((HWND)window, MONITOR_DEFAULTTOPRIMARY)
+               : MonitorFromPoint((POINT){ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    mi.cbSize = sizeof mi;
+    if (!m || !GetMonitorInfoA(m, &mi) || mi.rcMonitor.bottom <= mi.rcMonitor.top) return 0.0f;
+    a = (float)(mi.rcMonitor.right - mi.rcMonitor.left) / (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+    if (a < 4.0f / 3.0f + 0.01f) return 0.0f;   /* a 4:3 (or portrait) screen: nothing to widen */
+    if (a > 21.0f / 9.0f) a = 21.0f / 9.0f;      /* ultrawide: 21:9 at most */
+    return a;
+}
+
+const char *cs_settings_aspect_name(float a)
+{
+    static const struct { int w, h; } known[] = { { 16, 9 }, { 16, 10 }, { 21, 9 }, { 5, 3 }, { 3, 2 }, { 4, 3 } };
+    static char buf[16];
+    unsigned i;
+    if (a <= 0.0f) return "4:3";
+    for (i = 0; i < sizeof known / sizeof known[0]; i++)
+        if (a > (float)known[i].w / known[i].h - 0.02f && a < (float)known[i].w / known[i].h + 0.02f) {
+            snprintf(buf, sizeof buf, "%d:%d", known[i].w, known[i].h);
+            return buf;
+        }
+    snprintf(buf, sizeof buf, "%.2f:1", a);
+    return buf;
 }
 
 int cs_settings_rate_max(void *monitor, int *hz, int *vrr)

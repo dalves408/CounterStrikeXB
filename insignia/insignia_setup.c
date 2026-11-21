@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "cs_settings.h"
+#include "cs_ui.h"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -55,6 +56,116 @@ static void say(HWND w, const char *t);
 static void check_key(void);
 static int key_state(void);
 static int s_cli;                           /* run from the command line: no message boxes */
+
+/* ---- the look: the game's manual (src/cs_ui.c), as config.exe and the F1 menu ----
+ * The window keeps Windows' own edit boxes (the masked key and number) and
+ * buttons; they are drawn here: the page behind them, the steps' headings where
+ * group boxes were, buttons in the manual's style, navy edit boxes. */
+#define TOP 70                              /* the title band above the controls */
+#define K(v) ((v) * 5 / 4)                  /* the layout below, made for the old dialog font, a size up */
+typedef struct { RECT r; char text[64]; } Head;
+static Head s_heads[8];
+static int s_nheads;
+static CsUiFonts s_f;
+static HFONT s_label_font, s_button_font;
+static HBRUSH s_edit_brush;
+static int s_key_shown;                     /* the hard-drive key shown instead of masked */
+
+static void ui_init(void)
+{
+    if (s_label_font) return;
+    csui_fonts_make(&s_f, 1.0f);
+    s_label_font = CreateFontA(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, 0,
+                               CLEARTYPE_QUALITY, 0, "Bahnschrift");
+    s_edit_brush = CreateSolidBrush(CSUI_NAVY);
+    s_button_font = CreateFontA(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, 0,
+                                CLEARTYPE_QUALITY, 0, "Bahnschrift");
+}
+
+/* The page: background, title, the steps' headings. */
+static void ui_paint(HWND h, const char *title)
+{
+    PAINTSTRUCT ps;
+    RECT cr, band;
+    HDC dc = BeginPaint(h, &ps), mem;
+    HBITMAP bm, old;
+    int i;
+    GetClientRect(h, &cr);
+    mem = CreateCompatibleDC(dc);
+    bm = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+    old = (HBITMAP)SelectObject(mem, bm);
+    csui_background(mem, &cr);
+    SetRect(&band, 0, 6, cr.right, TOP - 6);
+    csui_title(mem, &s_f, &band, title);
+    if (h == s_main)
+        for (i = 0; i < s_nheads; i++) csui_section(mem, &s_f, &s_heads[i].r, s_heads[i].text);
+    BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bm);
+    DeleteDC(mem);
+    EndPaint(h, &ps);
+}
+
+/* Labels on the page, light; edit boxes navy. 0: not ours. */
+static LRESULT ui_ctlcolor(UINT m, HDC dc, HWND ctl)
+{
+    char cls[16];
+    GetClassNameA(ctl, cls, sizeof cls);
+    SetBkMode(dc, TRANSPARENT);
+    if (m == WM_CTLCOLOREDIT || !_stricmp(cls, "Edit")) {
+        SetTextColor(dc, CSUI_WHITE);
+        SetBkColor(dc, CSUI_NAVY);
+        SetBkMode(dc, OPAQUE);
+        return (LRESULT)s_edit_brush;
+    }
+    SetTextColor(dc, GetWindowLongPtrA(ctl, GWLP_ID) >= 100 ? CSUI_CREAM : CSUI_TEXT);   /* status lines cream */
+    return (LRESULT)GetStockObject(NULL_BRUSH);
+}
+
+/* A button in the manual's style, on the page behind it. */
+static void ui_drawitem(HWND parent, const DRAWITEMSTRUCT *d)
+{
+    RECT pr, r = d->rcItem;
+    char t[96];
+    POINT o = { 0, 0 };
+    int id = (int)d->CtlID;
+    GetClientRect(parent, &pr);
+    MapWindowPoints(d->hwndItem, parent, &o, 1);
+    SetViewportOrgEx(d->hDC, -o.x, -o.y, NULL);              /* the page as it is behind the button */
+    csui_background(d->hDC, &pr);
+    SetViewportOrgEx(d->hDC, 0, 0, NULL);
+    GetWindowTextA(d->hwndItem, t, sizeof t);
+    if (id == ID_KEY_SHOW) snprintf(t, sizeof t, "%s", s_key_shown ? "Hide" : "Show");
+    {
+        CsUiFonts f = s_f;                                     /* the buttons take the body font */
+        f.head = s_button_font;
+        csui_button(d->hDC, &f, &r, t, (d->itemState & (ODS_SELECTED | ODS_FOCUS)) != 0);
+    }
+    if (d->itemState & ODS_DISABLED) {
+        HBRUSH b = CreateSolidBrush(RGB(10, 20, 40));
+        (void)b; DeleteObject(b);
+    }
+}
+
+/* A static's text changed: the page behind it is drawn again (it is transparent). */
+static void ui_refresh(HWND w)
+{
+    RECT r;
+    HWND p = GetParent(w);
+    if (!p) return;
+    GetWindowRect(w, &r);
+    MapWindowPoints(NULL, p, (POINT *)&r, 2);
+    InvalidateRect(p, &r, TRUE);
+}
+
+/* The child controls' kinds: a group box is a heading on the page, push buttons
+ * and the Show switch are drawn by ui_drawitem. */
+static DWORD ui_style(const char *cls, DWORD style, int id)
+{
+    if (!_stricmp(cls, "BUTTON") && ((style & BS_TYPEMASK) <= BS_DEFPUSHBUTTON || id == ID_KEY_SHOW))
+        style = (style & ~BS_TYPEMASK) | BS_OWNERDRAW;
+    return style;
+}
 
 /* A message box, or with arguments a line on the calling console. */
 static void tell(const char *text, UINT icon)
@@ -392,7 +503,7 @@ static int read_sector(HANDLE f, uint64_t lba, uint8_t out[512])
 }
 
 /* ---- UI helpers ------------------------------------------------------------------------------- */
-static void say(HWND w, const char *t) { SetWindowTextA(w, t); }
+static void say(HWND w, const char *t) { SetWindowTextA(w, t); ui_refresh(w); }
 
 static int browse(const char *filter, char *path, DWORD n)
 {
@@ -737,14 +848,20 @@ static LRESULT CALLBACK rec_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     if (m == WM_CLOSE) { s_rec_done = -1; return 0; }
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_PAINT) { ui_paint(h, "Recover Account"); return 0; }
+    if (m == WM_CTLCOLORSTATIC || m == WM_CTLCOLOREDIT) return ui_ctlcolor(m, (HDC)w, (HWND)l);
+    if (m == WM_DRAWITEM) { ui_drawitem(h, (const DRAWITEMSTRUCT *)l); return TRUE; }
     return DefWindowProcA(h, m, w, l);
 }
 
 static HWND rec_mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
 {
-    HWND c = CreateWindowExA(cls[0] == 'E' ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                             x, y, w, h, s_rec, (HMENU)(INT_PTR)id, NULL, NULL);
-    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    HWND c;
+    ui_init();
+    c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | ui_style(cls, style, id) | (cls[0] == 'E' ? WS_BORDER : 0),
+                        K(x), K(y) + TOP, K(w), K(h), s_rec, (HMENU)(INT_PTR)id, NULL, NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)(cls[0] == 'S' ? s_label_font : s_button_font), TRUE);
     return c;
 }
 
@@ -753,7 +870,7 @@ static int ask_recover(char *tag, unsigned tagn, char *num, unsigned numn)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 460, 262 };
+    RECT r = { 0, 0, K(460), K(262) + TOP };
     memset(&wc, 0, sizeof wc);
     wc.lpfnWndProc = rec_proc;
     wc.hInstance = GetModuleHandleA(NULL);
@@ -908,9 +1025,19 @@ static void load_current(void)
 /* ---- window ----------------------------------------------------------------------------------- */
 static HWND mk(const char *cls, const char *text, DWORD style, int x, int y, int w, int h, int id)
 {
-    HWND c = CreateWindowExA(cls[0] == 'E' ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                             x, y, w, h, s_main, (HMENU)(INT_PTR)id, NULL, NULL);
-    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    HWND c;
+    ui_init();
+    if (!_stricmp(cls, "BUTTON") && (style & BS_TYPEMASK) == BS_GROUPBOX) {   /* a step: a heading on the page */
+        if (s_nheads < (int)(sizeof s_heads / sizeof s_heads[0])) {
+            SetRect(&s_heads[s_nheads].r, K(x), K(y) + TOP - 4, K(x + w), K(y) + TOP + 24);
+            snprintf(s_heads[s_nheads].text, sizeof s_heads[0].text, "%s", text);
+            s_nheads++;
+        }
+        return NULL;
+    }
+    c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | ui_style(cls, style, id) | (cls[0] == 'E' ? WS_BORDER : 0),
+                        K(x), K(y) + TOP + 8, K(w), K(h), s_main, (HMENU)(INT_PTR)id, NULL, NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)(cls[0] == 'S' ? s_label_font : s_button_font), TRUE);
     return c;
 }
 
@@ -961,6 +1088,16 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         make_ui();
         load_current();
         return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        ui_paint(h, "Insignia Setup");
+        return 0;
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT:
+        return ui_ctlcolor(m, (HDC)w, (HWND)l);
+    case WM_DRAWITEM:
+        ui_drawitem(h, (const DRAWITEMSTRUCT *)l);
+        return TRUE;
     case WM_COMMAND:
         switch (LOWORD(w)) {
         case ID_EE_BROWSE:
@@ -985,9 +1122,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (HIWORD(w) == EN_CHANGE) check_key();
             return 0;
         case ID_KEY_SHOW:
-            SendMessageA(s_key, EM_SETPASSWORDCHAR,
-                         SendMessageA((HWND)l, BM_GETCHECK, 0, 0) == BST_CHECKED ? 0 : (WPARAM)'*', 0);
+            s_key_shown = !s_key_shown;
+            SendMessageA(s_key, EM_SETPASSWORDCHAR, s_key_shown ? 0 : (WPARAM)'*', 0);
             InvalidateRect(s_key, NULL, TRUE);
+            InvalidateRect((HWND)l, NULL, TRUE);
             return 0;
         case ID_ACC_BROWSE:
             if (browse("Drive dump or image (*.bin;*.img;*.qcow2;*.raw)\0*.bin;*.img;*.qcow2;*.raw\0All files\0*.*\0", path, sizeof path)) {
@@ -1084,7 +1222,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
     WNDCLASSA wc;
     MSG msg;
-    RECT r = { 0, 0, 592, 512 };
+    RECT r = { 0, 0, K(592), K(512) + TOP + 8 };
     (void)prev; (void)cmd;
     InitCommonControls();
     memset(&wc, 0, sizeof wc);

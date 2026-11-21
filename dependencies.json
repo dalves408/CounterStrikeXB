@@ -1,7 +1,7 @@
 {
     "xboxrecomp":  {
                        "url":  "https://github.com/sp00nznet/xboxrecomp.git",
-                       "commit":  "39a5899af862c14bdcf3485be2dc19945a0c733c",
+                       "commit":  "cb2dcca3a92f80bab556c0027fcac84f96477c26",
                        "base_commit":  "343b6d8901723b37ce568b2418c5df4e1fe1d223",
                        "tag":  "v0.17.0",
                        "local_patches":  [
@@ -47,7 +47,9 @@
                                              "patches/xboxrecomp/0040-nv2a-pass-texture-stages-bump-matrix-and-cube-flag-t.patch",
                                              "patches/xboxrecomp/0041-nvnet-kernel-system-link-with-xemu-and-real-Xboxes.patch",
                                              "patches/xboxrecomp/0042-input-nvnet-mouse-layer-for-a-title-s-own-settings-t.patch",
-                                             "patches/xboxrecomp/0043-input-nvnet-mouse-buttons-and-wheel-as-keys-title-ga.patch"
+                                             "patches/xboxrecomp/0043-input-nvnet-mouse-buttons-and-wheel-as-keys-title-ga.patch",
+                                             "patches/xboxrecomp/0044-input-reload-the-key-map-while-the-title-runs.patch",
+                                             "patches/xboxrecomp/0045-input-set-aside-an-SDL-pad-that-mirrors-an-XInput-on.patch"
                                          ],
                        "patch_identity":  "CounterStrikeXB2 \u003ccs2@local\u003e 2026-11-11T06:00:00-08:00",
                        "path":  "tools/xboxrecomp",

@@ -39,10 +39,12 @@
  *   RECOMP_CS_ALPHA_LIFT=1 lift zero vertex alpha to 1 (old workaround; default off: it made
  *                          hidden glow sprites opaque -- the white/cyan blob)
  *   RECOMP_CS_WORLD_TRACE=1  one in-game frame: log every 3D batch (default off)
+ *   RECOMP_WIDE_TRACE=N[,frame]  widescreen: log N 2D placements from that frame (cs_wide.c)
  */
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
@@ -60,8 +62,10 @@
 #include "cs_settings.h"
 #include "cs_overlay.h"
 #include "cs_launch.h"
+#include "cs_wide.h"
 #include "video/video_player.h"
 #include "nv2a_backend.h"
+#include "nv2a_vsh_interp.h"
 #include "cs_vsh_hlsl.h"
 #include "cs_rc_hlsl.h"
 #include "d3d/d3d8_swizzle.h"
@@ -92,6 +96,10 @@ typedef struct {
     uint32_t dirty, used;
     int pend;                      /* a copy is queued in stage, for the next present */
     int unresolved;                /* MSAA: drawn since the last resolve */
+    int wide;                      /* widescreen: made s_wide_k times wider than 4:3 (cs_wide.c) */
+    uint32_t frame3d;              /* widescreen: s_frame + 1 of the last 3D draw into it */
+    uint32_t framemenu;            /* widescreen: s_frame + 1 of the last 4:3 menu picture drawn into it */
+    UINT tw, th;                   /* the texture's own size */
     ID3D11Texture2D *tex, *stage, *ms;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
@@ -106,6 +114,21 @@ typedef struct {
 static int s_scale_x2 = 2, s_msaa = 1, s_aniso = 1, s_hires = 1;   /* what the targets and samplers are made with now */
 /* A title size at the render scale. */
 static UINT scaled(uint32_t v) { return (UINT)(((uint64_t)v * (uint32_t)s_scale_x2 + 1u) / 2u); }
+/* Widescreen (cs_wide.c): the title's 640x480 screen targets are made this many
+ * times wider. 3D draws fill them (the engine renders the wider view squeezed
+ * into 640 pixels); 2D draws keep their shape, anchored left, middle or right
+ * (wide_2d). 1: off. */
+static float s_wide_k = 1.0f;
+static int surf_wide(const Nv2aSurface *s)
+{
+    /* the screen (640x480) and the surface the game draws each frame into
+     * before copying it there (640x960 here), at any anti-aliasing */
+    return s_wide_k > 1.0f && (s->width == 640u * s->aa_sx || s->width == 640u) &&
+           (s->height == 480u * s->aa_sy || s->height == 960u);
+}
+static UINT scaled_w(uint32_t v, int wide) { return wide ? (UINT)(scaled(v) * s_wide_k + 0.5f) : scaled(v); }
+static int s_wide_trace, s_wide_trace_left;   /* RECOMP_WIDE_TRACE=N[,frame]: log N placements from that frame */
+static uint32_t s_wide_trace_at;
 static int s_presenting;                           /* our presenter draws the window (cs_window_present) */
 static void settings_apply(int first);
 
@@ -524,7 +547,9 @@ static Rt *get_rt(const Nv2aSurface *s)
     if (free_i < 0) { free_i = lru; rt_release(&s_rt[free_i]); }
     r = &s_rt[free_i];
     memset(&td, 0, sizeof td);
-    td.Width = scaled(s->width); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
+    r->wide = surf_wide(s);
+    td.Width = scaled_w(s->width, r->wide); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
+    r->tw = td.Width; r->th = td.Height;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->tex))) { rt_release(r); return NULL; }
@@ -536,13 +561,13 @@ static Rt *get_rt(const Nv2aSurface *s)
         td.SampleDesc.Count = 1;
     } else
         ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->tex, NULL, &r->rtv);
-    if (s_scale_x2 == 2) {   /* the copy back to guest memory is at the title's size */
+    if (s_scale_x2 == 2 && !r->wide) {   /* the copy back to guest memory is at the title's size */
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->stage);
     }
     r->va = PHYS(s->color_va); r->rawva = s->color_va; r->w = s->width; r->h = s->height;
     r->pitch = s->pitch; r->bpp = s->bytes_per_pixel; r->used = s_tick; r->dirty = 0; r->unresolved = 0;
-    if (!r->srv || !r->rtv || (s_scale_x2 == 2 && !r->stage)) { rt_release(r); return NULL; }
+    if (!r->srv || !r->rtv || (s_scale_x2 == 2 && !r->wide && !r->stage)) { rt_release(r); return NULL; }
     if (s_log)
         fprintf(stderr, "[CS-D3D11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n",
                 s->color_va, s->width, s->height, s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy);
@@ -559,7 +584,7 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     for (i = 0; i < MAX_DS; i++) if (!s_ds[i].tex) { slot = i; break; }
     if (slot < 0) { slot = (int)(s_tick % MAX_DS); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
-    td.Width = scaled(s->width); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
+    td.Width = scaled_w(s->width, surf_wide(s)); td.Height = scaled(s->height); td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = (UINT)s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
@@ -1229,7 +1254,7 @@ static int bind_state(const Nv2aSurface *s, const Nv2aBatch *b, Rt *rt, Ds *ds,
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
     vp.TopLeftX = vp.TopLeftY = s_pixofs * (float)s_scale_x2 * 0.5f;
-    vp.Width = (float)scaled(s->width); vp.Height = (float)scaled(s->height);
+    vp.Width = (float)rt->tw; vp.Height = (float)rt->th;
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_PSSetShader(s_ctx, !use_rc ? s_ps : (cb.dbg ? s_ps_rc : rc_shader(b->combiner)), NULL, 0);
@@ -1299,6 +1324,93 @@ static void drawlog(uint32_t kind, const Nv2aSurface *s, const Nv2aBatch *b, uin
     if (kind == 3 && (s_frame % 30) == 0) fflush(s_dlog);
 }
 
+/* Widescreen: where a screen-space (2D) batch goes on a wide target. Its x is
+ * in the title's pixels, which the viewport stretches s_wide_k times; a batch
+ * across the whole screen (fades, the scope's surround) stretches with it,
+ * anything else keeps its shape and moves to the matching place on the wider
+ * screen: the left part of the HUD to the left edge, the right part to the
+ * right edge, the rest to the middle. x' = x * xs + xo. */
+/* Widescreen: the bars beside a 4:3 menu picture, cleared to black (the
+ * menus do not clear the screen themselves; old frames would show there). */
+static void wide_bars(Rt *rt)
+{
+    static ID3D11DeviceContext1 *c1;
+    static int tried;
+    const FLOAT black[4] = { 0, 0, 0, 1 };
+    D3D11_RECT r[2];
+    LONG bar = (LONG)((rt->tw - scaled(rt->w)) / 2);
+    if (!tried) {
+        tried = 1;
+        if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&c1))) c1 = NULL;
+    }
+    if (!c1 || bar <= 0) return;
+    r[0].left = 0; r[0].top = 0; r[0].right = bar; r[0].bottom = (LONG)rt->th;
+    r[1].left = (LONG)rt->tw - bar; r[1].top = 0; r[1].right = (LONG)rt->tw; r[1].bottom = (LONG)rt->th;
+    ID3D11DeviceContext1_ClearView(c1, (ID3D11View *)rt->rtv, black, r, 2);
+}
+
+/* Where a screen-space (2D) draw spanning title x lo..hi goes on a wide
+ * target: x' = x * xs + xo, in title pixels. top: its highest point, 0 (top
+ * of the screen) .. 1 (bottom). t: the texture it samples (NULL:
+ * a solid fill). bars: clear the side bars after drawing it. */
+static void wide_place(Rt *rt, float lo, float hi, float top, const Nv2aTexture *t, float *xs, float *xo, int *bars)
+{
+    float W = 640.0f * s_wide_k, off;
+    *xs = 1.0f; *xo = 0.0f; *bars = 0;
+    if (lo <= 8.0f && hi >= 632.0f) {                 /* the whole width */
+        /* a solid fill (fades, flashes) covers the wide screen, as does a
+         * picture over the 3D view in play or a copy of a wide surface; a menu's
+         * picture keeps its 4:3 shape in the middle, with black bars beside it */
+        int k;
+        if (!t || rt->frame3d == s_frame + 1) return;
+        for (k = 0; k < MAX_RT; k++)
+            if (s_rt[k].tex && s_rt[k].wide && s_rt[k].va == PHYS(t->offset)) return;
+        *bars = 1;                                     /* after the draw: a big triangle overhangs */
+        rt->framemenu = s_frame + 1;
+        off = (W - 640.0f) * 0.5f;
+    }
+    /* a menu (no 3D this frame or the last, or a 4:3 menu picture): kept together, 4:3 in the middle */
+    else if ((rt->framemenu && rt->framemenu >= s_frame) || rt->frame3d < s_frame) off = (W - 640.0f) * 0.5f;
+    else if (top >= 0.75f) off = (W - 640.0f) * 0.5f;  /* the bottom row (health .. ammo): its 4:3 spacing, in the middle */
+    else if (hi <= 640.0f * 0.40f) off = 0.0f;         /* the HUD's left part (radar, icons): to the left edge */
+    else if (lo >= 640.0f * 0.60f) off = W - 640.0f;   /* its right part: to the right edge */
+    else off = (W - 640.0f) * 0.5f;                    /* the rest: the middle */
+    *xs = 1.0f / s_wide_k;
+    *xo = off / s_wide_k;
+    if (s_wide_trace_left > 0 && s_frame >= s_wide_trace_at) {
+        s_wide_trace_left--;
+        fprintf(stderr, "[CS-WIDE] f%u 2d x %.0f..%.0f -> %s%s\n", s_frame, lo, hi,
+                *bars ? "4:3 picture" : off == 0.0f ? "left" : off == W - 640.0f ? "right" : "middle", t ? "" : " (solid)");
+        fflush(stderr);
+    }
+}
+
+static const Nv2aTexture *batch_tex(const Nv2aBatch *b)
+{
+    return b->stages && (b->stage_valid & 1u) ? &b->stages[0] : b->texture;
+}
+
+/* The CPU path's batches: screen space when every vertex has w 1 (a w of 0
+ * draws as 1, as in cs_vsh_hlsl.c); anything in perspective is 3D. */
+static void wide_2d(Rt *rt, const Nv2aBatch *b, float *xs, float *xo, int *bars)
+{
+    float lo = 1e30f, hi = -1e30f, top = 1e30f, px;
+    uint32_t i;
+    *xs = 1.0f; *xo = 0.0f; *bars = 0;
+    if (!rt->wide || !b->count) return;
+    for (i = 0; i < b->count; i++)
+        if (!isinf(b->vertices[i].rhw) && fabsf(b->vertices[i].rhw - 1.0f) > 1e-5f) { rt->frame3d = s_frame + 1; return; }
+    px = (float)rt->w / 640.0f;                        /* real pixels per title pixel (anti-aliasing) */
+    for (i = 0; i < b->count; i++) {
+        float x = b->vertices[i].x / px;
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
+        if (b->vertices[i].y < top) top = b->vertices[i].y;
+    }
+    wide_place(rt, lo, hi, top / (float)rt->h, batch_tex(b), xs, xo, bars);
+    *xo *= px;
+}
+
 static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     Rt *rt;
@@ -1321,6 +1433,8 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11Buffer *rcbuf = NULL;
     ID3D11ShaderResourceView *srvs[4];
     ID3D11SamplerState *smps[4];
+    float wxs = 1.0f, wxo = 0.0f;
+    int wbars = 0;
 
     if (!cs_ready() || !b->count) return;
     s_dl_in_cpu++;
@@ -1358,6 +1472,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     if (FAILED(MAP_W(vb, s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, &m)))
         return;
     dst = (Nv2aVertex *)((uint8_t *)m.pData + s_vb_off);
+    wide_2d(rt, b, &wxs, &wxo, &wbars);
     for (i = 0; i + 2 < b->count; i += 3) {
         const Nv2aVertex *v = &b->vertices[i];
         float area;
@@ -1372,6 +1487,14 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             }
         }
         dst[kept] = v[0]; dst[kept + 1] = v[1]; dst[kept + 2] = v[2];
+        {   /* a program's w of 0 is 1/0 here; the GPU path draws it as w 1 (cs_vsh_hlsl.c) */
+            int k;
+            for (k = 0; k < 3; k++) if (isinf(dst[kept + k].rhw)) dst[kept + k].rhw = 1.0f;
+        }
+        if (wxs != 1.0f) {
+            int k;
+            for (k = 0; k < 3; k++) dst[kept + k].x = dst[kept + k].x * wxs + wxo;
+        }
         /* Workaround for toolkit diffuse.a=0, remove when patch 0005 lands.
          * World batches combine T0.a * V0.a; zero V0.a fails GREATER/127 /
          * SRC_ALPHA blend. Lift only pure-zero alpha (gated by
@@ -1557,6 +1680,7 @@ static void cs_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     rt->dirty = 1; rt->unresolved = 1;
     st_draws++; st_tris += kept / 3;
     s_fr_draws++; s_fr_tris += kept / 3;
+    if (wbars) wide_bars(rt);
     drawlog(0, s, b, b->count, kept, 0);
     if (s_flash_dir && s_dln[s_dlc] < DL_MAX) {
         DrawRec *d = &s_dl[s_dlc][s_dln[s_dlc]++];
@@ -1911,7 +2035,7 @@ static void cs_flip(void)
 #define GV_CACHE    128
 
 typedef struct { uint64_t key; ID3D11VertexShader *vs; int failed; } GvEnt;
-typedef struct { uint32_t in_base, in_n; float aa[2]; uint32_t fog_en, fog_mode; float fog_p[2]; } GvCb;
+typedef struct { uint32_t in_base, in_n; float aa[2]; uint32_t fog_en, fog_mode; float fog_p[2]; float wx[2], wpad[2]; } GvCb;
 
 static GvEnt s_gv[GV_CACHE];
 static unsigned s_gv_n;
@@ -2033,6 +2157,34 @@ static ID3D11VertexShader *gv_shader(const Nv2aProgramDraw *p)
     return e->failed ? NULL : e->vs;
 }
 
+/* Widescreen: does this program draw in screen space (the menus, the HUD)?
+ * Its vertices are run on the CPU: w 1 (or 0, drawn as 1) for all of them is
+ * 2D, and *lo..*hi its x range in title pixels; anything in perspective has w
+ * the distance. Big batches are taken as 3D after their first few vertices. */
+static int program_2d(const Nv2aProgramDraw *p, float aa_x, float *lo, float *hi, float *top)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    Nv2aVshOutput o;
+    uint32_t nin = 0, k, v;
+    *lo = 1e30f; *hi = -1e30f; *top = 1e30f;
+    for (k = 0; k < 16; k++) nin += (p->input_mask >> k) & 1u;
+    if (!nin || !p->vertex_count) return 0;
+    for (v = 0; v < p->vertex_count; v++) {
+        uint32_t idx = 0;
+        if (v >= 3 && p->vertex_count > 4096) return 0;
+        memset(in, 0, sizeof in);
+        for (k = 0; k < 16; k++)
+            if ((p->input_mask >> k) & 1u) memcpy(in[k], p->inputs[v * nin + idx++], 16);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o)) return 0;
+        if (o.pos[3] != 0.0f && fabsf(o.pos[3] - 1.0f) > 1e-5f) return 0;
+        if (o.pos[0] * aa_x < *lo) *lo = o.pos[0] * aa_x;
+        if (o.pos[0] * aa_x > *hi) *hi = o.pos[0] * aa_x;
+        if (o.pos[1] < *top) *top = o.pos[1];
+    }
+    *lo /= aa_x; *hi /= aa_x;     /* logical pixels are title pixels */
+    return 1;
+}
+
 static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramDraw *p)
 {
     const Nv2aRenderState *r = b->state;
@@ -2045,7 +2197,8 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     GvCb g;
     Rt *rt;
     Ds *ds;
-    int use_rc, cull;
+    int use_rc, cull, wbars = 0;
+    float wxs = 1.0f, wxo = 0.0f;
 
     if (s_gv_ready < 0) {
         const char *e = getenv("RECOMP_CS_GPU_VSH");
@@ -2064,6 +2217,12 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     if (!(vs = gv_shader(p))) { st_gv_fallback++; return 0; }
     rt = get_rt(s);
     if (!rt) return 1;
+    if (rt->wide) {                                  /* widescreen: 2D keeps its shape (wide_place) */
+        float lo, hi, top;
+        if (program_2d(p, 1.0f, &lo, &hi, &top))
+            wide_place(rt, lo, hi, top * (float)(s->aa_sy ? s->aa_sy : 1) / (float)rt->h, batch_tex(b), &wxs, &wxo, &wbars);
+        else rt->frame3d = s_frame + 1;
+    }
     ds = get_ds(s, r->zeta_va);
 
     /* Inputs and indices into their rings; constants and per-draw values. */
@@ -2095,6 +2254,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     g.aa[0] = (float)(s->aa_sx ? s->aa_sx : 1); g.aa[1] = (float)(s->aa_sy ? s->aa_sy : 1);
     s_fr_gv++; if (p->fog_enable) s_fr_fog++;
     g.fog_en = p->fog_enable; g.fog_mode = p->fog_mode; g.fog_p[0] = p->fog_param[0]; g.fog_p[1] = p->fog_param[1];
+    g.wx[0] = wxs; g.wx[1] = wxo;
     {
         static GvCb last_g;
         static int have_g;
@@ -2121,6 +2281,7 @@ static int cs_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 2, 2, cbs);
     ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &s_gv_srv);
     ID3D11DeviceContext_DrawIndexed(s_ctx, p->index_count, s_gv_ib_off, 0);
+    if (wbars) wide_bars(rt);
     s_gv_in_off += rows;
     s_gv_ib_off += p->index_count;
     rt->dirty = 1; rt->unresolved = 1;
@@ -2188,10 +2349,16 @@ static void settings_apply(int first)
     int msaa = msaa_supported(g_cs_settings.msaa), aniso = g_cs_settings.aniso, i;
     if (aniso < 1) aniso = 1;
     if (aniso > 16) aniso = 16;
-    if (scale != s_scale_x2 || msaa != s_msaa) {
+    float wide = cs_wide_factor();
+    if (first) {
+        const char *t = getenv("RECOMP_WIDE_TRACE");
+        s_wide_trace = s_wide_trace_left = t ? atoi(t) : 0;
+        if (t && strchr(t, ',')) s_wide_trace_at = (uint32_t)atoi(strchr(t, ',') + 1);
+    }
+    if (scale != s_scale_x2 || msaa != s_msaa || wide != s_wide_k) {
         for (i = 0; i < MAX_RT; i++) if (s_rt[i].tex || s_rt[i].ms) rt_release(&s_rt[i]);
         for (i = 0; i < MAX_DS; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); memset(&s_ds[i], 0, sizeof s_ds[i]); }
-        s_scale_x2 = scale; s_msaa = msaa;
+        s_scale_x2 = scale; s_msaa = msaa; s_wide_k = wide;
     }
     if (aniso != s_aniso) {
         for (i = 0; i < s_nss; i++) { ID3D11SamplerState *o = (ID3D11SamplerState *)s_ss[i].obj; SAFE_REL(o); }
@@ -2390,7 +2557,7 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
     {   /* the picture: 4:3 in the middle, or the whole window with Stretch */
         float aw = (float)s_bb_w, ah = (float)s_bb_h;
-        float fw = rt ? (float)rt->w : 640.0f, fh = rt ? (float)rt->h : 480.0f;
+        float fw = rt ? (float)rt->tw : 640.0f, fh = rt ? (float)rt->th : 480.0f;
         vp.MinDepth = 0; vp.MaxDepth = 1;
         if (g_cs_settings.stretch) { vp.TopLeftX = vp.TopLeftY = 0; vp.Width = aw; vp.Height = ah; }
         else if (aw * fh > ah * fw) { vp.Height = ah; vp.Width = ah * fw / fh; vp.TopLeftX = (aw - vp.Width) * 0.5f; vp.TopLeftY = 0; }
@@ -2422,10 +2589,17 @@ static void present_frame(HWND h, uint32_t fb_va, int fresh)
         }
     }
     if (s_ov_valid) {
+        D3D11_VIEWPORT q = vp;   /* the movie overlay is 640x480: 4:3 in the middle of a wide picture */
+        if (rt && rt->wide && !g_cs_settings.stretch) {
+            q.Width = vp.Width / s_wide_k;
+            q.TopLeftX = vp.TopLeftX + (vp.Width - q.Width) * 0.5f;
+        }
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &q);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, s_blit_alpha, NULL, 0xFFFFFFFFu);
         ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps_a, NULL, 0);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_ov_srv);
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     }
     if (s_dlog) {   /* RECOMP_CS_DRAWLOG: the frame number as 16 squares top left (white = 1), to match screen grabs */
         static ID3D11ShaderResourceView *black;

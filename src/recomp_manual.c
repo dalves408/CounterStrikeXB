@@ -24,6 +24,7 @@
 #include "cs_kernel.h"
 #include "cs_launch.h"
 #include "cs_mouse.h"
+#include "cs_wide.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -126,6 +127,23 @@ void sub_000CA3B0(void)
 {
     if (cs_mouse_ui_refuse()) return;
     sub_000CA3B0_gen();
+}
+
+/* Widescreen (src/cs_wide.c): the engine's gluPerspective gets the wider
+ * aspect, and R_SetFrustum culls with the wider horizontal view. */
+extern void sub_0004E280_gen(void);
+void sub_0004E280(void)
+{
+    cs_wide_perspective();
+    sub_0004E280_gen();
+}
+
+extern void sub_0004DDB0_gen(void);
+void sub_0004DDB0(void)
+{
+    float saved = cs_wide_frustum_begin();
+    sub_0004DDB0_gen();
+    cs_wide_frustum_end(saved);
 }
 
 /* ── ICALL failure logging ─────────────────────────────────── */
