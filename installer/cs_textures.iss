@@ -34,7 +34,12 @@ ArchiveExtraction=enhanced/nopassword
 Compression=lzma2/max
 SolidCompression=yes
 LZMANumBlockThreads=1
-WizardStyle=modern
+; In the look of the game's manual, as the game's own menus (src/cs_ui.c): the dark style over the manual's navy
+; blueprint page, its title picture on the Welcome and Finished pages (all made by scripts/build_installer.py)
+WizardStyle=modern dark hidebevels
+WizardImageFile=wizard_image_164.bmp,wizard_image_192.bmp,wizard_image_246.bmp,wizard_image_273.bmp,wizard_image_328.bmp
+WizardBackImageFile=wizard_back_640.png,wizard_back_960.png,wizard_back_1280.png
+WizardBackColor=#122C52
 
 [Messages]
 #ifdef TextureHasDownload

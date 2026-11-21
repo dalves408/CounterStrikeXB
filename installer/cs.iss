@@ -44,7 +44,14 @@ UninstallDisplayIcon={app}\cs2_xbox_recomp.exe
 OutputBaseFilename=CounterStrike-Setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
-WizardStyle=modern
+; In the look of the game's manual, as the game's own menus (src/cs_ui.c): the dark style over the manual's navy
+; blueprint page, its title picture on the Welcome and Finished pages (all made by scripts/build_installer.py)
+WizardStyle=modern dark hidebevels
+WizardImageFile=wizard_image_164.bmp,wizard_image_192.bmp,wizard_image_246.bmp,wizard_image_273.bmp,wizard_image_328.bmp
+WizardBackImageFile=wizard_back_640.png,wizard_back_960.png,wizard_back_1280.png
+WizardBackColor=#122C52
+; the Welcome page shows the title picture first, as the Finished page does last
+DisableWelcomePage=no
 ExtraDiskSpaceRequired=1700000000
 ; the texture pack's parts are 7z archives (extracted by Setup itself)
 ArchiveExtraction=enhanced/nopassword
@@ -260,11 +267,39 @@ begin
     SrcEdit.Text := D;
 end;
 
+{ The manual's look on the wizard's header: its type on the headings, and the gold double rule under the title. }
+procedure ManualRule(Top, Height: Integer; Color: TColor);
+var
+  R: TBitmapImage;
+begin
+  R := TBitmapImage.Create(WizardForm);
+  R.Parent := WizardForm.MainPanel;
+  R.Left := 0;
+  R.Top := Top;
+  R.Width := WizardForm.MainPanel.Width;
+  R.Height := Height;
+  R.BackColor := Color;
+end;
+
+procedure ManualLook;
+begin
+  WizardForm.PageNameLabel.Font.Name := 'Bahnschrift';
+  WizardForm.PageNameLabel.Font.Style := [fsBold];
+  WizardForm.PageDescriptionLabel.Font.Name := 'Bahnschrift';
+  WizardForm.WelcomeLabel1.Font.Name := 'Bahnschrift';
+  WizardForm.WelcomeLabel1.Font.Style := [fsBold];
+  WizardForm.FinishedHeadingLabel.Font.Name := 'Bahnschrift';
+  WizardForm.FinishedHeadingLabel.Font.Style := [fsBold];
+  ManualRule(WizardForm.MainPanel.Height - ScaleY(6), ScaleY(3), $2AC6E2);   { gold, as RGB 226,198,42 }
+  ManualRule(WizardForm.MainPanel.Height - ScaleY(2), 1, $1E8496);
+end;
+
 procedure InitializeWizard;
 var
   L: TNewStaticText;
   B1, B2: TNewButton;
 begin
+  ManualLook;
   NewVer := '{#AppVersion}';
   OldDir := PreviousAppDir;
   UpdateMode := (OldDir <> '') and GameFilesPresent(OldDir);

@@ -30,7 +30,8 @@ build-abi/
 build_release/
 # Installer output and its generated wizard pictures (scripts/build_installer.py)
 installer/Output/
-installer/wizard_small_*.bmp
+installer/wizard_*.bmp
+installer/wizard_back_*.png
 installer/texture_payload.iss
 installer/texture_parts_code.iss
 

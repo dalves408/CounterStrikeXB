@@ -87,9 +87,9 @@ def build(metadata, output, url_base=None):
         resources.mkdir()
         for name in ('cs_textures.iss', 'texture_download_code.iss'):
             shutil.copyfile(ROOT / 'installer' / name, installer / name)
-        images = sorted((ROOT / 'installer').glob('wizard_small_*.bmp'))
-        if len(images) != 5:
-            raise SystemExit('installer/wizard_small_*.bmp missing: run scripts/build_installer.py once to make them')
+        images = sorted((ROOT / 'installer').glob('wizard_*.bmp')) + sorted((ROOT / 'installer').glob('wizard_back_*.png'))
+        if len(images) != 13:
+            raise SystemExit('installer/wizard_*.bmp, wizard_back_*.png missing: run scripts/build_installer.py once to make them')
         for image in images:
             shutil.copyfile(image, installer / image.name)
         shutil.copyfile(ROOT / 'resources/cs.ico', resources / 'cs.ico')

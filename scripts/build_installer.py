@@ -64,13 +64,100 @@ def set_rc_version(path, version):
         path.write_text(new, encoding='utf-8')
 
 
+# The wizard's pictures, in the look of the game's manual (src/cs_ui.c draws the game's own menus the same way): a
+# navy blueprint page with faint gold rings, a heavy white title after a yellow notch over a gold double rule, and the
+# manual's round page dial in a corner. Each is made in several sizes, one per screen scaling.
+BG_TOP, BG_MID, BG_BOT = (34, 70, 112), (18, 44, 82), (8, 22, 46)
+GRID, RING, GOLD, GOLD_DK = (38, 74, 116), (96, 112, 74), (226, 198, 42), (150, 132, 30)
+OUTLINE, CREAM, NAVY = (6, 16, 36), (240, 232, 176), (10, 26, 56)
+WIZARD_IMAGE_SIZES = ((164, 314), (192, 386), (246, 459), (273, 523), (328, 628))
+WIZARD_BACK_SIZES = ((640, 480), (960, 720), (1280, 960))
+
+
+def manual_font(px, bold=True):
+    from PIL import ImageFont
+    font = ImageFont.truetype(str(Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / 'bahnschrift.ttf'), px)
+    try:
+        font.set_variation_by_name('Bold' if bold else 'Regular')
+    except (OSError, ValueError):
+        pass
+    return font
+
+
+def manual_page(w, h):
+    """The manual's blueprint page: a navy gradient, a grid, two faint gold rings and a sweep."""
+    from PIL import ImageDraw
+    img = Image.new('RGB', (w, h))
+    d = ImageDraw.Draw(img)
+    mid = h * 2 // 5
+    for y in range(h):
+        a, b, t, n = (BG_TOP, BG_MID, y, mid) if y < mid else (BG_MID, BG_BOT, y - mid, h - mid)
+        d.line([(0, y), (w, y)], fill=tuple(a[i] + (b[i] - a[i]) * t // max(n, 1) for i in range(3)))
+    step = max(h // 26, 8)
+    for x in range(step // 2, w, step):
+        d.line([(x, 0), (x, h)], fill=GRID)
+    for y in range(step // 2, h, step):
+        d.line([(0, y), (w, y)], fill=GRID)
+    for r in (h * 6 // 10, h * 4 // 10):
+        d.ellipse([w // 2 - r, h // 2 - r, w // 2 + r, h // 2 + r], outline=RING, width=max(1, h // 320))
+    d.arc([-w // 3, h // 4, w * 4 // 3, h * 2], 200, 340, fill=RING, width=max(1, h // 320))
+    return img
+
+
+def manual_dial(img, right=False):
+    """The page dial in a bottom corner."""
+    from PIL import ImageDraw
+    import math
+    w, h = img.size
+    R = max(18, min(w, h) // 5)
+    cx, cy = (w if right else 0), h
+    d = ImageDraw.Draw(img)
+    d.ellipse([cx - R - 3, cy - R - 3, cx + R + 3, cy + R + 3], fill=(96, 100, 100))
+    d.ellipse([cx - R, cy - R, cx + R, cy + R], fill=(176, 178, 170))
+    for i in (1, 2, 3):
+        a = math.pi / 2 * i / 4
+        dx, dy = int(R * math.cos(a)), int(R * math.sin(a))
+        d.line([(cx, cy), ((cx - dx) if right else (cx + dx), cy - dy)], fill=(96, 100, 100), width=max(2, R // 18))
+    r = R * 45 // 100
+    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(232, 222, 48))
+
+
+def manual_title(img, x, y, text, px):
+    """A heading as the manual sets them: heavy white with a dark outline."""
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).text((x, y), text, font=manual_font(px), fill=(244, 246, 250),
+                             stroke_width=max(1, px // 14), stroke_fill=OUTLINE)
+
+
 def wizard_images():
-    """The picture at the top right of every wizard page is the game's icon, one file per screen scaling."""
+    """The wizard's pictures (cs.iss, cs_textures.iss): the small one at the top right of every page (the game's icon
+    on the manual's navy), the large one on the Welcome and Finished pages, and the page behind every page."""
+    from PIL import ImageDraw
     icon = Image.open(ROOT / 'resources' / 'cs.png').convert('RGBA')
     for size in WIZARD_SIZES:
-        canvas = Image.new('RGBA', (size, size), (255, 255, 255, 255))
+        canvas = Image.new('RGBA', (size, size), NAVY + (255,))
         canvas.alpha_composite(icon.resize((size, size), Image.LANCZOS))
         canvas.convert('RGB').save(INSTALLER / f'wizard_small_{size}.bmp')
+    for w, h in WIZARD_IMAGE_SIZES:
+        img = manual_page(w, h)
+        d = ImageDraw.Draw(img)
+        k = w / 164
+        # the yellow notch and the gold double rule under the title, as on each of the manual's pages
+        top = int(34 * k)
+        d.polygon([(0, top), (int(16 * k), top + int(20 * k)), (0, top + int(40 * k))], fill=GOLD)
+        manual_title(img, int(22 * k), top - int(4 * k), 'Counter-', int(26 * k))
+        manual_title(img, int(22 * k), top + int(24 * k), 'Strike', int(26 * k))
+        rule = top + int(62 * k)
+        d.line([(0, rule), (w, rule)], fill=GOLD, width=max(2, int(4 * k)))
+        d.line([(0, rule + int(6 * k)), (w, rule + int(6 * k))], fill=GOLD_DK, width=1)
+        d.text((int(22 * k), rule + int(12 * k)), 'Xbox, on your PC', font=manual_font(int(12 * k), False), fill=CREAM)
+        logo = int(84 * k)
+        img.paste(icon.resize((logo, logo), Image.LANCZOS), ((w - logo) // 2, int(h * 0.62) - logo // 2),
+                  icon.resize((logo, logo), Image.LANCZOS))
+        manual_dial(img)
+        img.save(INSTALLER / f'wizard_image_{w}.bmp')
+    for w, h in WIZARD_BACK_SIZES:
+        manual_page(w, h).save(INSTALLER / f'wizard_back_{w}.png')
 
 
 def keep_symbols(version):
